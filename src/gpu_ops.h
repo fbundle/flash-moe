@@ -392,9 +392,59 @@ static void gpu_encode_experts_batched(
     uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
-    // Per-expert: Encoder A (gate+up), Encoder B (SwiGLU+down)
+    // Per-expert: Encoder A (gate+up or fused_gate_up_swiglu), Encoder B (SwiGLU+down or down only)
     // Separate encoders per expert enables GPU parallelism across experts.
-    // Within each encoder, operations serialize (gate then up, SwiGLU then down).
+#if USE_FUSED_GATE_UP_SWIGLU
+    // Fused path: single dispatch replaces gate_proj + up_proj + SwiGLU.
+    // The kernel reads x once, computes gate and up simultaneously, applies
+    // SwiGLU inline, and writes directly to buf_multi_expert_act[k].
+    // 4-bit only — falls through to original path for 2-bit.
+    if (!g_use_2bit) {
+        uint32_t fused_tgs = gate_up_out;  // one threadgroup per output row
+        for (int k = 0; k < K; k++) {
+            if (!valid[k]) continue;
+
+            // Encoder A: fused_gate_up_swiglu (x -> act[k] in one dispatch)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                [enc setComputePipelineState:ctx->fused_gate_up_swiglu];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
+                [enc setBuffer:expert_bufs[k]                  offset:up_w_off    atIndex:3];
+                [enc setBuffer:expert_bufs[k]                  offset:up_s_off    atIndex:4];
+                [enc setBuffer:expert_bufs[k]                  offset:up_b_off    atIndex:5];
+                [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:6];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:7];
+                [enc setBytes:&gate_up_out length:4 atIndex:8];
+                [enc setBytes:&gate_up_in  length:4 atIndex:9];
+                [enc setBytes:&gs          length:4 atIndex:10];
+                [enc dispatchThreadgroups:MTLSizeMake(fused_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Encoder B: down_proj only (act[k] already has SwiGLU result)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                [enc setComputePipelineState:expert_pipe];
+                [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
+                [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
+                [enc setBuffer:expert_bufs[k]                  offset:down_b_off  atIndex:2];
+                [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
+                [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
+                [enc setBytes:&down_out length:4 atIndex:5];
+                [enc setBytes:&down_in  length:4 atIndex:6];
+                [enc setBytes:&gs       length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(down_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+        }
+        return;
+    }
+#endif
+    // Original path: gate+up encoded together, SwiGLU+down encoded together
     for (int k = 0; k < K; k++) {
         if (!valid[k]) continue;
 

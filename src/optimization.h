@@ -7,26 +7,32 @@
 // KV Cache bf16 quantization: halve memory bandwidth for full-attention layers.
 // Switches KVCache storage from float to uint16_t (bfloat16).
 // Affects: attention.h, layer_forward.h, shaders.metal, metal_setup.h
-#define USE_KV_CACHE_BF16 1
+#define USE_KV_CACHE_BF16 0
 
 // Fused RMS Norm Metal kernel: single-dispatch reduce+apply.
 // Combines rms_norm_sum + rms_norm_apply into one kernel.
 // Affects: shaders.metal (kernel), metal_setup.h (pipeline), layer_forward.h (usage)
-#define USE_FUSED_RMS_NORM 1
+#define USE_FUSED_RMS_NORM 0
 
 // MTLSharedEvent async pipeline: non-blocking GPU completion check.
 // GPU signals shared event on CMD3 commit; CPU checks signaledValue before blocking.
 // Affects: layer_forward.h (encodeSignalEvent, signaledValue wait)
-#define USE_EVENT_PIPELINE 1
+#define USE_EVENT_PIPELINE 0
 
 // CPU dequant FMA variant: precomputed scale*x + bias*x with fmaf() intrinsics.
 // Reduces inner-loop multiplies vs the base unrolled dequant matvec.
 // Affects: cpu_kernels.h (cpu_dequant_matvec_fma), metal_setup.h (fallback path)
-#define USE_CPU_DEQUANT_FMA 1
+#define USE_CPU_DEQUANT_FMA 0
 
 // Heap-based top-K: O(dim * log(K)) min-heap instead of O(dim * K) selection sort.
 // With K=8, reduces comparisons by ~2.5x.
 // Affects: cpu_kernels.h (cpu_topk)
-#define USE_HEAP_TOPK 1
+#define USE_HEAP_TOPK 0
+
+// Fused gate+up+SwiGLU kernel: computes gate_proj and up_proj in one pass,
+// applies SwiGLU inline, writes activated output directly. Saves 2 dispatches
+// and 2 intermediate buffers per expert.
+// Affects: shaders.metal (kernel), gpu_ops.h (encoding), metal_setup.h (pipeline)
+#define USE_FUSED_GATE_UP_SWIGLU 1
 
 #endif // OPTIMIZATION_H

@@ -8,6 +8,7 @@ Usage:
   python helpers/gen_optimizations.py --event-pipeline             # enable MTLSharedEvent
   python helpers/gen_optimizations.py --cpu-fma                    # enable CPU FMA dequant
   python helpers/gen_optimizations.py --heap-topk                  # enable heap top-K
+  python helpers/gen_optimizations.py --fused-gate-up              # enable fused gate+up+SwiGLU
   python helpers/gen_optimizations.py --all                        # enable all
 """
 import argparse
@@ -44,6 +45,12 @@ TEMPLATE = """// Compile-time optimization feature flags
 // Affects: cpu_kernels.h (cpu_topk)
 #define USE_HEAP_TOPK {use_heap_topk}
 
+// Fused gate+up+SwiGLU kernel: computes gate_proj and up_proj in one pass,
+// applies SwiGLU inline, writes activated output directly. Saves 2 dispatches
+// and 2 intermediate buffers per expert.
+// Affects: shaders.metal (kernel), gpu_ops.h (encoding), metal_setup.h (pipeline)
+#define USE_FUSED_GATE_UP_SWIGLU {use_fused_gate_up_swiglu}
+
 #endif // OPTIMIZATION_H
 """
 
@@ -55,6 +62,7 @@ def generate(args):
         use_event_pipeline=args.use_event_pipeline,
         use_cpu_dequant_fma=args.use_cpu_dequant_fma,
         use_heap_topk=args.use_heap_topk,
+        use_fused_gate_up_swiglu=args.use_fused_gate_up_swiglu,
     )
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,6 +94,8 @@ def main():
                         help="Enable CPU FMA dequant variant")
     parser.add_argument("--heap-topk", action="store_true",
                         help="Enable heap-based top-K")
+    parser.add_argument("--fused-gate-up", action="store_true",
+                        help="Enable fused gate+up+SwiGLU kernel")
     parser.add_argument("--all", action="store_true",
                         help="Enable all optimizations")
 
@@ -102,6 +112,7 @@ def main():
     args.use_event_pipeline = 1 if (args_raw.event_pipeline or all_enabled) else 0
     args.use_cpu_dequant_fma = 1 if (args_raw.cpu_fma or all_enabled) else 0
     args.use_heap_topk = 1 if (args_raw.heap_topk or all_enabled) else 0
+    args.use_fused_gate_up_swiglu = 1 if (args_raw.fused_gate_up or all_enabled) else 0
 
     out = generate(args)
     flags = [
@@ -110,6 +121,7 @@ def main():
         f"EVENT_PIPELINE={args.use_event_pipeline}",
         f"CPU_FMA={args.use_cpu_dequant_fma}",
         f"HEAP_TOPK={args.use_heap_topk}",
+        f"FUSED_GATE_UP={args.use_fused_gate_up_swiglu}",
     ]
     print(f"Optimizations: {', '.join(flags)}")
 
