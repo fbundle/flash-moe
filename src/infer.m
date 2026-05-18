@@ -118,6 +118,8 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 
+static char g_model_path[1024] = "data";
+
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = USE_EXPERT_PREDICTION;
 static int g_pred_generating = 0;   // only set to 1 after prefill (predictions only help during generation)
@@ -631,20 +633,13 @@ static int g_tokenizer_loaded = 0;
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
-    const char *paths[] = {
-        "data/tokenizer.bin",
-        "tokenizer.bin",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], R_OK) == 0) {
-            if (bpe_load(&g_tokenizer, paths[i]) == 0) {
-                g_tokenizer_loaded = 1;
-                return;
-            }
-        }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/tokenizer.bin", g_model_path);
+    if (access(path, R_OK) == 0 && bpe_load(&g_tokenizer, path) == 0) {
+        g_tokenizer_loaded = 1;
+        return;
     }
-    fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
+    fprintf(stderr, "WARNING: tokenizer.bin not found at %s, tokenization will fail\n", path);
 }
 
 static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
@@ -6526,10 +6521,12 @@ int main(int argc, char **argv) {
         }
 
         // All data files live under model_path
-        char weights_path[1024], manifest_path[1024], vocab_path[1024];
+        snprintf(g_model_path, sizeof(g_model_path), "%s", model_path);
+        char weights_path[1024], manifest_path[1024], vocab_path[1024], tok_path[1024];
         snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_path);
         snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json", model_path);
         snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_path);
+        snprintf(tok_path, sizeof(tok_path), "%s/tokenizer.bin", model_path);
 
         // ---- Model config from compile-time model_config.h ----
         print_model_config();

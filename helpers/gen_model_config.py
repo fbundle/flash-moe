@@ -274,7 +274,7 @@ def main():
     cfg = load_hf_config(str(model_path))
 
     model_name = args.name or model_path.name
-    output = args.output or "model_config.h"
+    output = args.output or "src/model_config.h"
 
     generate_header(cfg, model_name, output)
 

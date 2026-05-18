@@ -23,54 +23,67 @@ huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
 
 ```bash
 python helpers/gen_model_config.py \
-  hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/config.json
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
 This creates `src/model_config.h` with all dimension constants, expert layout offsets, and special tokens for your model.
 
-### 3. Extract non-expert weights
+### 3. Export tokenizer
 
 ```bash
-python helpers/extract_weights.py
+python helpers/export_tokenizer.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
-Writes `data/model_weights.bin` (~1.38 GB) and `data/model_weights.json` manifest. These are read into memory at startup (always in use, no benefit from lazy loading).
+Writes `data/vocab.bin` and `data/tokenizer.bin`.
 
-### 4. Repack expert weights
+### 4. Extract non-expert weights
 
 ```bash
-python helpers/repack_experts_4bit.py
+python helpers/extract_weights.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+  --output data
 ```
 
-Extracts per-layer binary files into `packed_experts/layer_00.bin` through `layer_39.bin` (~453 MB each, 18.1 GB total). These are streamed from SSD on demand.
+Writes `data/model_weights.bin` (~1.38 GB) and `data/model_weights.json` manifest.
 
-### 5. Generate experiment config
+### 5. Repack expert weights
+
+```bash
+python helpers/repack_experts_4bit.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+```
+
+Extracts per-layer binary files into `data/packed_experts/layer_00.bin` through `layer_39.bin` (~453 MB each, 18.1 GB total). These are streamed from SSD on demand.
+
+### 6. Generate experiment config
 
 ```bash
 python helpers/gen_config.py --active_experts 8 --use_gpu_linear 1
 ```
 
-Creates `src/config.h` with compile-time experiment knobs. Run `python autotune.py` later to find the best values.
+Creates `src/config.h` with compile-time experiment knobs. Run `python autotune.py` later to sweep configs and find the best values.
 
-### 6. Build
+### 7. Build
 
 ```bash
 make
 ```
 
-Builds `bin/infer` (inference engine).
+Builds `bin/infer`.
 
-### 7. Run
+### 8. Run
 
 ```bash
-# Basic inference
-./bin/infer --prompt "Explain quantum computing" --tokens 100
+# One-shot inference
+./bin/infer --model data --prompt "Explain quantum computing" --tokens 100
 
-# Interactive chat
-python helpers/chat.py
+# HTTP server + chat client
+./bin/infer --model data --serve 8080 &
+python helpers/chat.py --port 8080
 
 # Per-layer timing breakdown
-./bin/infer --prompt "Hello" --tokens 20 --timing
+./bin/infer --model data --prompt "Hello" --tokens 20 --timing
 ```
 
 ## Project Structure
@@ -84,6 +97,7 @@ src/
   tokenizer.h          # C BPE tokenizer
 helpers/
   gen_model_config.py     # Generate model_config.h from HF config.json
+  export_tokenizer.py     # Generate vocab.bin and tokenizer.bin from HF model
   extract_weights.py      # Non-expert weights → data/model_weights.bin
   repack_experts_4bit.py  # MLX 4-bit experts → packed_experts/
   repack_experts_2bit.py  # 4-bit → 2-bit requantization
@@ -135,15 +149,14 @@ python autotune.py
 
 5. **Trust the OS** — The OS page cache achieves ~71% hit rate naturally. Every custom caching approach (Metal LRU, malloc cache) was slower due to GPU memory pressure.
 
-## What We Tried
+## What We Did (35B Port)
 
-| Approach | Result | Impact |
-|----------|--------|--------|
-| FMA dequant kernel | GPU compute -12% | +12% tok/s |
-| Trust OS page cache | Deleted Metal LRU | +38% |
-| BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | +64% attn |
-| Deferred GPU CMD3 | CPU/GPU overlap | Pipeline |
-| Fused GPU combine+norm | Eliminates CPU round-trip | Pipeline |
-| LZ4 expert compression | -13% | Decompress > savings |
-| Temporal expert prediction | -18% | 25% hit rate |
-| MTP speculative decoding | Break-even | MoE I/O scales per-token |
+| Change | Result |
+|--------|--------|
+| Model-agnostic architecture | All dimensions from `model_config.h` (generated from HF `config.json`). Same engine runs 397B or 35B with zero code changes. |
+| Compile-time experiment system | Mandatory `config.h` with `#define` (no `#ifndef` guards). `gen_config.py` generates it, `autotune.py` sweeps it. No runtime branching overhead. |
+| Unified `--model` flag | Single CLI flag for all data paths. `--weights`, `--manifest`, `--vocab` removed. |
+| Malloc+read weight loading | Compile-time `MALLOC_WEIGHTS` option. Page-aligned allocation with `posix_memalign` → zero-copy Metal buffer. Always enabled in autotune. |
+| Python chat client | Replaced `chat.m` + `linenoise` (1500+ lines C) with `helpers/chat.py` (~100 lines). Connects via HTTP/SSE. |
+| Project cleanup | Deleted ~9000 lines, 21 files (`main.m`, `chat.m`, `linenoise`, `progress.py`, `train_predictor.py`, `CLAUDE.md`, etc.). |
+| Autotune script | `autotune.py` sweeps compile-time configs (GPU linear, expert prediction, malloc weights), builds, benchmarks, reports optimal setup. |

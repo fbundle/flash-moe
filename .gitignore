@@ -30,8 +30,6 @@ __pycache__/
 logs/
 *.log
 
-# Downloaded model files
-hub/
-
-# Test binaries and experiment data
-routing_data.bin
+# model
+hub
+data

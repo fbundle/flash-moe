@@ -39,12 +39,9 @@ def parse_safetensors_header(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
-    parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
-                        help='Path to model directory')
-    parser.add_argument('--output', type=str, default='.',
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to model directory (HuggingFace safetensors)')
+    parser.add_argument('--output', type=str, default='data',
                         help='Output directory for model_weights.bin and .json')
     parser.add_argument('--include-experts', action='store_true',
                         help='Also extract expert weights (huge, not recommended)')
