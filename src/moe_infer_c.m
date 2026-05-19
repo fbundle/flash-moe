@@ -1,6 +1,5 @@
 /*
- * flashmoe_c.m — C wrapper API for Flash-MoE inference engine.
- * Wraps all the header-only C/Metal code into a clean library interface.
+ * moe_infer_c.m — C wrapper API for Flash-MoE inference engine.
  */
 
 #include "util.h"

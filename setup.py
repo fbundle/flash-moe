@@ -13,7 +13,7 @@ ext = Extension(
     "moe_infer_mlx._core",
     sources=[
         "moe_infer_mlx/_core.pyx",
-        "src/flashmoe_c.m",
+        "src/moe_infer_c.m",
     ],
     include_dirs=["src", np.get_include()],
     extra_compile_args=[

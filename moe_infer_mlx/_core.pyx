@@ -10,7 +10,7 @@ cdef extern from "stdlib.h":
     void *malloc(size_t size)
     void free(void *ptr)
 
-cdef extern from "flashmoe_c.h":
+cdef extern from "moe_infer_c.h":
     ctypedef struct FlashMoE_Cache:
         pass
 

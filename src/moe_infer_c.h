@@ -1,5 +1,5 @@
-#ifndef FLASHMOE_C_H
-#define FLASHMOE_C_H
+#ifndef MOE_INFER_C_H
+#define MOE_INFER_C_H
 
 // C API for Flash-MoE inference engine.
 // Single-instance (globals). Called from Cython/Python.
@@ -46,4 +46,4 @@ void flashmoe_free(void);
 }
 #endif
 
-#endif // FLASHMOE_C_H
+#endif // MOE_INFER_C_H

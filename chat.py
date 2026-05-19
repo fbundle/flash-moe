@@ -63,7 +63,7 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
             result = tok.apply_chat_template(
-                messages, add_generation_prompt=True, enable_thinking=True)
+                messages, add_generation_prompt=True, enable_thinking=False)
             prompt_ids = [int(t) for t in result["input_ids"]]
 
             cache = fm.Cache()
