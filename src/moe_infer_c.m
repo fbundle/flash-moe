@@ -12,7 +12,7 @@
 #include "embeddings.h"
 #include "expert_io.h"
 #include "layer_forward.h"
-#include "flashmoe_c.h"
+#include "moe_infer_c.h"
 
 // ---- Cache ----
 
