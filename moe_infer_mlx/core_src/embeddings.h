@@ -5,9 +5,9 @@
 // Embedding lookup (4-bit quantized)
 // ============================================================================
 
-#include "model_internal.h"
+#include "common.h"
 
-static void embed_lookup(FlashMoE_Model *m, WeightFile *wf, int token_id, float *out) {
+static void embed_lookup(FlashMoE_Context *m, WeightFile *wf, int token_id, float *out) {
     TensorInfo *w_info = get_tensor_info(m, wf, "model.embed_tokens.weight");
     TensorInfo *s_info = get_tensor_info(m, wf, "model.embed_tokens.scales");
     TensorInfo *b_info = get_tensor_info(m, wf, "model.embed_tokens.biases");
@@ -52,7 +52,7 @@ static void embed_lookup(FlashMoE_Model *m, WeightFile *wf, int token_id, float 
 // LM head (logits projection)
 // ============================================================================
 
-static void lm_head_forward(FlashMoE_Model *m, WeightFile *wf, const float *hidden, float *logits) {
+static void lm_head_forward(FlashMoE_Context *m, WeightFile *wf, const float *hidden, float *logits) {
     TensorInfo *w_info = get_tensor_info(m, wf, "lm_head.weight");
     TensorInfo *s_info = get_tensor_info(m, wf, "lm_head.scales");
     TensorInfo *b_info = get_tensor_info(m, wf, "lm_head.biases");
@@ -66,7 +66,7 @@ static void lm_head_forward(FlashMoE_Model *m, WeightFile *wf, const float *hidd
     uint16_t *S = (uint16_t *)((char *)wf->data + s_info->offset);
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
-    fast_dequant_matvec(m, W, S, B, hidden, logits, m->cfg.vocab_size, m->cfg.hidden_dim, GROUP_SIZE);
+    fast_dequant_matvec(m, W, S, B, hidden, logits, m->cfg.vocab_size, m->cfg.hidden_dim, m->cfg.group_size);
 }
 
 

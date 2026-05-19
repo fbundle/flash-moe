@@ -4,11 +4,11 @@
 // ============================================================================
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern).
 // Types (IOThreadPool, AsyncPreadState, ExpertLRUCache, MallocExpertCache,
-// InferPrefetchCtx, etc.) are in model_types.h.
-// All state accessed via FlashMoE_Model *m.
+// InferPrefetchCtx, etc.) are in common.h.
+// All state accessed via FlashMoE_Context *m.
 // ============================================================================
 
-#include "model_internal.h"
+#include "common.h"
 
 void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
@@ -72,7 +72,7 @@ static void *io_pool_worker(void *arg) {
     return NULL;
 }
 
-static void io_pool_init(FlashMoE_Model *m) {
+static void io_pool_init(FlashMoE_Context *m) {
     if (m->io_pool_initialized) return;
     pthread_mutex_init(&m->io_pool.mutex, NULL);
     pthread_cond_init(&m->io_pool.work_ready, NULL);
@@ -104,13 +104,13 @@ static void io_pool_dispatch_raw(IOThreadPool *pool, InferPreadTask *tasks, int 
     pthread_mutex_unlock(&pool->mutex);
 }
 
-static void io_pool_dispatch(FlashMoE_Model *m, InferPreadTask *tasks, int num_tasks) {
+static void io_pool_dispatch(FlashMoE_Context *m, InferPreadTask *tasks, int num_tasks) {
     io_pool_dispatch_raw(&m->io_pool, tasks, num_tasks);
 }
 
 // ---- Async expert pread pipeline ----
 
-static void async_pread_start(FlashMoE_Model *m, int packed_fd, int *expert_indices, int K,
+static void async_pread_start(FlashMoE_Context *m, int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
     size_t esz = active_expert_size(m);
     m->async_pread.num_tasks = K;
@@ -134,7 +134,7 @@ static void async_pread_start(FlashMoE_Model *m, int packed_fd, int *expert_indi
     }
 }
 
-static void async_pread_wait(FlashMoE_Model *m) {
+static void async_pread_wait(FlashMoE_Context *m) {
     if (!m->async_pread.active) return;
     dispatch_group_wait(m->async_pread.group, DISPATCH_TIME_FOREVER);
     for (int k = 0; k < m->async_pread.num_tasks; k++) {
@@ -143,7 +143,7 @@ static void async_pread_wait(FlashMoE_Model *m) {
     m->async_pread.active = 0;
 }
 
-static void io_pool_shutdown(FlashMoE_Model *m) {
+static void io_pool_shutdown(FlashMoE_Context *m) {
     if (!m->io_pool_initialized) return;
     pthread_mutex_lock(&m->io_pool.mutex);
     m->io_pool.shutdown = 1;
@@ -159,7 +159,7 @@ static void io_pool_shutdown(FlashMoE_Model *m) {
 
 // Parallel pread of K experts into Metal buffers using pthreads.
 int parallel_pread_experts(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     int packed_fd,
     int *expert_indices,
     int K,
@@ -193,7 +193,7 @@ int parallel_pread_experts(
 
 // Parallel pread into explicit buffer set (for double buffering).
 int parallel_pread_experts_into(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     int packed_fd,
     int *expert_indices,
     int K,
@@ -228,7 +228,7 @@ int parallel_pread_experts_into(
 // Expert LRU Cache
 // ============================================================================
 
-ExpertLRUCache *expert_cache_new(FlashMoE_Model *m, id<MTLDevice> device, int max_entries) {
+ExpertLRUCache *expert_cache_new(FlashMoE_Context *m, id<MTLDevice> device, int max_entries) {
     ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
     cache->entry_idx = calloc((size_t)m->cfg.num_layers * m->cfg.num_experts, sizeof(int));
     cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
@@ -275,7 +275,7 @@ static void expert_cache_free(ExpertLRUCache *cache) {
     free(cache);
 }
 
-static id<MTLBuffer> expert_cache_lookup(FlashMoE_Model *m, ExpertLRUCache *cache, int layer_idx, int expert_idx) {
+static id<MTLBuffer> expert_cache_lookup(FlashMoE_Context *m, ExpertLRUCache *cache, int layer_idx, int expert_idx) {
     int idx = cache->entry_idx[(layer_idx) * m->cfg.num_experts + (expert_idx)];
     if (idx >= 0) {
         cache->entries[idx].last_used = ++cache->access_counter;
@@ -288,7 +288,7 @@ static id<MTLBuffer> expert_cache_lookup(FlashMoE_Model *m, ExpertLRUCache *cach
     return nil;
 }
 
-static id<MTLBuffer> expert_cache_insert(FlashMoE_Model *m, ExpertLRUCache *cache, int layer_idx, int expert_idx) {
+static id<MTLBuffer> expert_cache_insert(FlashMoE_Context *m, ExpertLRUCache *cache, int layer_idx, int expert_idx) {
     id<MTLBuffer> buf = nil;
 
     int existing = cache->entry_idx[(layer_idx) * m->cfg.num_experts + (expert_idx)];
@@ -337,7 +337,7 @@ static id<MTLBuffer> expert_cache_insert(FlashMoE_Model *m, ExpertLRUCache *cach
 // Malloc-based expert frequency cache
 // ============================================================================
 
-MallocExpertCache *malloc_cache_init(FlashMoE_Model *m, int max_entries, id<MTLDevice> device) {
+MallocExpertCache *malloc_cache_init(FlashMoE_Context *m, int max_entries, id<MTLDevice> device) {
     MallocExpertCache *cache = calloc(1, sizeof(MallocExpertCache));
     cache->entry_idx = calloc((size_t)m->cfg.num_layers * m->cfg.num_experts, sizeof(int));
     cache->data = calloc(max_entries, sizeof(void *));
@@ -391,7 +391,7 @@ MallocExpertCache *malloc_cache_init(FlashMoE_Model *m, int max_entries, id<MTLD
     return cache;
 }
 
-static id<MTLBuffer> malloc_cache_lookup(FlashMoE_Model *m, MallocExpertCache *cache, int layer, int expert) {
+static id<MTLBuffer> malloc_cache_lookup(FlashMoE_Context *m, MallocExpertCache *cache, int layer, int expert) {
     int idx = cache->entry_idx[(layer) * m->cfg.num_experts + (expert)];
     if (idx >= 0) {
         cache->last_used[idx] = ++cache->access_counter;
@@ -404,7 +404,7 @@ static id<MTLBuffer> malloc_cache_lookup(FlashMoE_Model *m, MallocExpertCache *c
     return nil;
 }
 
-static id<MTLBuffer> malloc_cache_insert(FlashMoE_Model *m, MallocExpertCache *cache, int layer, int expert, int *out_idx) {
+static id<MTLBuffer> malloc_cache_insert(FlashMoE_Context *m, MallocExpertCache *cache, int layer, int expert, int *out_idx) {
     int existing = cache->entry_idx[(layer) * m->cfg.num_experts + (expert)];
     if (existing >= 0) {
         cache->last_used[existing] = ++cache->access_counter;
@@ -544,7 +544,7 @@ int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
     return loaded;
 }
 
-void infer_prefetch_init(FlashMoE_Model *m) {
+void infer_prefetch_init(FlashMoE_Context *m) {
     if (m->prefetch) return;
     m->prefetch = calloc(1, sizeof(InferPrefetchCtx));
     pthread_mutex_init(&m->prefetch->mutex, NULL);
@@ -555,7 +555,7 @@ void infer_prefetch_init(FlashMoE_Model *m) {
     pthread_create(&m->prefetch_tid, NULL, infer_prefetch_thread_fn, m->prefetch);
 }
 
-void infer_prefetch_shutdown(FlashMoE_Model *m) {
+void infer_prefetch_shutdown(FlashMoE_Context *m) {
     if (!m->prefetch) return;
     pthread_mutex_lock(&m->prefetch->mutex);
     m->prefetch->shutdown = 1;

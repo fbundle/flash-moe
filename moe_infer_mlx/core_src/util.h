@@ -2,10 +2,10 @@
 #define UTIL_H
 
 // Utilities: timing, cache telemetry, bf16 conversion, dynamic array alloc.
-// Types (LayerTimingAccum, CacheTelemetry, LZ4IndexEntry) are in model_types.h.
-// All state accessed via FlashMoE_Model *m.
+// Types (LayerTimingAccum, CacheTelemetry, LZ4IndexEntry) are in common.h.
+// All state accessed via FlashMoE_Context *m.
 
-#include "model_internal.h"
+#include "common.h"
 
 // ============================================================================
 // Timing helper
@@ -17,22 +17,22 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
-static inline int expert_is_seen(FlashMoE_Model *m, int layer, int expert) {
+static inline int expert_is_seen(FlashMoE_Context *m, int layer, int expert) {
     return (m->expert_seen[layer * (m->cfg.num_experts / 8) + (expert >> 3)] >> (expert & 7)) & 1;
 }
-static inline void expert_mark_seen(FlashMoE_Model *m, int layer, int expert) {
+static inline void expert_mark_seen(FlashMoE_Context *m, int layer, int expert) {
     m->expert_seen[layer * (m->cfg.num_experts / 8) + (expert >> 3)] |= (1 << (expert & 7));
 }
-static inline int expert_pick_fd(FlashMoE_Model *m, int layer, int expert, int warm_fd) {
+static inline int expert_pick_fd(FlashMoE_Context *m, int layer, int expert, int warm_fd) {
     (void)m; (void)layer; (void)expert;
     return warm_fd;
 }
 
-static inline size_t active_expert_size(FlashMoE_Model *m) {
+static inline size_t active_expert_size(FlashMoE_Context *m) {
     return m->use_2bit ? m->cfg.expert_size_2bit : m->cfg.expert_size_4bit;
 }
 
-void cache_telemetry_reset(FlashMoE_Model *m) {
+void cache_telemetry_reset(FlashMoE_Context *m) {
     memset(&m->cache_telemetry, 0, sizeof(m->cache_telemetry));
     if (m->cache_seen)
         memset(m->cache_seen, 0, (size_t)m->cfg.num_layers * m->cfg.num_experts * sizeof(uint8_t));
@@ -42,12 +42,12 @@ void cache_telemetry_reset(FlashMoE_Model *m) {
         memset(m->cache_last_evict_token, 0, (size_t)m->cfg.num_layers * m->cfg.num_experts * sizeof(uint64_t));
 }
 
-static void cache_telemetry_note_token(FlashMoE_Model *m) {
+static void cache_telemetry_note_token(FlashMoE_Context *m) {
     if (!m->cache_telemetry_enabled) return;
     m->cache_telemetry.token_clock++;
 }
 
-static void cache_telemetry_touch(FlashMoE_Model *m, int layer_idx, int expert_idx) {
+static void cache_telemetry_touch(FlashMoE_Context *m, int layer_idx, int expert_idx) {
     if (!m->cache_telemetry_enabled) return;
     if (layer_idx < 0 || layer_idx >= m->cfg.num_layers || expert_idx < 0 || expert_idx >= m->cfg.num_experts) return;
     if (!m->cache_seen[(size_t)(layer_idx) * m->cfg.num_experts + (expert_idx)]) {
@@ -57,7 +57,7 @@ static void cache_telemetry_touch(FlashMoE_Model *m, int layer_idx, int expert_i
     m->cache_last_touch_token[(size_t)(layer_idx) * m->cfg.num_experts + (expert_idx)] = m->cache_telemetry.token_clock;
 }
 
-static void cache_telemetry_miss(FlashMoE_Model *m, int layer_idx, int expert_idx) {
+static void cache_telemetry_miss(FlashMoE_Context *m, int layer_idx, int expert_idx) {
     if (!m->cache_telemetry_enabled) return;
     if (layer_idx < 0 || layer_idx >= m->cfg.num_layers || expert_idx < 0 || expert_idx >= m->cfg.num_experts) return;
     if (!m->cache_seen[(size_t)(layer_idx) * m->cfg.num_experts + (expert_idx)]) {
@@ -82,14 +82,14 @@ static void cache_telemetry_miss(FlashMoE_Model *m, int layer_idx, int expert_id
     m->cache_last_touch_token[(size_t)(layer_idx) * m->cfg.num_experts + (expert_idx)] = m->cache_telemetry.token_clock;
 }
 
-static void cache_telemetry_evict(FlashMoE_Model *m, int layer_idx, int expert_idx) {
+static void cache_telemetry_evict(FlashMoE_Context *m, int layer_idx, int expert_idx) {
     if (!m->cache_telemetry_enabled) return;
     if (layer_idx < 0 || layer_idx >= m->cfg.num_layers || expert_idx < 0 || expert_idx >= m->cfg.num_experts) return;
     m->cache_telemetry.evictions++;
     m->cache_last_evict_token[(size_t)(layer_idx) * m->cfg.num_experts + (expert_idx)] = m->cache_telemetry.token_clock;
 }
 
-void cache_telemetry_print(FlashMoE_Model *m, uint64_t hits, uint64_t misses) {
+void cache_telemetry_print(FlashMoE_Context *m, uint64_t hits, uint64_t misses) {
     if (!m->cache_telemetry_enabled) return;
     uint64_t total = hits + misses;
     fprintf(stderr, "\n=== Cache Telemetry ===\n");
@@ -120,11 +120,11 @@ void cache_telemetry_print(FlashMoE_Model *m, uint64_t hits, uint64_t misses) {
             total > 0 ? 100.0 * hits / total : 0.0);
 }
 
-void timing_reset(FlashMoE_Model *m) {
+void timing_reset(FlashMoE_Context *m) {
     memset(&m->timing, 0, sizeof(m->timing));
 }
 
-void timing_print(FlashMoE_Model *m) {
+void timing_print(FlashMoE_Context *m) {
     if (m->timing.count == 0) return;
     int n = m->timing.count;
     fprintf(stderr, "\n[timing] Per-layer breakdown (avg of %d layers, ms):\n", n);
@@ -178,7 +178,7 @@ static uint16_t f32_to_bf16(float f) {
 
 // ---- Dynamic array allocation (called after model_config_load) ----
 
-static int util_arrays_alloc(FlashMoE_Model *m) {
+static int util_arrays_alloc(FlashMoE_Context *m) {
     int N = m->cfg.num_layers;
     int E = m->cfg.num_experts;
 
@@ -201,7 +201,7 @@ static int util_arrays_alloc(FlashMoE_Model *m) {
     return 0;
 }
 
-static void util_arrays_free(FlashMoE_Model *m) {
+static void util_arrays_free(FlashMoE_Context *m) {
     free(m->lz4_index);      m->lz4_index = NULL;
     free(m->layer_fds_cold); m->layer_fds_cold = NULL;
     free(m->expert_seen);    m->expert_seen = NULL;

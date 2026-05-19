@@ -5,9 +5,22 @@ Compiles the C wrapper (moe_infer_mlx/core_src/moe_infer_c.m, Objective-C) toget
 the Cython bridge (moe_infer_mlx/core.pyx) into a single shared library.
 """
 
+import os
+
+from helpers.gen_config import generate_default as generate_config
+from helpers.gen_shaders import generate as generate_shaders_header
+
 from setuptools import setup, Extension
 from Cython.Build import cythonize
 import numpy as np
+
+# Regenerate generated headers before each build
+_base = os.path.dirname(__file__)
+generate_config()
+generate_shaders_header(
+    os.path.join(_base, "moe_infer_mlx", "core_src", "shaders.metal"),
+    os.path.join(_base, "moe_infer_mlx", "core_src", "shaders.h"),
+)
 
 ext = Extension(
     "moe_infer_mlx.core",

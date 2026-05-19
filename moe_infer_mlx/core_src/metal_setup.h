@@ -3,13 +3,13 @@
 
 // ============================================================================
 // Metal context for GPU-accelerated matmuls.
-// MetalCtx type is in model_types.h. State stored in FlashMoE_Model.metal.
+// MetalCtx type is in model_types.h. State stored in FlashMoE_Context.metal.
 // ============================================================================
 
-#include "model_internal.h"
+#include "common.h"
 #include "shaders.h"
 
-static int metal_setup(FlashMoE_Model *m) {
+static int metal_setup(FlashMoE_Context *m) {
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
     ctx->device = MTLCreateSystemDefaultDevice();
     if (!ctx->device) {
@@ -100,15 +100,15 @@ static int metal_setup(FlashMoE_Model *m) {
     // Allocate reusable buffers (large enough for biggest projection)
     size_t max_out = m->cfg.vocab_size * sizeof(float);
     size_t max_in = m->cfg.linear_total_value * sizeof(float);
-    if (max_in < (size_t)(m->cfg.num_attn_heads * HEAD_DIM) * sizeof(float)) {
-        max_in = (size_t)(m->cfg.num_attn_heads * HEAD_DIM) * sizeof(float);
+    if (max_in < (size_t)(m->cfg.num_attn_heads * m->cfg.head_dim) * sizeof(float)) {
+        max_in = (size_t)(m->cfg.num_attn_heads * m->cfg.head_dim) * sizeof(float);
     }
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
 
     // Batched matmul output slots
     {
-        size_t slot_size = (size_t)(m->cfg.num_attn_heads * HEAD_DIM * 2) * sizeof(float);
+        size_t slot_size = (size_t)(m->cfg.num_attn_heads * m->cfg.head_dim * 2) * sizeof(float);
         if (slot_size < (size_t)m->cfg.linear_conv_dim * sizeof(float))
             slot_size = (size_t)m->cfg.linear_conv_dim * sizeof(float);
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
@@ -187,11 +187,11 @@ static int metal_setup(FlashMoE_Model *m) {
 
     // GPU attention buffers
     {
-        size_t kv_dim = m->cfg.num_kv_heads * HEAD_DIM;
+        size_t kv_dim = m->cfg.num_kv_heads * m->cfg.head_dim;
 #if USE_KV_CACHE_BF16
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(uint16_t);
+        size_t kv_cache_size = m->cfg.gpu_kv_seq * kv_dim * sizeof(uint16_t);
 #else
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+        size_t kv_cache_size = m->cfg.gpu_kv_seq * kv_dim * sizeof(float);
 #endif
         ctx->buf_kv_k = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
         ctx->buf_kv_v = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
@@ -205,22 +205,22 @@ static int metal_setup(FlashMoE_Model *m) {
             CFRetain((__bridge CFTypeRef)buf_k);
             CFRetain((__bridge CFTypeRef)buf_v);
         }
-        ctx->buf_attn_q      = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_q      = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * m->cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)m->cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)m->cfg.num_attn_heads * m->cfg.gpu_kv_seq * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_out    = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_out    = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * m->cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * m->cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
                m->cfg.num_full_attn_layers, kv_cache_size / 1e6,
-               (double)(m->cfg.num_attn_heads * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+               (double)(m->cfg.num_attn_heads * m->cfg.max_seq_len * sizeof(float)) / 1e6);
     }
 
     // Persistent GPU state buffers for delta-net
     if (ctx->delta_net_step) {
-        size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
+        size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * m->cfg.linear_value_dim * m->cfg.linear_key_dim;
         size_t conv_state_sz = 3 * (size_t)m->cfg.linear_conv_dim;
         ctx->buf_delta_state = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_linear_layers, sizeof(id<MTLBuffer>));
         ctx->buf_conv_state  = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_linear_layers, sizeof(id<MTLBuffer>));
@@ -263,9 +263,9 @@ static int metal_setup(FlashMoE_Model *m) {
 }
 
 // Reset delta-net and conv GPU state buffers (call at start of new generation)
-static void reset_delta_net_state(FlashMoE_Model *m) {
+static void reset_delta_net_state(FlashMoE_Context *m) {
     if (!m->metal || !m->metal->delta_net_step) return;
-    size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+    size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * m->cfg.linear_value_dim * m->cfg.linear_key_dim * sizeof(float);
     size_t conv_state_sz = 3 * (size_t)m->cfg.linear_conv_dim * sizeof(float);
     for (int i = 0; i < m->cfg.num_linear_layers; i++) {
         if (m->metal->buf_delta_state[i])
@@ -351,7 +351,7 @@ static void gpu_dequant_matvec(
 
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
 static void fast_dequant_matvec(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size

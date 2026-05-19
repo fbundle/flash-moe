@@ -1,6 +1,6 @@
 /*
  * moe_infer_c.m — C wrapper API for Flash-MoE inference engine.
- * Instance-based: flashmoe_init() returns an opaque FlashMoE_Model *;
+ * Instance-based: flashmoe_init() returns an opaque FlashMoE_Context *;
  * all functions take it as their first argument.
  */
 
@@ -16,7 +16,7 @@
 #include "layer_forward.h"
 #include "moe_infer_c.h"
 
-// ---- Cache (public API, defined here since it's not in model_types.h) ----
+// ---- Cache (public API, defined here since it's not in common.h) ----
 
 typedef struct FlashMoE_Cache {
     KVCache **kv_caches;          // [num_layers] — non-NULL for full-attn layers
@@ -26,14 +26,14 @@ typedef struct FlashMoE_Cache {
 
 // ---- flashmoe_cache_new ----
 
-FlashMoE_Cache *flashmoe_cache_new(FlashMoE_Model *m) {
+FlashMoE_Cache *flashmoe_cache_new(FlashMoE_Context *m) {
     FlashMoE_Cache *c = calloc(1, sizeof(FlashMoE_Cache));
     if (!c) return NULL;
     c->kv_caches    = calloc(m->cfg.num_layers, sizeof(KVCache *));
     c->layer_states = calloc(m->cfg.num_layers, sizeof(void *));
     c->pos = 0;
     for (int i = 0; i < m->cfg.num_layers; i++) {
-        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        int is_full = ((i + 1) % m->cfg.full_attn_interval == 0);
         if (is_full) {
             c->kv_caches[i] = kv_cache_new(m);
         } else {
@@ -67,7 +67,7 @@ void flashmoe_cache_free(FlashMoE_Cache *c) {
     free(c);
 }
 
-void flashmoe_cache_reset(FlashMoE_Cache *c, FlashMoE_Model *m) {
+void flashmoe_cache_reset(FlashMoE_Cache *c, FlashMoE_Context *m) {
     if (!c) return;
     for (int i = 0; i < m->cfg.num_layers; i++) {
         if (c->kv_caches[i]) {
@@ -76,9 +76,9 @@ void flashmoe_cache_reset(FlashMoE_Cache *c, FlashMoE_Model *m) {
         if (c->layer_states[i]) {
             LinearAttnState *s = (LinearAttnState *)c->layer_states[i];
             memset(s->conv_state, 0,
-                   (CONV_KERNEL_SIZE - 1) * m->cfg.linear_conv_dim * sizeof(float));
+                   (m->cfg.conv_kernel_size - 1) * m->cfg.linear_conv_dim * sizeof(float));
             memset(s->ssm_state, 0,
-                   m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+                   m->cfg.linear_num_v_heads * m->cfg.linear_value_dim * m->cfg.linear_key_dim * sizeof(float));
         }
     }
     c->pos = 0;
@@ -87,8 +87,8 @@ void flashmoe_cache_reset(FlashMoE_Cache *c, FlashMoE_Model *m) {
 
 // ---- flashmoe_init ----
 
-FlashMoE_Model *flashmoe_init(const char *model_path) {
-    FlashMoE_Model *m = calloc(1, sizeof(FlashMoE_Model));
+FlashMoE_Context *flashmoe_init(const char *model_path) {
+    FlashMoE_Context *m = calloc(1, sizeof(FlashMoE_Context));
     if (!m) return NULL;
 
     snprintf(m->model_path, sizeof(m->model_path), "%s", model_path);
@@ -226,7 +226,7 @@ FlashMoE_Model *flashmoe_init(const char *model_path) {
 
 // ---- flashmoe_forward ----
 
-int flashmoe_forward(FlashMoE_Model *m,
+int flashmoe_forward(FlashMoE_Context *m,
                      const int *input_ids, int n_tokens,
                      float *logits_out, FlashMoE_Cache *cache) {
     if (!m || !m->initialized || !cache || !input_ids || n_tokens < 1 || !logits_out)
@@ -241,7 +241,7 @@ int flashmoe_forward(FlashMoE_Model *m,
         embed_lookup(m, wf, input_ids[tok], m->hidden);
 
         for (int layer = 0; layer < m->cfg.num_layers; layer++) {
-            int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+            int is_full = ((layer + 1) % m->cfg.full_attn_interval == 0);
             fused_layer_forward(m, wf, layer, m->hidden,
                                 is_full ? cache->kv_caches[layer] : NULL,
                                 is_full ? NULL : cache->layer_states[layer],
@@ -255,7 +255,7 @@ int flashmoe_forward(FlashMoE_Model *m,
 
         if (m->final_norm_w) {
             float *normed = malloc(m->cfg.hidden_dim * sizeof(float));
-            cpu_rms_norm(m->hidden, m->final_norm_w, normed, m->cfg.hidden_dim, RMS_NORM_EPS);
+            cpu_rms_norm(m->hidden, m->final_norm_w, normed, m->cfg.hidden_dim, m->cfg.rms_norm_eps);
             memcpy(m->hidden, normed, m->cfg.hidden_dim * sizeof(float));
             free(normed);
         }
@@ -273,13 +273,13 @@ int flashmoe_cache_position(FlashMoE_Cache *c) {
     return c ? c->pos : 0;
 }
 
-int flashmoe_vocab_size(FlashMoE_Model *m)  { return m->cfg.vocab_size; }
-int flashmoe_hidden_dim(FlashMoE_Model *m)  { return m->cfg.hidden_dim; }
-int flashmoe_num_layers(FlashMoE_Model *m)  { return m->cfg.num_layers; }
+int flashmoe_vocab_size(FlashMoE_Context *m)  { return m->cfg.vocab_size; }
+int flashmoe_hidden_dim(FlashMoE_Context *m)  { return m->cfg.hidden_dim; }
+int flashmoe_num_layers(FlashMoE_Context *m)  { return m->cfg.num_layers; }
 
 // ---- flashmoe_free ----
 
-void flashmoe_free(FlashMoE_Model *m) {
+void flashmoe_free(FlashMoE_Context *m) {
     if (!m || !m->initialized) return;
 
     io_pool_shutdown(m);

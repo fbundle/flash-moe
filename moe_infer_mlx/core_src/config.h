@@ -26,21 +26,10 @@
 #define USE_FUSED_GATE_UP_SWIGLU 0
 
 // ============================================================================
-// Architectural constants (same across all Qwen3 MoE models)
+// Compile-time constant — used in fixed-size stack array declarations.
+// All other architectural values come from model_config.json at runtime.
 // ============================================================================
 
-#define HEAD_DIM           256
-#define GROUP_SIZE         64
-#define BITS               4
-#define RMS_NORM_EPS       1e-06f
-#define ROPE_THETA         10000000.0f
-#define PARTIAL_ROTARY     0.25f
-#define FULL_ATTN_INTERVAL 4
-#define CONV_KERNEL_SIZE   4
-#define MAX_SEQ_LEN        1048576
-#define GPU_KV_SEQ         8192
-#define MAX_K              8
-#define LINEAR_KEY_DIM     128
-#define LINEAR_VALUE_DIM   128
+#define MAX_K 8
 
 #endif // CONFIG_H

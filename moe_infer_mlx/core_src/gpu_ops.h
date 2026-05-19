@@ -7,7 +7,7 @@
 // BatchMatvecSpec type is in model_types.h.
 // ============================================================================
 
-#include "model_internal.h"
+#include "common.h"
 
 // Run N matmuls in a single command buffer. All share the same input vector.
 static void gpu_batch_matvec(
@@ -146,7 +146,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 
 // Encode one expert forward using multi-expert slot k.
 void gpu_encode_expert_forward_slot(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int k
@@ -169,7 +169,7 @@ void gpu_encode_expert_forward_slot(
     uint32_t gate_up_in  = m->cfg.hidden_dim;
     uint32_t down_out    = m->cfg.hidden_dim;
     uint32_t down_in     = m->cfg.moe_intermediate;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = m->cfg.group_size;
 
     // gate_proj: data[k] -> gate[k]
     {
@@ -239,7 +239,7 @@ void gpu_encode_expert_forward_slot(
 
 // Encode one expert forward using explicit data buffer (for double buffering).
 void gpu_encode_expert_forward_slot_buf(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int k,
@@ -263,7 +263,7 @@ void gpu_encode_expert_forward_slot_buf(
     uint32_t gate_up_in  = m->cfg.hidden_dim;
     uint32_t down_out    = m->cfg.hidden_dim;
     uint32_t down_in     = m->cfg.moe_intermediate;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = m->cfg.group_size;
 
     // gate_proj
     {
@@ -333,7 +333,7 @@ void gpu_encode_expert_forward_slot_buf(
 
 // Batched expert encoding: encode K experts using fused or per-expert encoders.
 static void gpu_encode_experts_batched(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int K,
@@ -358,7 +358,7 @@ static void gpu_encode_experts_batched(
     uint32_t gate_up_in  = m->cfg.hidden_dim;
     uint32_t down_out    = m->cfg.hidden_dim;
     uint32_t down_in     = m->cfg.moe_intermediate;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = m->cfg.group_size;
     uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
     uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
@@ -465,7 +465,7 @@ static void gpu_encode_experts_batched(
 // Encode one expert forward (gate+up+swiglu+down) into cmdbuf (single expert, legacy).
 __attribute__((unused))
 static void gpu_encode_expert_forward(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
@@ -483,7 +483,7 @@ static void gpu_encode_expert_forward(
     uint32_t gate_up_in  = m->cfg.hidden_dim;
     uint32_t down_out    = m->cfg.hidden_dim;
     uint32_t down_in     = m->cfg.moe_intermediate;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = m->cfg.group_size;
 
     // gate_proj
     {
@@ -553,7 +553,7 @@ static void gpu_encode_expert_forward(
 
 // Batched wrapper: takes N matmul specs sharing the same input.
 static void fast_batch_matvec(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
@@ -574,7 +574,7 @@ static void fast_batch_matvec(
 
 __attribute__((unused))
 static void gpu_expert_forward(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     MetalCtx *ctx,
     const void *expert_data,
     const float *h_post,
@@ -604,7 +604,7 @@ static void gpu_expert_forward(
     uint32_t gate_up_in  = m->cfg.hidden_dim;
     uint32_t down_out    = m->cfg.hidden_dim;
     uint32_t down_in     = m->cfg.moe_intermediate;
-    uint32_t gs          = GROUP_SIZE;
+    uint32_t gs          = m->cfg.group_size;
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
@@ -687,12 +687,12 @@ static void gpu_expert_forward(
 // ============================================================================
 
 static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
-                              int head_dim, int rotary_dim) {
+                              int head_dim, int rotary_dim, float rope_theta) {
     int half = rotary_dim / 2;
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(ROPE_THETA, (float)(2 * i) / rotary_dim);
+            float freq = 1.0f / powf(rope_theta, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
@@ -706,7 +706,7 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
     for (int h = 0; h < num_kv_heads; h++) {
         float *kh = k + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(ROPE_THETA, (float)(2 * i) / rotary_dim);
+            float freq = 1.0f / powf(rope_theta, (float)(2 * i) / rotary_dim);
             float angle = (float)pos * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);

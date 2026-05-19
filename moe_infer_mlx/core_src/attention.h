@@ -5,10 +5,10 @@
 // KV Cache for full attention layers
 //
 // With USE_KV_CACHE_BF16: stored as bfloat16 (uint16_t) to halve memory bandwidth.
-// Types (KVCache, LinearAttnState) are in model_types.h.
+// Types (KVCache, LinearAttnState) are in common.h.
 // ============================================================================
 
-#include "model_internal.h"
+#include "common.h"
 
 #if USE_KV_CACHE_BF16
 typedef uint16_t kv_elem_t;
@@ -31,10 +31,10 @@ static inline float kv_elem_to_f32(float v) { return v; }
 static inline float f32_to_kv_elem(float v) { return v; }
 #endif
 
-static KVCache *kv_cache_new(FlashMoE_Model *m) {
+static KVCache *kv_cache_new(FlashMoE_Context *m) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * m->cfg.num_kv_heads * HEAD_DIM, KV_ELEM_SIZE);
-    c->v_cache = calloc(MAX_SEQ_LEN * m->cfg.num_kv_heads * HEAD_DIM, KV_ELEM_SIZE);
+    c->k_cache = calloc(m->cfg.max_seq_len * m->cfg.num_kv_heads * m->cfg.head_dim, KV_ELEM_SIZE);
+    c->v_cache = calloc(m->cfg.max_seq_len * m->cfg.num_kv_heads * m->cfg.head_dim, KV_ELEM_SIZE);
     c->len = 0;
     return c;
 }
@@ -51,10 +51,10 @@ static void kv_cache_free(KVCache *c) {
 // Linear attention state (GatedDeltaNet recurrent state)
 // ============================================================================
 
-static LinearAttnState *linear_attn_state_new(FlashMoE_Model *m) {
+static LinearAttnState *linear_attn_state_new(FlashMoE_Context *m) {
     LinearAttnState *s = calloc(1, sizeof(LinearAttnState));
-    s->conv_state = calloc((CONV_KERNEL_SIZE - 1) * m->cfg.linear_conv_dim, sizeof(float));
-    s->ssm_state = calloc(m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM, sizeof(float));
+    s->conv_state = calloc((m->cfg.conv_kernel_size - 1) * m->cfg.linear_conv_dim, sizeof(float));
+    s->ssm_state = calloc(m->cfg.linear_num_v_heads * m->cfg.linear_value_dim * m->cfg.linear_key_dim, sizeof(float));
     return s;
 }
 
@@ -78,7 +78,7 @@ static float vec_rms(const float *v, int n) {
 
 __attribute__((unused))
 static void full_attention_forward(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     WeightFile *wf,
     int layer_idx,
     float *hidden,       // [m->cfg.hidden_dim] in/out
@@ -102,7 +102,7 @@ static void full_attention_forward(
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
     uint16_t *norm_w = get_tensor_ptr(m, wf, name);
-    cpu_rms_norm(hidden, norm_w, normed, m->cfg.hidden_dim, RMS_NORM_EPS);
+    cpu_rms_norm(hidden, norm_w, normed, m->cfg.hidden_dim, m->cfg.rms_norm_eps);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] normed_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -110,9 +110,9 @@ static void full_attention_forward(
     }
 
     // ---- QKV Projection ----
-    int q_proj_dim = m->cfg.num_attn_heads * HEAD_DIM * 2;
-    int q_dim = m->cfg.num_attn_heads * HEAD_DIM;
-    int kv_dim = m->cfg.num_kv_heads * HEAD_DIM;
+    int q_proj_dim = m->cfg.num_attn_heads * m->cfg.head_dim * 2;
+    int q_dim = m->cfg.num_attn_heads * m->cfg.head_dim;
+    int kv_dim = m->cfg.num_kv_heads * m->cfg.head_dim;
 
     float *q_proj_out = calloc(q_proj_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
@@ -143,9 +143,9 @@ static void full_attention_forward(
     // Batch Q/K/V into one command buffer (3 dispatches, 1 commit)
     if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
         BatchMatvecSpec qkv_specs[3] = {
-            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, m->cfg.hidden_dim, GROUP_SIZE, 0 },
-            { kw, ks, kb, k,          (uint32_t)kv_dim,     m->cfg.hidden_dim, GROUP_SIZE, 1 },
-            { vw, vs, vb, v,          (uint32_t)kv_dim,     m->cfg.hidden_dim, GROUP_SIZE, 2 },
+            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, m->cfg.hidden_dim, m->cfg.group_size, 0 },
+            { kw, ks, kb, k,          (uint32_t)kv_dim,     m->cfg.hidden_dim, m->cfg.group_size, 1 },
+            { vw, vs, vb, v,          (uint32_t)kv_dim,     m->cfg.hidden_dim, m->cfg.group_size, 2 },
         };
         fast_batch_matvec(m, normed, m->cfg.hidden_dim, qkv_specs, 3);
     }
@@ -159,9 +159,9 @@ static void full_attention_forward(
     float *q = calloc(q_dim, sizeof(float));
     float *q_gate = calloc(q_dim, sizeof(float));
     for (int h = 0; h < m->cfg.num_attn_heads; h++) {
-        float *src = q_proj_out + h * (2 * HEAD_DIM);
-        memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
-        memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
+        float *src = q_proj_out + h * (2 * m->cfg.head_dim);
+        memcpy(q + h * m->cfg.head_dim, src, m->cfg.head_dim * sizeof(float));
+        memcpy(q_gate + h * m->cfg.head_dim, src + m->cfg.head_dim, m->cfg.head_dim * sizeof(float));
     }
     free(q_proj_out);
 
@@ -186,11 +186,11 @@ static void full_attention_forward(
     // Apply per-head Q norm
     if (qnorm_w) {
         for (int h = 0; h < m->cfg.num_attn_heads; h++) {
-            float *qh = q + h * HEAD_DIM;
+            float *qh = q + h * m->cfg.head_dim;
             float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += qh[i] * qh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
+            for (int i = 0; i < m->cfg.head_dim; i++) sum_sq += qh[i] * qh[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / m->cfg.head_dim + m->cfg.rms_norm_eps);
+            for (int i = 0; i < m->cfg.head_dim; i++) {
                 qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
             }
         }
@@ -198,11 +198,11 @@ static void full_attention_forward(
     // Apply per-head K norm
     if (knorm_w) {
         for (int h = 0; h < m->cfg.num_kv_heads; h++) {
-            float *kh = k + h * HEAD_DIM;
+            float *kh = k + h * m->cfg.head_dim;
             float sum_sq = 0.0f;
-            for (int i = 0; i < HEAD_DIM; i++) sum_sq += kh[i] * kh[i];
-            float inv_rms = 1.0f / sqrtf(sum_sq / HEAD_DIM + RMS_NORM_EPS);
-            for (int i = 0; i < HEAD_DIM; i++) {
+            for (int i = 0; i < m->cfg.head_dim; i++) sum_sq += kh[i] * kh[i];
+            float inv_rms = 1.0f / sqrtf(sum_sq / m->cfg.head_dim + m->cfg.rms_norm_eps);
+            for (int i = 0; i < m->cfg.head_dim; i++) {
                 kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
             }
         }
@@ -210,7 +210,7 @@ static void full_attention_forward(
 
 
     // ---- RoPE ----
-    apply_rotary_emb(q, k, pos, m->cfg.num_attn_heads, m->cfg.num_kv_heads, HEAD_DIM, m->cfg.rotary_dim);
+    apply_rotary_emb(q, k, pos, m->cfg.num_attn_heads, m->cfg.num_kv_heads, m->cfg.head_dim, m->cfg.rotary_dim, m->cfg.rope_theta);
 
     // ---- Update KV cache ----
     int cache_pos = kv->len;
@@ -227,19 +227,19 @@ static void full_attention_forward(
 
     // ---- Scaled dot-product attention ----
     int heads_per_kv = m->cfg.num_attn_heads / m->cfg.num_kv_heads;
-    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    float scale = 1.0f / sqrtf((float)m->cfg.head_dim);
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
     for (int h = 0; h < m->cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
-        float *qh = q + h * HEAD_DIM;
+        float *qh = q + h * m->cfg.head_dim;
 
         float *scores = malloc(kv->len * sizeof(float));
         for (int p = 0; p < kv->len; p++) {
-            kv_elem_t *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+            kv_elem_t *kp = kv->k_cache + p * kv_dim + kv_h * m->cfg.head_dim;
             float dot = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
+            for (int d = 0; d < m->cfg.head_dim; d++) {
                 dot += qh[d] * kv_elem_to_f32(kp[d]);
             }
             scores[p] = dot * scale;
@@ -247,10 +247,10 @@ static void full_attention_forward(
 
         cpu_softmax(scores, kv->len);
 
-        float *oh = attn_out + h * HEAD_DIM;
+        float *oh = attn_out + h * m->cfg.head_dim;
         for (int p = 0; p < kv->len; p++) {
-            kv_elem_t *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d++) {
+            kv_elem_t *vp = kv->v_cache + p * kv_dim + kv_h * m->cfg.head_dim;
+            for (int d = 0; d < m->cfg.head_dim; d++) {
                 oh[d] += scores[p] * kv_elem_to_f32(vp[d]);
             }
         }
@@ -272,7 +272,7 @@ static void full_attention_forward(
     uint16_t *os_ptr = get_tensor_ptr(m, wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
     uint16_t *ob = get_tensor_ptr(m, wf, name);
-    if (ow && os_ptr && ob) fast_dequant_matvec(m, ow, os_ptr, ob, attn_out, attn_projected, m->cfg.hidden_dim, q_dim, GROUP_SIZE);
+    if (ow && os_ptr && ob) fast_dequant_matvec(m, ow, os_ptr, ob, attn_out, attn_projected, m->cfg.hidden_dim, q_dim, m->cfg.group_size);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] attn_out_rms=%.6f o_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -328,7 +328,7 @@ static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w
 
 __attribute__((unused))
 static void linear_attention_forward(
-    FlashMoE_Model *m,
+    FlashMoE_Context *m,
     WeightFile *wf,
     int layer_idx,
     float *hidden,           // [m->cfg.hidden_dim] in/out
@@ -358,7 +358,7 @@ static void linear_attention_forward(
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
     uint16_t *norm_w = get_tensor_ptr(m, wf, name);
-    cpu_rms_norm(hidden, norm_w, normed, m->cfg.hidden_dim, RMS_NORM_EPS);
+    cpu_rms_norm(hidden, norm_w, normed, m->cfg.hidden_dim, m->cfg.rms_norm_eps);
 
     // ---- Batch QKV + Z + B + A projections (4 matmuls, 1 command buffer) ----
     int qkv_dim = m->cfg.linear_conv_dim;
@@ -399,10 +399,10 @@ static void linear_attention_forward(
     if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
         b_w && b_s && b_b && a_w && a_s && a_b) {
         BatchMatvecSpec la_specs[4] = {
-            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         m->cfg.hidden_dim, GROUP_SIZE, 0 },
-            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           m->cfg.hidden_dim, GROUP_SIZE, 1 },
-            { b_w,   b_s,   b_b,   beta,   (uint32_t)m->cfg.linear_num_v_heads, m->cfg.hidden_dim, GROUP_SIZE, 2 },
-            { a_w,   a_s,   a_b,   alpha,  (uint32_t)m->cfg.linear_num_v_heads, m->cfg.hidden_dim, GROUP_SIZE, 3 },
+            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         m->cfg.hidden_dim, m->cfg.group_size, 0 },
+            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           m->cfg.hidden_dim, m->cfg.group_size, 1 },
+            { b_w,   b_s,   b_b,   beta,   (uint32_t)m->cfg.linear_num_v_heads, m->cfg.hidden_dim, m->cfg.group_size, 2 },
+            { a_w,   a_s,   a_b,   alpha,  (uint32_t)m->cfg.linear_num_v_heads, m->cfg.hidden_dim, m->cfg.group_size, 3 },
         };
         fast_batch_matvec(m, normed, m->cfg.hidden_dim, la_specs, 4);
     }
@@ -414,13 +414,13 @@ static void linear_attention_forward(
     float *conv_out = calloc(qkv_dim, sizeof(float));
     if (conv_w) {
         cpu_conv1d_step(state->conv_state, qkv, conv_w, conv_out,
-                        qkv_dim, CONV_KERNEL_SIZE);
+                        qkv_dim, m->cfg.conv_kernel_size);
     }
 
     // Update conv state: shift left, append new input
     memmove(state->conv_state, state->conv_state + qkv_dim,
-            (CONV_KERNEL_SIZE - 2) * qkv_dim * sizeof(float));
-    memcpy(state->conv_state + (CONV_KERNEL_SIZE - 2) * qkv_dim, qkv,
+            (m->cfg.conv_kernel_size - 2) * qkv_dim * sizeof(float));
+    memcpy(state->conv_state + (m->cfg.conv_kernel_size - 2) * qkv_dim, qkv,
            qkv_dim * sizeof(float));
 
     // ---- Split conv_out into q, k, v ----
@@ -429,18 +429,18 @@ static void linear_attention_forward(
     float *lin_v = conv_out + 2 * m->cfg.linear_total_key;
 
     // ---- RMS normalize q and k (bare, no weights) ----
-    float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
+    float inv_scale = 1.0f / sqrtf((float)m->cfg.linear_key_dim);
 
     for (int h = 0; h < m->cfg.linear_num_k_heads; h++) {
-        float *qh = lin_q + h * LINEAR_KEY_DIM;
-        cpu_rms_norm_bare(qh, qh, LINEAR_KEY_DIM, 1e-6f);
+        float *qh = lin_q + h * m->cfg.linear_key_dim;
+        cpu_rms_norm_bare(qh, qh, m->cfg.linear_key_dim, 1e-6f);
         float q_scale = inv_scale * inv_scale;
-        for (int d = 0; d < LINEAR_KEY_DIM; d++) qh[d] *= q_scale;
+        for (int d = 0; d < m->cfg.linear_key_dim; d++) qh[d] *= q_scale;
     }
     for (int h = 0; h < m->cfg.linear_num_k_heads; h++) {
-        float *kh = lin_k + h * LINEAR_KEY_DIM;
-        cpu_rms_norm_bare(kh, kh, LINEAR_KEY_DIM, 1e-6f);
-        for (int d = 0; d < LINEAR_KEY_DIM; d++) kh[d] *= inv_scale;
+        float *kh = lin_k + h * m->cfg.linear_key_dim;
+        cpu_rms_norm_bare(kh, kh, m->cfg.linear_key_dim, 1e-6f);
+        for (int d = 0; d < m->cfg.linear_key_dim; d++) kh[d] *= inv_scale;
     }
 
     // ---- Gated delta net recurrence ----
@@ -473,36 +473,36 @@ static void linear_attention_forward(
         float g = g_decay[vh];
         float b_gate = beta_gate[vh];
 
-        float *S = state->ssm_state + vh * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
-        float *v_h = lin_v + vh * LINEAR_VALUE_DIM;
-        float *k_h = lin_k + kh * LINEAR_KEY_DIM;
+        float *S = state->ssm_state + vh * m->cfg.linear_value_dim * m->cfg.linear_key_dim;
+        float *v_h = lin_v + vh * m->cfg.linear_value_dim;
+        float *k_h = lin_k + kh * m->cfg.linear_key_dim;
 
         // Step 1: Decay state
-        for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
-            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
-                S[vi * LINEAR_KEY_DIM + ki] *= g;
+        for (int vi = 0; vi < m->cfg.linear_value_dim; vi++) {
+            for (int ki = 0; ki < m->cfg.linear_key_dim; ki++) {
+                S[vi * m->cfg.linear_key_dim + ki] *= g;
             }
         }
 
         // Step 2: Compute kv_mem, delta, and update state
-        for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
+        for (int vi = 0; vi < m->cfg.linear_value_dim; vi++) {
             float kv_mem = 0.0f;
-            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
-                kv_mem += S[vi * LINEAR_KEY_DIM + ki] * k_h[ki];
+            for (int ki = 0; ki < m->cfg.linear_key_dim; ki++) {
+                kv_mem += S[vi * m->cfg.linear_key_dim + ki] * k_h[ki];
             }
             float delta = (v_h[vi] - kv_mem) * b_gate;
-            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
-                S[vi * LINEAR_KEY_DIM + ki] += k_h[ki] * delta;
+            for (int ki = 0; ki < m->cfg.linear_key_dim; ki++) {
+                S[vi * m->cfg.linear_key_dim + ki] += k_h[ki] * delta;
             }
         }
 
         // Step 3: Output
-        float *q_h = lin_q + kh * LINEAR_KEY_DIM;
-        float *o_h = out_values + vh * LINEAR_VALUE_DIM;
-        for (int vi = 0; vi < LINEAR_VALUE_DIM; vi++) {
+        float *q_h = lin_q + kh * m->cfg.linear_key_dim;
+        float *o_h = out_values + vh * m->cfg.linear_value_dim;
+        for (int vi = 0; vi < m->cfg.linear_value_dim; vi++) {
             float sum = 0.0f;
-            for (int ki = 0; ki < LINEAR_KEY_DIM; ki++) {
-                sum += S[vi * LINEAR_KEY_DIM + ki] * q_h[ki];
+            for (int ki = 0; ki < m->cfg.linear_key_dim; ki++) {
+                sum += S[vi * m->cfg.linear_key_dim + ki] * q_h[ki];
             }
             o_h[vi] = sum;
         }
@@ -514,13 +514,13 @@ static void linear_attention_forward(
 
     float *gated_out = calloc(m->cfg.linear_total_value, sizeof(float));
     for (int vh = 0; vh < m->cfg.linear_num_v_heads; vh++) {
-        float *oh = out_values + vh * LINEAR_VALUE_DIM;
-        float *zh = z + vh * LINEAR_VALUE_DIM;
-        float *gh = gated_out + vh * LINEAR_VALUE_DIM;
+        float *oh = out_values + vh * m->cfg.linear_value_dim;
+        float *zh = z + vh * m->cfg.linear_value_dim;
+        float *gh = gated_out + vh * m->cfg.linear_value_dim;
         if (gated_norm_w) {
-            cpu_rms_norm_gated(oh, zh, gated_norm_w, gh, LINEAR_VALUE_DIM, RMS_NORM_EPS);
+            cpu_rms_norm_gated(oh, zh, gated_norm_w, gh, m->cfg.linear_value_dim, m->cfg.rms_norm_eps);
         } else {
-            memcpy(gh, oh, LINEAR_VALUE_DIM * sizeof(float));
+            memcpy(gh, oh, m->cfg.linear_value_dim * sizeof(float));
         }
     }
 
@@ -534,7 +534,7 @@ static void linear_attention_forward(
     uint16_t *out_b = get_tensor_ptr(m, wf, name);
     if (out_w && out_s && out_b) {
         fast_dequant_matvec(m, out_w, out_s, out_b, gated_out, attn_out, m->cfg.hidden_dim,
-                            m->cfg.linear_total_value, GROUP_SIZE);
+                            m->cfg.linear_total_value, m->cfg.group_size);
     }
 
     // ---- Residual ----
