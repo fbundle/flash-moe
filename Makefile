@@ -61,6 +61,15 @@ $(BIN_DIR)/shaders.metallib: $(SRC_DIR)/shaders.metal | $(BIN_DIR)
 	$(METALC) -c $(SRC_DIR)/shaders.metal -o $(BIN_DIR)/shaders.air
 	$(METALLIB) $(BIN_DIR)/shaders.air -o $@
 
+# ── Python Cython extension ────────────────────────────────────────────────
+.PHONY: python-build python-clean
+
+python-build:
+	python setup.py build_ext --inplace
+
+python-clean:
+	rm -rf moe_infer_mlx/_core*.so build/
+
 # ── Clean ─────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BIN_DIR)
@@ -72,6 +81,8 @@ help:
 	@echo "Build targets:"
 	@echo "  make              Build infer"
 	@echo "  make metallib     Pre-compile Metal shader library"
+	@echo "  make python-build Build Cython extension (moe_infer_mlx)"
+	@echo "  make python-clean Remove Python build artifacts"
 	@echo "  make clean        Remove bin/"
 	@echo ""
 	@echo "Build options:"

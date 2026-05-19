@@ -34,3 +34,5 @@ logs/
 hub
 output
 vendor
+build/
+moe_infer_mlx/_core.c
