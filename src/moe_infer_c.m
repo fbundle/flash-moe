@@ -8,7 +8,6 @@
 #include "metal_setup.h"
 #include "gpu_ops.h"
 #include "attention.h"
-#include "moe_forward.h"
 #include "embeddings.h"
 #include "expert_io.h"
 #include "layer_forward.h"

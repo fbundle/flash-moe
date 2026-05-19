@@ -165,7 +165,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 // Encode one expert forward using multi-expert slot k.
 // Expert data must already be in buf_multi_expert_data[k].
 // Input must already be in buf_multi_expert_input.
-static void gpu_encode_expert_forward_slot(
+void gpu_encode_expert_forward_slot(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int k  // slot index
@@ -260,7 +260,7 @@ static void gpu_encode_expert_forward_slot(
 // Expert data must already be in data_buf.
 // Input must already be in buf_multi_expert_input.
 // Uses slot k's gate/up/act/out scratch buffers.
-static void gpu_encode_expert_forward_slot_buf(
+void gpu_encode_expert_forward_slot_buf(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
     int k,                  // slot index (for gate/up/act/out scratch)

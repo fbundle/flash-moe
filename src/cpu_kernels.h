@@ -241,7 +241,7 @@ static void cpu_vec_zero(float *dst, int dim) {
 }
 
 // Argmax
-static int cpu_argmax(const float *x, int dim) {
+int cpu_argmax(const float *x, int dim) {
     int best = 0;
     float best_val = x[0];
     for (int i = 1; i < dim; i++) {

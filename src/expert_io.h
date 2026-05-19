@@ -25,7 +25,7 @@ typedef struct {
     int thread_id;
 } InferPreadThreadArg;
 
-static void *infer_pread_thread_fn(void *arg) {
+void *infer_pread_thread_fn(void *arg) {
     InferPreadThreadArg *ta = (InferPreadThreadArg *)arg;
     for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
         InferPreadTask *t = &ta->tasks[i];
@@ -189,7 +189,7 @@ static void io_pool_shutdown(void) {
 
 // Parallel pread of K experts into Metal buffers using pthreads.
 // Returns number of successfully loaded experts, sets valid[] flags.
-static int parallel_pread_experts(
+int parallel_pread_experts(
     int packed_fd,
     int *expert_indices,
     int K,
@@ -225,7 +225,7 @@ static int parallel_pread_experts(
 // Parallel pread into explicit buffer set (for double buffering).
 // Same as parallel_pread_experts but reads into caller-specified MTLBuffers.
 // ============================================================================
-static int parallel_pread_experts_into(
+int parallel_pread_experts_into(
     int packed_fd,
     int *expert_indices,
     int K,
@@ -311,7 +311,7 @@ static int g_pred_count[60];                       // how many experts stored pe
 static int g_pred_valid = 0;                       // 1 after first token completes (predictions available)
 // g_pred_enabled, g_pred_hits, g_pred_misses, g_pred_layers declared near timing (line ~163)
 
-static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
+ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
     cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
     cache->max_entries = max_entries;
@@ -449,7 +449,7 @@ typedef struct {
 
 static MallocExpertCache *g_malloc_cache = NULL;
 
-static MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
+MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
     MallocExpertCache *cache = calloc(1, sizeof(MallocExpertCache));
     cache->data = calloc(max_entries, sizeof(void *));
     cache->metal_bufs = (__strong id<MTLBuffer> *)calloc(max_entries, sizeof(id<MTLBuffer>));
@@ -649,7 +649,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
 
 // Build I/O plan on main thread (ARC-safe: extracts void* from id<MTLBuffer>),
 // then signal background prefetch thread.
-static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                   int *expert_indices, int K,
                                   id<MTLBuffer> __strong *dst_bufs) {
     pthread_mutex_lock(&pf->mutex);
@@ -671,7 +671,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
 
 // Wait for background prefetch to complete. Returns number of loaded experts.
 // Copies valid[] flags into caller's array.
-static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
+int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
     pthread_mutex_lock(&pf->mutex);
     while (!pf->done) {
         pthread_cond_wait(&pf->cond, &pf->mutex);
@@ -687,7 +687,7 @@ static int infer_prefetch_wait(InferPrefetchCtx *pf, int *valid_out, int K) {
 static InferPrefetchCtx *g_prefetch = NULL;
 static pthread_t g_prefetch_tid;
 
-static void infer_prefetch_init(void) {
+void infer_prefetch_init(void) {
     if (g_prefetch) return;
     g_prefetch = calloc(1, sizeof(InferPrefetchCtx));
     pthread_mutex_init(&g_prefetch->mutex, NULL);
@@ -696,7 +696,7 @@ static void infer_prefetch_init(void) {
     pthread_create(&g_prefetch_tid, NULL, infer_prefetch_thread_fn, g_prefetch);
 }
 
-static void infer_prefetch_shutdown(void) {
+void infer_prefetch_shutdown(void) {
     if (!g_prefetch) return;
     pthread_mutex_lock(&g_prefetch->mutex);
     g_prefetch->shutdown = 1;

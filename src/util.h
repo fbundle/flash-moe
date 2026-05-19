@@ -1,49 +1,7 @@
 #ifndef UTIL_H
 #define UTIL_H
 
-/*
- * infer.m — Complete Qwen3.5-397B inference engine using Metal
- *
- * Full forward pass: embedding -> 60 transformer layers -> norm -> lm_head -> sample
- * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
- * Expert weights loaded from packed_experts/ per layer per token (pread)
- *
- * Architecture: Qwen3.5-397B-A17B (MoE)
- *   - 60 layers: 45 linear attention (GatedDeltaNet) + 15 full attention
- *   - hidden_size=4096, head_dim=256, num_attention_heads=32, num_kv_heads=2
- *   - 512 experts/layer, 10 active (we use K=4 for speed)
- *   - Shared expert per layer (always active)
- *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
- *   - Full attention: standard QKV + scaled dot product + RoPE
- *
- * Command buffer optimization (fused_layer_forward):
- *   Per-layer Metal command buffer structure:
- *     CMD1: attention input projections (3-4 dispatches, 1 commit)
- *     CPU:  attention compute (RoPE/softmax/delta-net)
- *     CMD2: o_proj + residual_add + rms_norm + routing + shared gate/up (8 encoders, 1 commit)
- *           GPU handles residual connection and post-attn norm internally,
- *           eliminating the CPU round-trip that previously split this into 2 cmd buffers.
- *     CPU:  softmax + top-K + pread all K experts (4 pthreads parallel)
- *     CMD3: all K expert forwards + shared SwiGLU + shared down
- *           + GPU-side combine + residual_add + rms_norm -> buf_input (DEFERRED commit)
- *           Batched encoding: 4 encoders for K experts + 2 shared + 3 combine = 9 total
- *   Total: 3 cmd buffers per layer. CMD3 is submitted async (commit without wait).
- *   GPU-side combine in CMD3: for non-last layers, CMD3 also computes:
- *     moe_combine_residual (weighted sum + residual + shared gate -> hidden)
- *     rms_norm (hidden -> buf_input using NEXT layer's input_norm weights)
- *   This allows the next layer's CMD1 to submit immediately without waiting
- *   for CMD3 completion — the GPU queue serializes CMD3(N-1) then CMD1(N).
- *   Saves ~0.83ms/layer deferred_wait + CPU combine + input_norm overhead.
- *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
- *   forwards to be encoded into a single command buffer.
- *   Batched encoding: 2 encoders per expert (gate+up fused, SwiGLU+down fused)
- *   + 2 for shared expert = K*2 + 2 total encoders in CMD3.
- *   Double-buffered expert data (buf_multi_expert_data / data_B) for future
- *   async pread overlap with GPU compute.
- *
- * Build:  clang -O2 -Wall -fobjc-arc -framework Metal -framework Foundation -lpthread infer.m -o infer
- * Run:    ./infer --prompt "Explain relativity" --tokens 50
- */
+// Shared utilities: system includes, global state, cache telemetry, timing.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -202,7 +160,7 @@ static uint8_t g_cache_seen[NUM_LAYERS][NUM_EXPERTS];
 static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS];
 static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS];
 
-static void cache_telemetry_reset(void) {
+void cache_telemetry_reset(void) {
     memset(&g_cache_telemetry, 0, sizeof(g_cache_telemetry));
     memset(g_cache_seen, 0, sizeof(g_cache_seen));
     memset(g_cache_last_touch_token, 0, sizeof(g_cache_last_touch_token));
@@ -256,7 +214,7 @@ static void cache_telemetry_evict(int layer_idx, int expert_idx) {
     g_cache_last_evict_token[layer_idx][expert_idx] = g_cache_telemetry.token_clock;
 }
 
-static void cache_telemetry_print(uint64_t hits, uint64_t misses) {
+void cache_telemetry_print(uint64_t hits, uint64_t misses) {
     if (!g_cache_telemetry_enabled) return;
     uint64_t total = hits + misses;
     fprintf(stderr, "\n=== Cache Telemetry ===\n");
@@ -287,11 +245,11 @@ static void cache_telemetry_print(uint64_t hits, uint64_t misses) {
             total > 0 ? 100.0 * hits / total : 0.0);
 }
 
-static void timing_reset(void) {
+void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
 }
 
-static void timing_print(void) {
+void timing_print(void) {
     if (g_timing.count == 0) return;
     int n = g_timing.count;
     fprintf(stderr, "\n[timing] Per-layer breakdown (avg of %d layers, ms):\n", n);
