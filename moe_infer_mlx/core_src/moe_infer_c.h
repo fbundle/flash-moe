@@ -11,11 +11,9 @@ extern "C" {
 // Opaque cache handle — owns KV caches, linear-attn states, and position.
 typedef struct FlashMoE_Cache FlashMoE_Cache;
 
-typedef struct FlashMoE_Model FlashMoE_Model;
-
 // Initialize the inference engine from model_path.
 // Returns 0 on success, -1 on error.
-FlashMoE_Model *flashmoe_init(const char *model_path);
+int flashmoe_init(const char *model_path);
 
 // Create / destroy caches. Cache holds recurrent state (KV, delta-net, position).
 FlashMoE_Cache *flashmoe_cache_new(void);
