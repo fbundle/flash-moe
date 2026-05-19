@@ -3,24 +3,11 @@
 
 // ============================================================================
 // JSON parser (minimal, for model_weights.json)
+// Types (TensorInfo, TensorManifest, TensorHTEntry, WeightFile) are in model_types.h.
+// Hash table state (tensor_ht, tensor_ht_built) lives in FlashMoE_Model.
 // ============================================================================
 
-// We use NSJSONSerialization via ObjC since we already link Foundation
-
-typedef struct {
-    const char *name;
-    size_t offset;
-    size_t size;
-    int ndim;
-    int shape[4];
-    char dtype[8];  // "U32", "BF16", "F32"
-} TensorInfo;
-
-typedef struct {
-    TensorInfo *tensors;
-    int num_tensors;
-    int capacity;
-} TensorManifest;
+#include "model_internal.h"
 
 static TensorManifest *load_manifest(const char *json_path) {
     @autoreleasepool {
@@ -47,14 +34,14 @@ static TensorManifest *load_manifest(const char *json_path) {
             return NULL;
         }
 
-        TensorManifest *m = calloc(1, sizeof(TensorManifest));
-        m->capacity = (int)[tensors count] + 16;
-        m->tensors = calloc(m->capacity, sizeof(TensorInfo));
-        m->num_tensors = 0;
+        TensorManifest *manifest = calloc(1, sizeof(TensorManifest));
+        manifest->capacity = (int)[tensors count] + 16;
+        manifest->tensors = calloc(manifest->capacity, sizeof(TensorInfo));
+        manifest->num_tensors = 0;
 
         for (NSString *key in tensors) {
             NSDictionary *info = tensors[key];
-            TensorInfo *t = &m->tensors[m->num_tensors];
+            TensorInfo *t = &manifest->tensors[manifest->num_tensors];
 
             const char *name = [key UTF8String];
             t->name = strdup(name);
@@ -70,25 +57,17 @@ static TensorManifest *load_manifest(const char *json_path) {
             const char *dtype = [info[@"dtype"] UTF8String];
             strncpy(t->dtype, dtype, 7);
 
-            m->num_tensors++;
+            manifest->num_tensors++;
         }
 
-        printf("[manifest] Loaded %d tensors from %s\n", m->num_tensors, json_path);
-        return m;
+        printf("[manifest] Loaded %d tensors from %s\n", manifest->num_tensors, json_path);
+        return manifest;
     }
 }
 
 // Hash table for O(1) tensor lookup (replaces O(N) linear scan).
 // FNV-1a hash, open addressing with linear probing.
 #define TENSOR_HT_SIZE 8192  // power of 2, > 4x num_tensors (2092)
-
-typedef struct {
-    const char *key;     // tensor name (pointer into TensorInfo)
-    TensorInfo *value;   // pointer to tensor info
-} TensorHTEntry;
-
-static TensorHTEntry tensor_ht[TENSOR_HT_SIZE];
-static int tensor_ht_built = 0;
 
 static uint32_t fnv1a(const char *s) {
     uint32_t h = 2166136261u;
@@ -99,26 +78,26 @@ static uint32_t fnv1a(const char *s) {
     return h;
 }
 
-static void build_tensor_ht(TensorManifest *m) {
-    if (tensor_ht_built) return;
-    memset(tensor_ht, 0, sizeof(tensor_ht));
-    for (int i = 0; i < m->num_tensors; i++) {
-        uint32_t idx = fnv1a(m->tensors[i].name) & (TENSOR_HT_SIZE - 1);
-        while (tensor_ht[idx].key) {
+static void build_tensor_ht(FlashMoE_Model *m, TensorManifest *manifest) {
+    if (m->tensor_ht_built) return;
+    memset(m->tensor_ht, 0, sizeof(m->tensor_ht));
+    for (int i = 0; i < manifest->num_tensors; i++) {
+        uint32_t idx = fnv1a(manifest->tensors[i].name) & (TENSOR_HT_SIZE - 1);
+        while (m->tensor_ht[idx].key) {
             idx = (idx + 1) & (TENSOR_HT_SIZE - 1);
         }
-        tensor_ht[idx].key = m->tensors[i].name;
-        tensor_ht[idx].value = &m->tensors[i];
+        m->tensor_ht[idx].key = manifest->tensors[i].name;
+        m->tensor_ht[idx].value = &manifest->tensors[i];
     }
-    tensor_ht_built = 1;
+    m->tensor_ht_built = 1;
 }
 
-static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
-    if (!tensor_ht_built) build_tensor_ht(m);
+static TensorInfo *find_tensor(FlashMoE_Model *m, TensorManifest *manifest, const char *name) {
+    if (!m->tensor_ht_built) build_tensor_ht(m, manifest);
     uint32_t idx = fnv1a(name) & (TENSOR_HT_SIZE - 1);
-    while (tensor_ht[idx].key) {
-        if (strcmp(tensor_ht[idx].key, name) == 0) {
-            return tensor_ht[idx].value;
+    while (m->tensor_ht[idx].key) {
+        if (strcmp(m->tensor_ht[idx].key, name) == 0) {
+            return m->tensor_ht[idx].value;
         }
         idx = (idx + 1) & (TENSOR_HT_SIZE - 1);
     }
@@ -128,12 +107,6 @@ static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
 // ============================================================================
 // Weight file: mmap'd binary blob
 // ============================================================================
-
-typedef struct {
-    void *data;
-    size_t size;
-    TensorManifest *manifest;
-} WeightFile;
 
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     int fd = open(bin_path, O_RDONLY);
@@ -147,8 +120,6 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     size_t size = st.st_size;
 
 #if MALLOC_WEIGHTS
-    // Page-aligned allocation for zero-copy Metal buffer wrapping.
-    // Non-expert weights are always in use — read them all upfront.
     size_t page_size = 16384;
     size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
     void *data = NULL;
@@ -198,8 +169,8 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     return wf;
 }
 
-static void *get_tensor_ptr(WeightFile *wf, const char *name) {
-    TensorInfo *t = find_tensor(wf->manifest, name);
+static void *get_tensor_ptr(FlashMoE_Model *m, WeightFile *wf, const char *name) {
+    TensorInfo *t = find_tensor(m, wf->manifest, name);
     if (!t) {
         fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
         return NULL;
@@ -207,8 +178,8 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
     return (char *)wf->data + t->offset;
 }
 
-static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
-    return find_tensor(wf->manifest, name);
+static TensorInfo *get_tensor_info(FlashMoE_Model *m, WeightFile *wf, const char *name) {
+    return find_tensor(m, wf->manifest, name);
 }
 
 

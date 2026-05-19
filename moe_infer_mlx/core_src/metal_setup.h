@@ -1,129 +1,27 @@
 #ifndef METAL_SETUP_H
 #define METAL_SETUP_H
 
+// ============================================================================
+// Metal context for GPU-accelerated matmuls.
+// MetalCtx type is in model_types.h. State stored in FlashMoE_Model.metal.
+// ============================================================================
+
+#include "model_internal.h"
 #include "shaders.h"
 
-// ============================================================================
-// Metal context for GPU-accelerated matmuls
-// ============================================================================
-
-// Maximum number of batched matmul output slots.
-// Used for encoding multiple matmuls into one command buffer.
-#define MAX_BATCH_SLOTS 8
-
-typedef struct {
-    id<MTLDevice>               device;
-    id<MTLCommandQueue>         queue;
-    id<MTLLibrary>              library;
-    id<MTLComputePipelineState> matvec_v3;
-    id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
-    id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
-    id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
-    id<MTLComputePipelineState> rms_norm_sum;
-    id<MTLComputePipelineState> rms_norm_apply;
-    id<MTLComputePipelineState> rms_norm_apply_bf16;
-#if USE_FUSED_RMS_NORM
-    id<MTLComputePipelineState> rms_norm_fused;     // single-kernel fused RMS norm (llama.cpp pattern)
-#endif
-    id<MTLComputePipelineState> residual_add;
-    id<MTLComputePipelineState> swiglu;
-#if USE_FUSED_GATE_UP_SWIGLU
-    id<MTLComputePipelineState> fused_gate_up_swiglu;  // fused gate+up+SwiGLU kernel
-#endif
-    // GPU attention pipelines
-    id<MTLComputePipelineState> attn_scores_pipe;
-    id<MTLComputePipelineState> attn_softmax_pipe;
-    id<MTLComputePipelineState> attn_values_pipe;
-    id<MTLComputePipelineState> sigmoid_gate_pipe;
-    // Reusable buffers for attention matmuls
-    id<MTLBuffer> buf_input;     // input vector [g_cfg.hidden_dim or max projection input]
-    id<MTLBuffer> buf_output;    // output vector [max projection output]
-    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer
-    // Batched matmul output slots (preallocated, reused across dispatches)
-    id<MTLBuffer> batch_out[MAX_BATCH_SLOTS];
-    // Reusable buffers for expert computation (avoids per-expert alloc)
-    // Legacy single-expert buffers (kept for gpu_expert_forward compat)
-    id<MTLBuffer> buf_expert_data;   // holds one expert's packed weights (g_cfg.expert_size_4bit bytes)
-    id<MTLBuffer> buf_expert_input;  // h_post input [g_cfg.hidden_dim floats]
-    id<MTLBuffer> buf_expert_gate;   // gate_proj output [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_expert_up;     // up_proj output [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_expert_act;    // SwiGLU output [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_expert_out;    // down_proj output [g_cfg.hidden_dim floats]
-    // Multi-expert buffers: K independent sets so all experts can be encoded
-    // into a SINGLE command buffer (no per-expert commit+wait).
-    // Each expert k uses slot [k].
-    // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
-    // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
-    id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [g_cfg.expert_size_4bit bytes] each — buffer set A
-    id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [g_cfg.expert_size_4bit bytes] each — buffer set B (prefetch)
-    id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_multi_expert_up[MAX_K];     // [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_multi_expert_act[MAX_K];    // [g_cfg.moe_intermediate floats]
-    id<MTLBuffer> buf_multi_expert_out[MAX_K];    // [g_cfg.hidden_dim floats]
-    id<MTLBuffer> buf_multi_expert_input;         // [g_cfg.hidden_dim floats] (shared, read-only during dispatch)
-    // Shared expert buffers for fused CMD2 (shared gate/up computed in CMD1,
-    // SwiGLU + down_proj in CMD2 alongside routed experts)
-    id<MTLBuffer> buf_shared_gate;   // [g_cfg.shared_intermediate floats]
-    id<MTLBuffer> buf_shared_up;     // [g_cfg.shared_intermediate floats]
-    id<MTLBuffer> buf_shared_act;    // [g_cfg.shared_intermediate floats] (SwiGLU output)
-    id<MTLBuffer> buf_shared_out;    // [g_cfg.hidden_dim floats] (down_proj output)
-    // Fused o_proj+norm+routing buffers (eliminates 1 cmd buffer per layer)
-    id<MTLBuffer> buf_residual;     // [g_cfg.hidden_dim floats] holds residual for GPU add
-    id<MTLBuffer> buf_h_mid;        // [g_cfg.hidden_dim floats] residual+oproj result
-    id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
-    // GPU attention buffers (for full attention layers)
-    __unsafe_unretained id<MTLBuffer> *buf_kv_k;  // K cache per full-attn layer [g_cfg.num_full_attn_layers]
-    __unsafe_unretained id<MTLBuffer> *buf_kv_v;  // V cache per full-attn layer [g_cfg.num_full_attn_layers]
-    id<MTLBuffer> buf_attn_q;       // [g_cfg.num_attn_heads * HEAD_DIM floats] all query heads
-    id<MTLBuffer> buf_attn_scores;  // [g_cfg.num_attn_heads * MAX_SEQ_LEN floats] all heads' scores
-    id<MTLBuffer> buf_attn_out;     // [g_cfg.num_attn_heads * HEAD_DIM floats] full attention output
-    id<MTLBuffer> buf_attn_gate;    // [g_cfg.num_attn_heads * HEAD_DIM floats] sigmoid gate
-    // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
-    id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
-    id<MTLBuffer> buf_moe_hidden;     // [g_cfg.hidden_dim floats] GPU combine output (hidden state)
-    id<MTLBuffer> buf_combine_params; // [10 floats] expert weights[8] + shared_gate_score + padding
-    id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
-    // Shared event for CPU-GPU synchronization (async pipeline)
-#if USE_EVENT_PIPELINE
-    id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
-    uint64_t event_value;                // monotonically increasing event counter
-#endif
-    // GPU delta-net (gated_delta_net_step) and conv1d pipelines
-    id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
-    id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
-    id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
-    id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
-    id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
-    // Persistent GPU state buffers for linear attention layers
-    __unsafe_unretained id<MTLBuffer> *buf_delta_state;  // [g_cfg.num_linear_layers]
-    __unsafe_unretained id<MTLBuffer> *buf_conv_state;   // [g_cfg.num_linear_layers]
-    // Scratch buffers for delta-net inputs/outputs (sized at allocation time)
-    id<MTLBuffer> buf_delta_q;        // [g_cfg.linear_total_key] float
-    id<MTLBuffer> buf_delta_k;        // [g_cfg.linear_total_key] float
-    id<MTLBuffer> buf_delta_v;        // [g_cfg.linear_total_value] float
-    id<MTLBuffer> buf_delta_g_decay;  // [g_cfg.linear_num_v_heads] float
-    id<MTLBuffer> buf_delta_beta;     // [g_cfg.linear_num_v_heads] float
-    id<MTLBuffer> buf_delta_output;   // [g_cfg.linear_total_value] float
-    id<MTLBuffer> buf_conv_input;     // [g_cfg.linear_conv_dim] float
-    id<MTLBuffer> buf_conv_output;    // [g_cfg.linear_conv_dim] float
-} MetalCtx;
-
-static MetalCtx *g_metal = NULL;
-
-static MetalCtx *metal_setup(void) {
+static int metal_setup(FlashMoE_Model *m) {
     MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
     ctx->device = MTLCreateSystemDefaultDevice();
     if (!ctx->device) {
         fprintf(stderr, "ERROR: No Metal device\n");
-        free(ctx); return NULL;
+        free(ctx); return -1;
     }
     printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
 
     ctx->queue = [ctx->device newCommandQueue];
     if (!ctx->queue) {
         fprintf(stderr, "ERROR: No command queue\n");
-        free(ctx); return NULL;
+        free(ctx); return -1;
     }
 
     // Compile shaders from embedded source
@@ -131,7 +29,7 @@ static MetalCtx *metal_setup(void) {
     NSString *src = [NSString stringWithUTF8String:g_shader_source];
     if (!src) {
         fprintf(stderr, "ERROR: Embedded shader source is null\n");
-        free(ctx); return NULL;
+        free(ctx); return -1;
     }
 
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
@@ -148,7 +46,7 @@ static MetalCtx *metal_setup(void) {
     if (!ctx->library) {
         fprintf(stderr, "ERROR: Shader compile failed: %s\n",
                 [[error localizedDescription] UTF8String]);
-        free(ctx); return NULL;
+        free(ctx); return -1;
     }
     printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
 
@@ -163,7 +61,7 @@ static MetalCtx *metal_setup(void) {
     };
 
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
-    ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
+    ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
@@ -196,55 +94,48 @@ static MetalCtx *metal_setup(void) {
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
-        free(ctx); return NULL;
+        free(ctx); return -1;
     }
 
     // Allocate reusable buffers (large enough for biggest projection)
-    // Q proj output is 16384 floats, lm_head output is 248320 floats
-    // o_proj input is 8192, linear attn out_proj input is 8192
-    size_t max_out = g_cfg.vocab_size * sizeof(float);  // lm_head is largest
-    size_t max_in = g_cfg.linear_total_value * sizeof(float);  // 8192 floats (linear_attn out_proj)
-    if (max_in < (size_t)(g_cfg.num_attn_heads * HEAD_DIM) * sizeof(float)) {
-        max_in = (size_t)(g_cfg.num_attn_heads * HEAD_DIM) * sizeof(float);  // o_proj input = 8192
+    size_t max_out = m->cfg.vocab_size * sizeof(float);
+    size_t max_in = m->cfg.linear_total_value * sizeof(float);
+    if (max_in < (size_t)(m->cfg.num_attn_heads * HEAD_DIM) * sizeof(float)) {
+        max_in = (size_t)(m->cfg.num_attn_heads * HEAD_DIM) * sizeof(float);
     }
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
 
-    // Batched matmul output slots — each large enough for the biggest projection
-    // q_proj = 16384 floats, qkv_proj = 12288, z_proj = 8192, o_proj = 4096
-    // lm_head (248320) uses buf_output directly, not batched.
+    // Batched matmul output slots
     {
-        size_t slot_size = (size_t)(g_cfg.num_attn_heads * HEAD_DIM * 2) * sizeof(float);  // 16384 floats
-        if (slot_size < (size_t)g_cfg.linear_conv_dim * sizeof(float))
-            slot_size = (size_t)g_cfg.linear_conv_dim * sizeof(float);  // 12288 floats
+        size_t slot_size = (size_t)(m->cfg.num_attn_heads * HEAD_DIM * 2) * sizeof(float);
+        if (slot_size < (size_t)m->cfg.linear_conv_dim * sizeof(float))
+            slot_size = (size_t)m->cfg.linear_conv_dim * sizeof(float);
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
             ctx->batch_out[i] = [ctx->device newBufferWithLength:slot_size
                                                          options:MTLResourceStorageModeShared];
         }
     }
 
-    // Expert computation buffers (reused across all experts and layers)
-    ctx->buf_expert_data  = [ctx->device newBufferWithLength:g_cfg.expert_size_4bit
+    // Expert computation buffers
+    ctx->buf_expert_data  = [ctx->device newBufferWithLength:m->cfg.expert_size_4bit
                                                      options:MTLResourceStorageModeShared];
-    ctx->buf_expert_input = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_expert_input = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-    ctx->buf_expert_gate  = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+    ctx->buf_expert_gate  = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-    ctx->buf_expert_up    = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+    ctx->buf_expert_up    = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-    ctx->buf_expert_act   = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+    ctx->buf_expert_act   = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-    ctx->buf_expert_out   = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_expert_out   = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
 
-    // Multi-expert buffers: K independent slots (double-buffered data)
-    // Expert data buffers use 2MB-aligned backing memory for DMA efficiency.
-    // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
-    ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    // Multi-expert buffers
+    ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
-    size_t expert_alloc_size = (g_cfg.expert_size_4bit + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
+    size_t expert_alloc_size = (m->cfg.expert_size_4bit + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);
     for (int k = 0; k < MAX_K; k++) {
-        // 2MB-aligned allocation for optimal DMA throughput
         void *aligned_data = NULL, *aligned_data_b = NULL;
         posix_memalign(&aligned_data,   2*1024*1024, expert_alloc_size);
         posix_memalign(&aligned_data_b, 2*1024*1024, expert_alloc_size);
@@ -258,36 +149,36 @@ static MetalCtx *metal_setup(void) {
                                                                          length:expert_alloc_size
                                                                         options:MTLResourceStorageModeShared
                                                                     deallocator:nil];
-        ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+        ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+        ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_act[k]  = [ctx->device newBufferWithLength:g_cfg.moe_intermediate * sizeof(float)
+        ctx->buf_multi_expert_act[k]  = [ctx->device newBufferWithLength:m->cfg.moe_intermediate * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+        ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
     }
 
-    // Shared expert buffers (for fused CMD2)
-    ctx->buf_shared_gate = [ctx->device newBufferWithLength:g_cfg.shared_intermediate * sizeof(float)
+    // Shared expert buffers
+    ctx->buf_shared_gate = [ctx->device newBufferWithLength:m->cfg.shared_intermediate * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_shared_up   = [ctx->device newBufferWithLength:g_cfg.shared_intermediate * sizeof(float)
+    ctx->buf_shared_up   = [ctx->device newBufferWithLength:m->cfg.shared_intermediate * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_shared_act  = [ctx->device newBufferWithLength:g_cfg.shared_intermediate * sizeof(float)
+    ctx->buf_shared_act  = [ctx->device newBufferWithLength:m->cfg.shared_intermediate * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_shared_out  = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_shared_out  = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
 
     // Fused o_proj+norm+routing buffers
-    ctx->buf_residual = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_residual = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
-    ctx->buf_h_mid    = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_h_mid    = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
     ctx->buf_sum_sq   = [ctx->device newBufferWithLength:sizeof(float)
                                                  options:MTLResourceStorageModeShared];
 
     // CMD3 GPU-side combine buffers
-    ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:g_cfg.hidden_dim * sizeof(float)
+    ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:m->cfg.hidden_dim * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
     ctx->buf_combine_params = [ctx->device newBufferWithLength:10 * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -296,15 +187,15 @@ static MetalCtx *metal_setup(void) {
 
     // GPU attention buffers
     {
-        size_t kv_dim = g_cfg.num_kv_heads * HEAD_DIM;
+        size_t kv_dim = m->cfg.num_kv_heads * HEAD_DIM;
 #if USE_KV_CACHE_BF16
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(uint16_t);
 #else
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
 #endif
-        ctx->buf_kv_k = (__unsafe_unretained id<MTLBuffer> *)calloc(g_cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
-        ctx->buf_kv_v = (__unsafe_unretained id<MTLBuffer> *)calloc(g_cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
-        for (int i = 0; i < g_cfg.num_full_attn_layers; i++) {
+        ctx->buf_kv_k = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+        ctx->buf_kv_v = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+        for (int i = 0; i < m->cfg.num_full_attn_layers; i++) {
             id<MTLBuffer> buf_k = [ctx->device newBufferWithLength:kv_cache_size
                                                            options:MTLResourceStorageModeShared];
             id<MTLBuffer> buf_v = [ctx->device newBufferWithLength:kv_cache_size
@@ -314,26 +205,26 @@ static MetalCtx *metal_setup(void) {
             CFRetain((__bridge CFTypeRef)buf_k);
             CFRetain((__bridge CFTypeRef)buf_v);
         }
-        ctx->buf_attn_q      = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_q      = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)g_cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)m->cfg.num_attn_heads * GPU_KV_SEQ * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_out    = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_out    = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:g_cfg.num_attn_heads * HEAD_DIM * sizeof(float)
+        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:m->cfg.num_attn_heads * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
-               g_cfg.num_full_attn_layers, kv_cache_size / 1e6,
-               (double)(g_cfg.num_attn_heads * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+               m->cfg.num_full_attn_layers, kv_cache_size / 1e6,
+               (double)(m->cfg.num_attn_heads * MAX_SEQ_LEN * sizeof(float)) / 1e6);
     }
 
-    // Persistent GPU state buffers for delta-net (linear attention layers)
+    // Persistent GPU state buffers for delta-net
     if (ctx->delta_net_step) {
-        size_t delta_state_sz = (size_t)g_cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
-        size_t conv_state_sz = 3 * (size_t)g_cfg.linear_conv_dim;
-        ctx->buf_delta_state = (__unsafe_unretained id<MTLBuffer> *)calloc(g_cfg.num_linear_layers, sizeof(id<MTLBuffer>));
-        ctx->buf_conv_state  = (__unsafe_unretained id<MTLBuffer> *)calloc(g_cfg.num_linear_layers, sizeof(id<MTLBuffer>));
-        for (int i = 0; i < g_cfg.num_linear_layers; i++) {
+        size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM;
+        size_t conv_state_sz = 3 * (size_t)m->cfg.linear_conv_dim;
+        ctx->buf_delta_state = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_linear_layers, sizeof(id<MTLBuffer>));
+        ctx->buf_conv_state  = (__unsafe_unretained id<MTLBuffer> *)calloc(m->cfg.num_linear_layers, sizeof(id<MTLBuffer>));
+        for (int i = 0; i < m->cfg.num_linear_layers; i++) {
             id<MTLBuffer> ds_buf = [ctx->device newBufferWithLength:delta_state_sz * sizeof(float)
                                                             options:MTLResourceStorageModeShared];
             ctx->buf_delta_state[i] = ds_buf;
@@ -345,19 +236,19 @@ static MetalCtx *metal_setup(void) {
             CFRetain((__bridge CFTypeRef)cs_buf);
             memset([cs_buf contents], 0, conv_state_sz * sizeof(float));
         }
-        // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
-        ctx->buf_delta_q       = [ctx->device newBufferWithLength:g_cfg.linear_total_key * sizeof(float)   options:MTLResourceStorageModeShared];
-        ctx->buf_delta_k       = [ctx->device newBufferWithLength:g_cfg.linear_total_key * sizeof(float)   options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:g_cfg.linear_total_value * sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:g_cfg.linear_num_v_heads * sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:g_cfg.linear_num_v_heads * sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:g_cfg.linear_total_value * sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:g_cfg.linear_conv_dim * sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:g_cfg.linear_conv_dim * sizeof(float)    options:MTLResourceStorageModeShared];
+        // Scratch buffers for delta-net inputs/outputs
+        ctx->buf_delta_q       = [ctx->device newBufferWithLength:m->cfg.linear_total_key * sizeof(float)   options:MTLResourceStorageModeShared];
+        ctx->buf_delta_k       = [ctx->device newBufferWithLength:m->cfg.linear_total_key * sizeof(float)   options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:m->cfg.linear_total_value * sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:m->cfg.linear_num_v_heads * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:m->cfg.linear_num_v_heads * sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:m->cfg.linear_total_value * sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:m->cfg.linear_conv_dim * sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:m->cfg.linear_conv_dim * sizeof(float)    options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
-               g_cfg.num_linear_layers,
-               (double)g_cfg.num_linear_layers * (delta_state_sz + conv_state_sz) * sizeof(float) / 1e6,
-               (double)(2 * g_cfg.linear_total_key + 2 * g_cfg.linear_total_value + 2 * g_cfg.linear_num_v_heads + 2 * g_cfg.linear_conv_dim) * sizeof(float) / 1e6);
+               m->cfg.num_linear_layers,
+               (double)m->cfg.num_linear_layers * (delta_state_sz + conv_state_sz) * sizeof(float) / 1e6,
+               (double)(2 * m->cfg.linear_total_key + 2 * m->cfg.linear_total_value + 2 * m->cfg.linear_num_v_heads + 2 * m->cfg.linear_conv_dim) * sizeof(float) / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -367,27 +258,25 @@ static MetalCtx *metal_setup(void) {
 #endif
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
-    return ctx;
+    m->metal = ctx;
+    return 0;
 }
 
 // Reset delta-net and conv GPU state buffers (call at start of new generation)
-static void reset_delta_net_state(void) {
-    if (!g_metal || !g_metal->delta_net_step) return;
-    size_t delta_state_sz = (size_t)g_cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
-    size_t conv_state_sz = 3 * (size_t)g_cfg.linear_conv_dim * sizeof(float);
-    for (int i = 0; i < g_cfg.num_linear_layers; i++) {
-        if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, delta_state_sz);
-        if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, conv_state_sz);
+static void reset_delta_net_state(FlashMoE_Model *m) {
+    if (!m->metal || !m->metal->delta_net_step) return;
+    size_t delta_state_sz = (size_t)m->cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
+    size_t conv_state_sz = 3 * (size_t)m->cfg.linear_conv_dim * sizeof(float);
+    for (int i = 0; i < m->cfg.num_linear_layers; i++) {
+        if (m->metal->buf_delta_state[i])
+            memset([m->metal->buf_delta_state[i] contents], 0, delta_state_sz);
+        if (m->metal->buf_conv_state[i])
+            memset([m->metal->buf_conv_state[i] contents], 0, conv_state_sz);
     }
 }
 
 // Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
-// mmap returns page-aligned addresses, Metal requires the same.
-// On Apple Silicon, page size is 16KB.
 static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
-    // Round size up to page boundary (16KB)
     size_t page_size = 16384;
     size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
 
@@ -407,12 +296,6 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
 }
 
 // GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
-// W_packed, scales, biases are pointers into mmap'd weight file
-// x_f32 is CPU float array, result written back to out_f32
-//
-// We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
-// byte offsets to point each shader argument at the right tensor.
-// This avoids per-tensor buffer creation and the page-alignment constraint.
 static void gpu_dequant_matvec(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
@@ -438,8 +321,6 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
-    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
-    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
     [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
     [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
@@ -452,12 +333,10 @@ static void gpu_dequant_matvec(
     [enc setBytes:&group_size   length:4     atIndex:7];
 
     if (use_v3) {
-        // v3: tiled threadgroups, 256 threads, 8 rows per TG
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        // fast: one threadgroup per output row, 64 threads per TG
         NSUInteger tg_size = 64;
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
@@ -472,12 +351,13 @@ static void gpu_dequant_matvec(
 
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
 static void fast_dequant_matvec(
+    FlashMoE_Model *m,
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
-        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
+    if (m->metal && m->metal->wf_buf) {
+        gpu_dequant_matvec(m->metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
 #if USE_CPU_DEQUANT_FMA

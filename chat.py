@@ -47,8 +47,8 @@ def main():
     messages = []
 
     with model:
-        print(f"Ready. {fm.core.num_layers()} layers, "
-              f"{fm.core.hidden_dim()} dim.\n")
+        print(f"Ready. {model.num_layers} layers, "
+              f"{model.hidden_dim} dim.\n")
 
         while True:
             try:
@@ -66,7 +66,7 @@ def main():
                 messages, add_generation_prompt=True, enable_thinking=False)
             prompt_ids = [int(t) for t in result["input_ids"]]
 
-            cache = fm.Cache()
+            cache = fm.Cache(model)
             t0 = time.monotonic()
             response_ids = []
 

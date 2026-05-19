@@ -4,24 +4,15 @@
 // ============================================================================
 // Batched GPU matmul: encode N independent matmuls sharing the same input
 // into ONE command buffer, reducing dispatch overhead by N-1 round-trips.
+// BatchMatvecSpec type is in model_types.h.
 // ============================================================================
 
-typedef struct {
-    const void *W;           // packed weights (pointer into mmap'd file)
-    const void *scales;      // scales (pointer into mmap'd file)
-    const void *biases;      // biases (pointer into mmap'd file)
-    float *out_cpu;          // CPU output pointer (result copied here after GPU finishes)
-    uint32_t out_dim;
-    uint32_t in_dim;
-    uint32_t group_size;
-    int batch_slot;          // which batch_out[slot] to use for GPU output
-} BatchMatvecSpec;
+#include "model_internal.h"
 
 // Run N matmuls in a single command buffer. All share the same input vector.
-// The input is copied once; all outputs go to preallocated batch_out slots.
 static void gpu_batch_matvec(
     MetalCtx *ctx,
-    const float *x_f32, uint32_t x_dim,  // shared input
+    const float *x_f32, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
     // Copy input once
@@ -71,12 +62,6 @@ static void gpu_batch_matvec(
     }
 }
 
-// ============================================================================
-// Encode-only variants: add dispatches to an EXISTING command buffer.
-// These do NOT commit — the caller batches multiple encode calls into one
-// command buffer and commits once, eliminating per-dispatch overhead.
-// ============================================================================
-
 // Encode N matmuls into cmdbuf. Input must already be in ctx->buf_input.
 static void gpu_encode_batch_matvec(
     MetalCtx *ctx,
@@ -124,10 +109,7 @@ static void gpu_flush_batch_results(MetalCtx *ctx, BatchMatvecSpec *specs, int n
     }
 }
 
-// Encode a single matvec reading from buf_expert_act into buf_expert_out,
-// using weight pointers into the mmap'd weight file.
-// Used for shared expert down_proj which reads from a different input than
-// the attention projections.
+// Encode a single matvec reading from buf_expert_act into buf_expert_out.
 static void gpu_encode_dequant_matvec_with_io_bufs(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
@@ -163,31 +145,30 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 }
 
 // Encode one expert forward using multi-expert slot k.
-// Expert data must already be in buf_multi_expert_data[k].
-// Input must already be in buf_multi_expert_input.
 void gpu_encode_expert_forward_slot(
+    FlashMoE_Model *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
-    int k  // slot index
+    int k
 ) {
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
-        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
-        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
+    if (m->use_2bit) {
+        gate_w_off = m->cfg.layout_2bit.gate_w_off; gate_s_off = m->cfg.layout_2bit.gate_s_off; gate_b_off = m->cfg.layout_2bit.gate_b_off;
+        up_w_off   = m->cfg.layout_2bit.up_w_off;   up_s_off   = m->cfg.layout_2bit.up_s_off;   up_b_off   = m->cfg.layout_2bit.up_b_off;
+        down_w_off = m->cfg.layout_2bit.down_w_off; down_s_off = m->cfg.layout_2bit.down_s_off; down_b_off = m->cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
-        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
-        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
+        gate_w_off = m->cfg.layout_4bit.gate_w_off; gate_s_off = m->cfg.layout_4bit.gate_s_off; gate_b_off = m->cfg.layout_4bit.gate_b_off;
+        up_w_off   = m->cfg.layout_4bit.up_w_off;   up_s_off   = m->cfg.layout_4bit.up_s_off;   up_b_off   = m->cfg.layout_4bit.up_b_off;
+        down_w_off = m->cfg.layout_4bit.down_w_off; down_s_off = m->cfg.layout_4bit.down_s_off; down_b_off = m->cfg.layout_4bit.down_b_off;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = m->use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = g_cfg.moe_intermediate;
-    uint32_t gate_up_in  = g_cfg.hidden_dim;
-    uint32_t down_out    = g_cfg.hidden_dim;
-    uint32_t down_in     = g_cfg.moe_intermediate;
+    uint32_t gate_up_out = m->cfg.moe_intermediate;
+    uint32_t gate_up_in  = m->cfg.hidden_dim;
+    uint32_t down_out    = m->cfg.hidden_dim;
+    uint32_t down_in     = m->cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj: data[k] -> gate[k]
@@ -257,33 +238,31 @@ void gpu_encode_expert_forward_slot(
 }
 
 // Encode one expert forward using explicit data buffer (for double buffering).
-// Expert data must already be in data_buf.
-// Input must already be in buf_multi_expert_input.
-// Uses slot k's gate/up/act/out scratch buffers.
 void gpu_encode_expert_forward_slot_buf(
+    FlashMoE_Model *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
-    int k,                  // slot index (for gate/up/act/out scratch)
-    id<MTLBuffer> data_buf  // expert weight data buffer (from either set A or B)
+    int k,
+    id<MTLBuffer> data_buf
 ) {
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
-        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
-        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
+    if (m->use_2bit) {
+        gate_w_off = m->cfg.layout_2bit.gate_w_off; gate_s_off = m->cfg.layout_2bit.gate_s_off; gate_b_off = m->cfg.layout_2bit.gate_b_off;
+        up_w_off   = m->cfg.layout_2bit.up_w_off;   up_s_off   = m->cfg.layout_2bit.up_s_off;   up_b_off   = m->cfg.layout_2bit.up_b_off;
+        down_w_off = m->cfg.layout_2bit.down_w_off; down_s_off = m->cfg.layout_2bit.down_s_off; down_b_off = m->cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
-        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
-        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
+        gate_w_off = m->cfg.layout_4bit.gate_w_off; gate_s_off = m->cfg.layout_4bit.gate_s_off; gate_b_off = m->cfg.layout_4bit.gate_b_off;
+        up_w_off   = m->cfg.layout_4bit.up_w_off;   up_s_off   = m->cfg.layout_4bit.up_s_off;   up_b_off   = m->cfg.layout_4bit.up_b_off;
+        down_w_off = m->cfg.layout_4bit.down_w_off; down_s_off = m->cfg.layout_4bit.down_s_off; down_b_off = m->cfg.layout_4bit.down_b_off;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = m->use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = g_cfg.moe_intermediate;
-    uint32_t gate_up_in  = g_cfg.hidden_dim;
-    uint32_t down_out    = g_cfg.hidden_dim;
-    uint32_t down_in     = g_cfg.moe_intermediate;
+    uint32_t gate_up_out = m->cfg.moe_intermediate;
+    uint32_t gate_up_in  = m->cfg.hidden_dim;
+    uint32_t down_out    = m->cfg.hidden_dim;
+    uint32_t down_in     = m->cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj
@@ -352,59 +331,45 @@ void gpu_encode_expert_forward_slot_buf(
     }
 }
 
-// Batched expert encoding: encode K experts using 2 encoders per expert
-// (gate+up fused, SwiGLU+down fused) + 2 for shared = K*2 + 2 encoders total.
-// With K=4: 10 encoders (vs. old 4*K + 2 = 18 with per-operation encoding).
-// Each expert gets its own encoder pair for GPU parallelism across experts.
-// Within each encoder, gate+up (or SwiGLU+down) are serialized but share
-// encoder creation overhead. Net win: fewer encoders, same parallelism.
+// Batched expert encoding: encode K experts using fused or per-expert encoders.
 static void gpu_encode_experts_batched(
+    FlashMoE_Model *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf,
-    int K,                       // number of experts to encode
-    const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+    int K,
+    const int *valid,
+    id<MTLBuffer> __strong *expert_bufs
 ) {
-    // Select offsets and pipeline based on quantization mode
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
-        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
-        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
+    if (m->use_2bit) {
+        gate_w_off = m->cfg.layout_2bit.gate_w_off; gate_s_off = m->cfg.layout_2bit.gate_s_off; gate_b_off = m->cfg.layout_2bit.gate_b_off;
+        up_w_off   = m->cfg.layout_2bit.up_w_off;   up_s_off   = m->cfg.layout_2bit.up_s_off;   up_b_off   = m->cfg.layout_2bit.up_b_off;
+        down_w_off = m->cfg.layout_2bit.down_w_off; down_s_off = m->cfg.layout_2bit.down_s_off; down_b_off = m->cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
-        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
-        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
+        gate_w_off = m->cfg.layout_4bit.gate_w_off; gate_s_off = m->cfg.layout_4bit.gate_s_off; gate_b_off = m->cfg.layout_4bit.gate_b_off;
+        up_w_off   = m->cfg.layout_4bit.up_w_off;   up_s_off   = m->cfg.layout_4bit.up_s_off;   up_b_off   = m->cfg.layout_4bit.up_b_off;
+        down_w_off = m->cfg.layout_4bit.down_w_off; down_s_off = m->cfg.layout_4bit.down_s_off; down_b_off = m->cfg.layout_4bit.down_b_off;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = m->use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = g_cfg.moe_intermediate;
-    uint32_t gate_up_in  = g_cfg.hidden_dim;
-    uint32_t down_out    = g_cfg.hidden_dim;
-    uint32_t down_in     = g_cfg.moe_intermediate;
+    uint32_t gate_up_out = m->cfg.moe_intermediate;
+    uint32_t gate_up_in  = m->cfg.hidden_dim;
+    uint32_t down_out    = m->cfg.hidden_dim;
+    uint32_t down_in     = m->cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
-    // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
-    // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
-    // Threadgroup count is the same (based on out_dim), kernel handles packed_cols internally.
     uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
     uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
 
-    // Per-expert: Encoder A (gate+up or fused_gate_up_swiglu), Encoder B (SwiGLU+down or down only)
-    // Separate encoders per expert enables GPU parallelism across experts.
 #if USE_FUSED_GATE_UP_SWIGLU
-    // Fused path: single dispatch replaces gate_proj + up_proj + SwiGLU.
-    // The kernel reads x once, computes gate and up simultaneously, applies
-    // SwiGLU inline, and writes directly to buf_multi_expert_act[k].
-    // 4-bit only — falls through to original path for 2-bit.
-    if (!g_use_2bit) {
-        uint32_t fused_tgs = gate_up_out;  // one threadgroup per output row
+    if (!m->use_2bit) {
+        uint32_t fused_tgs = gate_up_out;
         for (int k = 0; k < K; k++) {
             if (!valid[k]) continue;
 
-            // Encoder A: fused_gate_up_swiglu (x -> act[k] in one dispatch)
+            // Encoder A: fused_gate_up_swiglu
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:ctx->fused_gate_up_swiglu];
@@ -424,7 +389,7 @@ static void gpu_encode_experts_batched(
                 [enc endEncoding];
             }
 
-            // Encoder B: down_proj only (act[k] already has SwiGLU result)
+            // Encoder B: down_proj only
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:expert_pipe];
@@ -448,10 +413,9 @@ static void gpu_encode_experts_batched(
     for (int k = 0; k < K; k++) {
         if (!valid[k]) continue;
 
-        // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
+        // Encoder A: gate_proj + up_proj
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // gate_proj
             [enc setComputePipelineState:expert_pipe];
             [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
@@ -463,7 +427,6 @@ static void gpu_encode_experts_batched(
             [enc setBytes:&gs          length:4 atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // up_proj (same encoder, serialized after gate — shares encoder overhead)
             [enc setBuffer:expert_bufs[k]                  offset:up_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:up_s_off  atIndex:1];
             [enc setBuffer:expert_bufs[k]                  offset:up_b_off  atIndex:2];
@@ -473,10 +436,9 @@ static void gpu_encode_experts_batched(
             [enc endEncoding];
         }
 
-        // Encoder B: SwiGLU + down_proj (SwiGLU depends on gate+up from Enc A)
+        // Encoder B: SwiGLU + down_proj
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            // SwiGLU
             [enc setComputePipelineState:ctx->swiglu];
             [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
@@ -484,7 +446,6 @@ static void gpu_encode_experts_batched(
             [enc setBytes:&gate_up_out length:4 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            // down_proj (same encoder, serialized after SwiGLU)
             [enc setComputePipelineState:expert_pipe];
             [enc setBuffer:expert_bufs[k]                  offset:down_w_off  atIndex:0];
             [enc setBuffer:expert_bufs[k]                  offset:down_s_off  atIndex:1];
@@ -501,28 +462,27 @@ static void gpu_encode_experts_batched(
     }
 }
 
-// Encode one expert forward (gate+up+swiglu+down) into cmdbuf.
-// Expert data must already be in buf_expert_data.
-// Input must already be in buf_expert_input.
+// Encode one expert forward (gate+up+swiglu+down) into cmdbuf (single expert, legacy).
 __attribute__((unused))
 static void gpu_encode_expert_forward(
+    FlashMoE_Model *m,
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = g_cfg.layout_4bit.gate_w_off;
-    NSUInteger gate_s_off = g_cfg.layout_4bit.gate_s_off;
-    NSUInteger gate_b_off = g_cfg.layout_4bit.gate_b_off;
-    NSUInteger up_w_off   = g_cfg.layout_4bit.up_w_off;
-    NSUInteger up_s_off   = g_cfg.layout_4bit.up_s_off;
-    NSUInteger up_b_off   = g_cfg.layout_4bit.up_b_off;
-    NSUInteger down_w_off = g_cfg.layout_4bit.down_w_off;
-    NSUInteger down_s_off = g_cfg.layout_4bit.down_s_off;
-    NSUInteger down_b_off = g_cfg.layout_4bit.down_b_off;
+    NSUInteger gate_w_off = m->cfg.layout_4bit.gate_w_off;
+    NSUInteger gate_s_off = m->cfg.layout_4bit.gate_s_off;
+    NSUInteger gate_b_off = m->cfg.layout_4bit.gate_b_off;
+    NSUInteger up_w_off   = m->cfg.layout_4bit.up_w_off;
+    NSUInteger up_s_off   = m->cfg.layout_4bit.up_s_off;
+    NSUInteger up_b_off   = m->cfg.layout_4bit.up_b_off;
+    NSUInteger down_w_off = m->cfg.layout_4bit.down_w_off;
+    NSUInteger down_s_off = m->cfg.layout_4bit.down_s_off;
+    NSUInteger down_b_off = m->cfg.layout_4bit.down_b_off;
 
-    uint32_t gate_up_out = g_cfg.moe_intermediate;
-    uint32_t gate_up_in  = g_cfg.hidden_dim;
-    uint32_t down_out    = g_cfg.hidden_dim;
-    uint32_t down_in     = g_cfg.moe_intermediate;
+    uint32_t gate_up_out = m->cfg.moe_intermediate;
+    uint32_t gate_up_in  = m->cfg.hidden_dim;
+    uint32_t down_out    = m->cfg.hidden_dim;
+    uint32_t down_in     = m->cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj
@@ -591,14 +551,14 @@ static void gpu_encode_expert_forward(
     }
 }
 
-// Batched wrapper: takes N matmul specs sharing the same input, dispatches
-// via GPU batch if available, otherwise falls back to CPU.
+// Batched wrapper: takes N matmul specs sharing the same input.
 static void fast_batch_matvec(
+    FlashMoE_Model *m,
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
-        gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
+    if (m->metal && m->metal->wf_buf) {
+        gpu_batch_matvec(m->metal, x, x_dim, specs, num_specs);
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
@@ -610,56 +570,45 @@ static void fast_batch_matvec(
 
 // ============================================================================
 // GPU expert forward: gate+up matvec -> SwiGLU -> down matvec
-// All 3 matmuls + activation in a single command buffer submission.
-// Expert data is copied into a reusable Metal buffer.
 // ============================================================================
 
-// expert_data_already_in_buffer: if true, expert data is already in buf_expert_data
-//   (pread'd directly into it), skip the copy.
 __attribute__((unused))
 static void gpu_expert_forward(
+    FlashMoE_Model *m,
     MetalCtx *ctx,
-    const void *expert_data,     // g_cfg.expert_size_4bit bytes (may be buf_expert_data contents)
-    const float *h_post,         // [g_cfg.hidden_dim] input
-    float *expert_out,           // [g_cfg.hidden_dim] output
+    const void *expert_data,
+    const float *h_post,
+    float *expert_out,
     int expert_data_already_in_buffer
 ) {
-    // Expert layout offsets — select based on quantization mode
     NSUInteger gate_w_off, gate_s_off, gate_b_off;
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
-        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
-        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
+    if (m->use_2bit) {
+        gate_w_off = m->cfg.layout_2bit.gate_w_off; gate_s_off = m->cfg.layout_2bit.gate_s_off; gate_b_off = m->cfg.layout_2bit.gate_b_off;
+        up_w_off   = m->cfg.layout_2bit.up_w_off;   up_s_off   = m->cfg.layout_2bit.up_s_off;   up_b_off   = m->cfg.layout_2bit.up_b_off;
+        down_w_off = m->cfg.layout_2bit.down_w_off; down_s_off = m->cfg.layout_2bit.down_s_off; down_b_off = m->cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
-        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
-        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
+        gate_w_off = m->cfg.layout_4bit.gate_w_off; gate_s_off = m->cfg.layout_4bit.gate_s_off; gate_b_off = m->cfg.layout_4bit.gate_b_off;
+        up_w_off   = m->cfg.layout_4bit.up_w_off;   up_s_off   = m->cfg.layout_4bit.up_s_off;   up_b_off   = m->cfg.layout_4bit.up_b_off;
+        down_w_off = m->cfg.layout_4bit.down_w_off; down_s_off = m->cfg.layout_4bit.down_s_off; down_b_off = m->cfg.layout_4bit.down_b_off;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = m->use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
-        memcpy([ctx->buf_expert_data contents], expert_data, active_expert_size());
+        memcpy([ctx->buf_expert_data contents], expert_data, active_expert_size(m));
     }
-    memcpy([ctx->buf_expert_input contents], h_post, g_cfg.hidden_dim * sizeof(float));
+    memcpy([ctx->buf_expert_input contents], h_post, m->cfg.hidden_dim * sizeof(float));
 
-    uint32_t gate_up_out = g_cfg.moe_intermediate;  // 1024
-    uint32_t gate_up_in  = g_cfg.hidden_dim;        // 4096
-    uint32_t down_out    = g_cfg.hidden_dim;        // 4096
-    uint32_t down_in     = g_cfg.moe_intermediate;  // 1024
-    uint32_t gs          = GROUP_SIZE;        // 64
-
-    // Build one command buffer with all 4 dispatches:
-    // 1. gate_proj matvec (h_post -> gate_out)
-    // 2. up_proj matvec (h_post -> up_out)
-    // 3. SwiGLU (gate_out, up_out -> act_out)
-    // 4. down_proj matvec (act_out -> expert_out)
+    uint32_t gate_up_out = m->cfg.moe_intermediate;
+    uint32_t gate_up_in  = m->cfg.hidden_dim;
+    uint32_t down_out    = m->cfg.hidden_dim;
+    uint32_t down_in     = m->cfg.moe_intermediate;
+    uint32_t gs          = GROUP_SIZE;
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
-    // --- Dispatch 1: gate_proj [4096] -> [1024] ---
+    // gate_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:expert_pipe];
@@ -677,7 +626,7 @@ static void gpu_expert_forward(
         [enc endEncoding];
     }
 
-    // --- Dispatch 2: up_proj [4096] -> [1024] ---
+    // up_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:expert_pipe];
@@ -695,7 +644,7 @@ static void gpu_expert_forward(
         [enc endEncoding];
     }
 
-    // --- Dispatch 3: SwiGLU(gate, up) -> act ---
+    // SwiGLU
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:ctx->swiglu];
@@ -709,7 +658,7 @@ static void gpu_expert_forward(
         [enc endEncoding];
     }
 
-    // --- Dispatch 4: down_proj [1024] -> [4096] ---
+    // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:expert_pipe];
@@ -730,8 +679,7 @@ static void gpu_expert_forward(
     [cmdbuf commit];
     [cmdbuf waitUntilCompleted];
 
-    // Copy result back to CPU
-    memcpy(expert_out, [ctx->buf_expert_out contents], g_cfg.hidden_dim * sizeof(float));
+    memcpy(expert_out, [ctx->buf_expert_out contents], m->cfg.hidden_dim * sizeof(float));
 }
 
 // ============================================================================
@@ -740,9 +688,6 @@ static void gpu_expert_forward(
 
 static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
                               int head_dim, int rotary_dim) {
-    // Apply RoPE to the first rotary_dim dimensions of each head
-    // NON-TRADITIONAL (MLX default): pairs are (x[i], x[i + half_dim])
-    // where half_dim = rotary_dim / 2
     int half = rotary_dim / 2;
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
