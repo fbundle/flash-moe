@@ -71,6 +71,23 @@ class Model:
         logits, _ = _core.forward(input_ids, self._model_ptr, cache._ptr)
         return (logits, cache)
 
+    def generate(self, first_token_id: int, cache: Cache,
+                 eos_token_id: int, *,
+                 max_tokens: int = 256,
+                 temperature: float = 0.0,
+                 top_k: int = 0,
+                 top_p: float = 1.0,
+                 min_p: float = 0.0):
+        """Autoregressive generation with sampling. Returns (token_ids: list[int], cache)."""
+        if not self._loaded:
+            raise RuntimeError("Model not loaded — call .load() or use as context manager.")
+        token_ids, _ = _core.generate(
+            first_token_id, self._model_ptr, cache._ptr,
+            max_tokens, eos_token_id,
+            temperature, top_k, top_p, min_p,
+        )
+        return (token_ids, cache)
+
     @property
     def num_layers(self) -> int:
         return _core.num_layers(self._model_ptr) if self._loaded else 0

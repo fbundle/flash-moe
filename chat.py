@@ -14,23 +14,22 @@ from transformers import AutoTokenizer
 import moe_infer_mlx as fm
 
 
-def generate(model, cache, prompt_ids, max_tokens, eos_token_id):
-    """Greedy decode. Yields token_ids one at a time."""
+def generate_c(model, cache, prompt_ids, max_tokens, eos_token_id, temperature):
+    """Run prefill then C-side autoregressive generation. Yields token_ids one at a time."""
     pos = cache.position
     new_ids = prompt_ids[pos:]
     if new_ids:
         logits, cache = model.forward(new_ids, cache)
     else:
-        # Entire prompt already cached — run a no-op forward to get first logits
         logits, cache = model.forward([prompt_ids[-1]], cache)
-    next_id = int(logits[-1].argmax())
 
-    for _ in range(max_tokens):
-        if next_id == eos_token_id:
-            break
-        yield next_id
-        logits, cache = model.forward([next_id], cache)
-        next_id = int(logits[-1].argmax())
+    first_id = int(logits[-1].argmax())
+    token_ids, cache = model.generate(
+        first_id, cache, eos_token_id,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    yield from token_ids
 
 
 def main():
@@ -38,6 +37,7 @@ def main():
     parser.add_argument("--model", "-m", default="data")
     parser.add_argument("--tokenizer", "-t", default=None)
     parser.add_argument("--max-tokens", "-n", type=int, default=512)
+    parser.add_argument("--temperature", "-T", type=float, default=0.6)
     args = parser.parse_args()
 
     tok_path = args.tokenizer or args.model
@@ -70,8 +70,9 @@ def main():
             t0 = time.monotonic()
             response_ids = []
 
-            for token_id in generate(model, cache, prompt_ids,
-                                     args.max_tokens, tok.eos_token_id):
+            for token_id in generate_c(model, cache, prompt_ids,
+                                       args.max_tokens, tok.eos_token_id,
+                                       args.temperature):
                 response_ids.append(token_id)
                 print(tok.decode([token_id]), end="", flush=True)
 

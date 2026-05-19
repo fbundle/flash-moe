@@ -6,9 +6,7 @@ Thin Cython mirror of moe_infer_c.h — one function per C function.
 import numpy as np
 cimport numpy as cnp
 
-cdef extern from "stdlib.h":
-    void *malloc(size_t size)
-    void free(void *ptr)
+from libc.stdlib cimport malloc, free
 
 cdef extern from "moe_infer_c.h":
     ctypedef struct FlashMoE_Cache:
@@ -26,6 +24,13 @@ cdef extern from "moe_infer_c.h":
     int flashmoe_forward(FlashMoE_Context *model,
                          const int *input_ids, int n_tokens,
                          float *logits_out, FlashMoE_Cache *cache)
+
+    int flashmoe_generate(FlashMoE_Context *model,
+                          FlashMoE_Cache *cache,
+                          int first_token_id,
+                          int *output_ids, int max_completion_length,
+                          int eos_token_id, float temperature,
+                          int top_k, float top_p, float min_p)
 
     int flashmoe_cache_position(FlashMoE_Cache *c)
     int flashmoe_vocab_size(FlashMoE_Context *model)
@@ -98,6 +103,37 @@ def forward(list input_ids, unsigned long long model_ptr,
         raise RuntimeError("Forward pass failed")
 
     return (logits, cache_ptr)
+
+
+# ---- Generation ----
+
+def generate(int first_token_id, unsigned long long model_ptr,
+             unsigned long long cache_ptr,
+             int max_completion_length, int eos_token_id,
+             float temperature, int top_k, float top_p, float min_p):
+    """Autoregressive generation with sampling. Returns (token_ids: list[int], cache_ptr)."""
+    cdef int *buf = <int*>malloc(max_completion_length * sizeof(int))
+    if buf == NULL:
+        raise MemoryError()
+
+    cdef int n = flashmoe_generate(
+        <FlashMoE_Context *>model_ptr,
+        <FlashMoE_Cache *>cache_ptr,
+        first_token_id,
+        buf, max_completion_length,
+        eos_token_id, temperature,
+        top_k, top_p, min_p,
+    )
+
+    if n < 0:
+        free(buf)
+        raise RuntimeError("Generation failed")
+
+    cdef list out = []
+    for i in range(n):
+        out.append(buf[i])
+    free(buf)
+    return (out, cache_ptr)
 
 
 # ---- Accessors ----
