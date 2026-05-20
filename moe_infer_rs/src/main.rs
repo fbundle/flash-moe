@@ -81,6 +81,19 @@ fn main() -> anyhow::Result<()> {
         (cfg, mp)
     } else if let Some(model_path) = &args.model {
         let mp = PathBuf::from(model_path);
+        // If not an existing path and not absolute/relative, look in data/
+        let mp = if mp.exists() {
+            mp
+        } else if mp.is_relative() && !mp.starts_with(".") {
+            let data_mp = PathBuf::from("data").join(&mp);
+            if data_mp.exists() {
+                data_mp
+            } else {
+                mp
+            }
+        } else {
+            mp
+        };
         let cfg = load_model_config(&mp)?;
         (cfg, mp)
     } else {
