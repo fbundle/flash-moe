@@ -8,6 +8,30 @@
 use crate::kernels::*;
 use crate::types::*;
 
+// Thread-local GPU context for attention projections.
+// Set to Some(&MetalCtx) by the GPU forward path before calling step functions,
+// cleared to None by the CPU forward path.  dequant_proj checks this to
+// optionally dispatch to GPU for bit-identical results with C's pipeline.
+use std::cell::Cell;
+thread_local! {
+    static TL_GPU_CTX: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Set the thread-local GPU context pointer. Call before running GPU forward.
+pub(crate) fn set_tl_gpu_ctx(ctx: Option<&crate::metal::MetalCtx>) {
+    TL_GPU_CTX.with(|c| c.set(match ctx {
+        Some(ctx) => ctx as *const crate::metal::MetalCtx as usize,
+        None => 0,
+    }));
+}
+
+fn tl_gpu_ctx() -> Option<*const crate::metal::MetalCtx> {
+    TL_GPU_CTX.with(|c| {
+        let p = c.get();
+        if p == 0 { None } else { Some(p as *const crate::metal::MetalCtx) }
+    })
+}
+
 // ============================================================================
 // Step 1 — Input RMS normalisation
 // ============================================================================
@@ -207,27 +231,30 @@ pub fn step_linear_attention(
         state.conv_state[dst..].copy_from_slice(qkv_out);
     }
 
-    // ---- Split conv_out into q, k, v ----
+    // ---- Split conv_out into q, k, v — operate in-place ----
     let total_key = cfg.linear_total_key as usize;
-    let mut lin_q = conv_out[0..total_key].to_vec();
-    let mut lin_k = conv_out[total_key..2 * total_key].to_vec();
-    let lin_v = &conv_out[2 * total_key..];
+    let (q_part, rest) = conv_out.split_at_mut(total_key);
+    let (k_part, v_part) = rest.split_at_mut(total_key);
 
-    // ---- RMS norm q and k ----
+    // ---- RMS norm q and k (in-place) ----
     let inv_scale = 1.0 / (key_dim as f32).sqrt();
     for h in 0..num_kh {
-        let qh = &mut lin_q[h * key_dim..(h + 1) * key_dim];
+        let qh = &mut q_part[h * key_dim..(h + 1) * key_dim];
         let sq: f32 = qh.iter().map(|x| x * x).sum();
         let inv_rms = 1.0 / (sq / key_dim as f32 + 1e-6).sqrt();
         let q_scale = inv_scale * inv_scale;
         for d in 0..key_dim { qh[d] = qh[d] * inv_rms * q_scale; }
     }
     for h in 0..num_kh {
-        let kh = &mut lin_k[h * key_dim..(h + 1) * key_dim];
+        let kh = &mut k_part[h * key_dim..(h + 1) * key_dim];
         let sq: f32 = kh.iter().map(|x| x * x).sum();
         let inv_rms = 1.0 / (sq / key_dim as f32 + 1e-6).sqrt();
         for d in 0..key_dim { kh[d] *= inv_rms * inv_scale; }
     }
+    // Reborrow immutably for recurrence
+    let lin_q: &[f32] = q_part;
+    let lin_k: &[f32] = k_part;
+    let lin_v: &[f32] = v_part;
 
     // ---- Precompute decay and beta gate ----
     let k_heads_per_v = num_vh / num_kh;
@@ -238,7 +265,7 @@ pub fn step_linear_attention(
         let dt_b = dt_bias.map_or(0.0, |o| {
             bf16_to_f32(unsafe { *o.add(vh) })
         });
-        let a_log_val = a_log.map_or(1.0f32, |o| unsafe { *o.add(vh) });
+        let a_log_val = a_log.map_or(0.0f32, |o| unsafe { *o.add(vh) }); // default: exp(0)=1.0 matches C's default A_val=1.0
         let softplus = (1.0 + (a_val + dt_b).exp()).ln();
         g_decay[vh] = (-a_log_val.exp() * softplus).exp();
         beta_gate[vh] = cpu_sigmoid(beta_out[vh]);
@@ -300,6 +327,237 @@ pub fn step_linear_attention(
     // ---- Output projection ----
     attn_proj[..hd].fill(0.0);
     dequant_proj(out_proj_w, out_proj_s, out_proj_b, gated_out, attn_proj, hd, z_dim, gs);
+}
+
+// ============================================================================
+// CPU attention compute (between projections and o_proj) — for GPU pipeline
+// ============================================================================
+
+/// CPU full attention compute after GPU projections.  Takes Q/K/V projection
+/// outputs (already computed by GPU CMD1), runs RMS-norm / RoPE / KV-cache /
+/// dot-product attention / sigmoid gate on CPU.  Writes attn_out ready for o_proj.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_full_attn_compute(
+    cfg: &ModelConfig,
+    q_proj_out: &[f32],   // [heads * head_dim * 2]
+    k_out: &mut [f32],     // [kv_heads * head_dim] — mutated in-place by RoPE
+    v_out: &[f32],         // [kv_heads * head_dim]
+    q_norm_w: Option<*const u16>,
+    k_norm_w: Option<*const u16>,
+    kv: &mut KVCache,
+    pos: i32,
+    attn_out: &mut [f32],  // [heads * head_dim]
+    // Scratch:
+    q_buf: &mut [f32],
+    q_gate: &mut [f32],
+) {
+    let heads = cfg.num_attn_heads as usize;
+    let kv_heads = cfg.num_kv_heads as usize;
+    let head_dim = cfg.head_dim as usize;
+    let q_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+
+    // Split q_proj_out into q and q_gate
+    for h in 0..heads {
+        let src = h * 2 * head_dim;
+        q_buf[h * head_dim..(h + 1) * head_dim]
+            .copy_from_slice(&q_proj_out[src..src + head_dim]);
+        q_gate[h * head_dim..(h + 1) * head_dim]
+            .copy_from_slice(&q_proj_out[src + head_dim..src + 2 * head_dim]);
+    }
+
+    // Q/K RMS norm (k_out mutated in-place)
+    rms_norm_heads(q_buf, heads, head_dim, q_norm_w, cfg.rms_norm_eps);
+    rms_norm_heads(k_out, kv_heads, head_dim, k_norm_w, cfg.rms_norm_eps);
+
+    // RoPE (modifies q_buf and k_out in-place)
+    crate::gpu_ops::apply_rotary_emb(
+        q_buf, k_out, pos, heads, kv_heads, head_dim,
+        cfg.rotary_dim as usize, cfg.rope_theta,
+    );
+
+    // KV cache update
+    let cache_pos = kv.len as usize;
+    for i in 0..kv_dim {
+        let bits = k_out[i].to_bits();
+        kv.k_cache[cache_pos * kv_dim + i] = (bits >> 16) as u16;
+        let vbits = v_out[i].to_bits();
+        kv.v_cache[cache_pos * kv_dim + i] = (vbits >> 16) as u16;
+    }
+    kv.len += 1;
+
+    // Scaled dot-product attention (GQA)
+    attn_out[..q_dim].fill(0.0);
+    let heads_per_kv = heads / kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut scores = vec![0.0f32; kv.len as usize];
+
+    for h in 0..heads {
+        let kv_h = h / heads_per_kv;
+        let qh = &q_buf[h * head_dim..(h + 1) * head_dim];
+
+        for p in 0..kv.len as usize {
+            let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..][..head_dim];
+            let dot: f32 = qh.iter().enumerate()
+                .map(|(d, &qd)| qd * kv_elem_to_f32(kp[d]))
+                .sum();
+            scores[p] = dot * scale;
+        }
+        cpu_softmax(&mut scores, kv.len as usize);
+
+        let oh = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+        for p in 0..kv.len as usize {
+            let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..][..head_dim];
+            let sp = scores[p];
+            for d in 0..head_dim {
+                oh[d] += sp * kv_elem_to_f32(vp[d]);
+            }
+        }
+    }
+
+    // Sigmoid gate
+    for i in 0..q_dim {
+        attn_out[i] *= cpu_sigmoid(q_gate[i]);
+    }
+}
+
+/// CPU linear attention compute after GPU projections.  Takes QKV/Z/B/A/Alpha
+/// projection outputs (already computed by GPU CMD1), runs conv1d + delta-net +
+/// gated RMS-norm on CPU.  Writes gated_out ready for out_proj.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_linear_attn_compute(
+    cfg: &ModelConfig,
+    qkv_out: &[f32],       // [linear_conv_dim]
+    z_out: &[f32],          // [linear_total_value]
+    beta_out: &[f32],       // [linear_num_v_heads]
+    alpha_out: &[f32],      // [linear_num_v_heads]
+    conv1d_w: Option<*const u16>,
+    a_log: Option<*const f32>,
+    dt_bias: Option<*const u16>,
+    gated_norm_w: Option<*const u16>,
+    state: &mut LinearAttnState,
+    gated_out: &mut [f32],  // [linear_total_value]
+    // Scratch:
+    conv_out_buf: &mut [f32],
+    out_values: &mut [f32],
+) {
+    let qkv_dim = cfg.linear_conv_dim as usize;
+    let z_dim = cfg.linear_total_value as usize;
+    let num_vh = cfg.linear_num_v_heads as usize;
+    let num_kh = cfg.linear_num_k_heads as usize;
+    let key_dim = cfg.linear_key_dim as usize;
+    let val_dim = cfg.linear_value_dim as usize;
+
+    // Conv1d step
+    conv_out_buf[..qkv_dim].fill(0.0);
+    if let Some(cw) = conv1d_w {
+        let cw_slice = unsafe {
+            std::slice::from_raw_parts(cw, qkv_dim * cfg.conv_kernel_size as usize)
+        };
+        cpu_conv1d_step(&state.conv_state, qkv_out, cw_slice, conv_out_buf,
+            qkv_dim, cfg.conv_kernel_size as usize);
+    }
+    // Update conv state
+    let state_skip = qkv_dim;
+    let state_len = state.conv_state.len();
+    if state_len > state_skip {
+        state.conv_state.copy_within(state_skip.., 0);
+        let dst = state_len - state_skip;
+        state.conv_state[dst..].copy_from_slice(qkv_out);
+    }
+
+    // Split conv_out into q, k, v — operate in-place on conv_out_buf
+    let total_key = cfg.linear_total_key as usize;
+    let (q_part, rest) = conv_out_buf.split_at_mut(total_key);
+    let (k_part, v_part) = rest.split_at_mut(total_key);
+
+    // RMS norm q and k (in-place)
+    let inv_scale = 1.0 / (key_dim as f32).sqrt();
+    for h in 0..num_kh {
+        let qh = &mut q_part[h * key_dim..(h + 1) * key_dim];
+        let sq: f32 = qh.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (sq / key_dim as f32 + 1e-6).sqrt();
+        let q_scale = inv_scale * inv_scale;
+        for d in 0..key_dim { qh[d] = qh[d] * inv_rms * q_scale; }
+    }
+    for h in 0..num_kh {
+        let kh = &mut k_part[h * key_dim..(h + 1) * key_dim];
+        let sq: f32 = kh.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (sq / key_dim as f32 + 1e-6).sqrt();
+        for d in 0..key_dim { kh[d] *= inv_rms * inv_scale; }
+    }
+    // Reborrow immutably for recurrence
+    let lin_q: &[f32] = q_part;
+    let lin_k: &[f32] = k_part;
+    let lin_v: &[f32] = v_part;
+
+    // Precompute decay and beta gate
+    let k_heads_per_v = num_vh / num_kh;
+    let mut g_decay = vec![0.0f32; num_vh];
+    let mut beta_gate = vec![0.0f32; num_vh];
+    for vh in 0..num_vh {
+        let a_val = alpha_out[vh];
+        let dt_b = dt_bias.map_or(0.0, |o| {
+            bf16_to_f32(unsafe { *o.add(vh) })
+        });
+        let a_log_val = a_log.map_or(0.0f32, |o| unsafe { *o.add(vh) }); // default: exp(0)=1.0 matches C's default A_val=1.0
+        let softplus = (1.0 + (a_val + dt_b).exp()).ln();
+        g_decay[vh] = (-a_log_val.exp() * softplus).exp();
+        beta_gate[vh] = cpu_sigmoid(beta_out[vh]);
+    }
+
+    // Gated delta net recurrence
+    out_values[..z_dim].fill(0.0);
+    for vh in 0..num_vh {
+        let kh = vh / k_heads_per_v;
+        let g = g_decay[vh];
+        let b_gate = beta_gate[vh];
+        let s_off = vh * val_dim * key_dim;
+        let v_off = vh * val_dim;
+        let k_off = kh * key_dim;
+
+        for vi in 0..val_dim {
+            for ki in 0..key_dim {
+                state.ssm_state[s_off + vi * key_dim + ki] *= g;
+            }
+        }
+        for vi in 0..val_dim {
+            let kv_mem: f32 = (0..key_dim)
+                .map(|ki| state.ssm_state[s_off + vi * key_dim + ki] * lin_k[k_off + ki])
+                .sum();
+            let delta = (lin_v[v_off + vi] - kv_mem) * b_gate;
+            for ki in 0..key_dim {
+                state.ssm_state[s_off + vi * key_dim + ki] += lin_k[k_off + ki] * delta;
+            }
+        }
+        for vi in 0..val_dim {
+            let sum: f32 = (0..key_dim)
+                .map(|ki| state.ssm_state[s_off + vi * key_dim + ki] * lin_q[k_off + ki])
+                .sum();
+            out_values[v_off + vi] = sum;
+        }
+    }
+
+    // RMSNormGated
+    gated_out[..z_dim].fill(0.0);
+    for vh in 0..num_vh {
+        let oh = &out_values[vh * val_dim..(vh + 1) * val_dim];
+        let zh = &z_out[vh * val_dim..(vh + 1) * val_dim];
+        let gh = &mut gated_out[vh * val_dim..(vh + 1) * val_dim];
+        if let Some(gnw) = gated_norm_w {
+            let gnw_s = unsafe { std::slice::from_raw_parts(gnw, val_dim) };
+            let sum_sq: f32 = oh.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / val_dim as f32 + cfg.rms_norm_eps).sqrt();
+            for i in 0..val_dim {
+                let w = bf16_to_f32(gnw_s[i]);
+                let silu_z = zh[i] / (1.0 + (-zh[i]).exp());
+                gh[i] = oh[i] * inv_rms * w * silu_z;
+            }
+        } else {
+            gh.copy_from_slice(oh);
+        }
+    }
+
 }
 
 // ============================================================================
@@ -628,6 +886,9 @@ pub struct CpuForwardScratch {
     pub conv_out: Vec<f32>,
     pub out_values: Vec<f32>,
     pub gated_out: Vec<f32>,
+    // GPU delta-net scratch
+    pub g_decay: Vec<f32>,
+    pub beta_gate: Vec<f32>,
 }
 
 impl CpuForwardScratch {
@@ -663,6 +924,8 @@ impl CpuForwardScratch {
             conv_out: vec![0.0; qkv_dim],
             out_values: vec![0.0; z_dim],
             gated_out: vec![0.0; z_dim],
+            g_decay: vec![0.0; vh],
+            beta_gate: vec![0.0; vh],
         }
     }
 }
@@ -693,6 +956,9 @@ pub unsafe fn cpu_layer_forward(
     use_2bit: bool,
     scratch: &mut CpuForwardScratch,
 ) {
+    // Ensure GPU dequant is disabled (CPU-only path)
+    set_tl_gpu_ctx(None);
+
     let hd = cfg.hidden_dim as usize;
     let is_full = kv.is_some();
 
@@ -806,13 +1072,24 @@ fn kv_elem_to_f32(v: u16) -> f32 {
 }
 
 /// Dequant projection: out = W @ x  (4-bit packed, bf16 scales/biases)
-fn dequant_proj(
+/// Uses GPU dequant (same Metal shader as C) when the GPU path is active,
+/// otherwise falls back to CPU dequant.
+pub(crate) fn dequant_proj(
     w: *const u32, s: *const u16, b: *const u16,
     x: &[f32], out: &mut [f32],
     out_dim: usize, in_dim: usize, group_size: usize,
 ) {
     if w.is_null() || s.is_null() || b.is_null() {
         return;
+    }
+    if let Some(gpu_ptr) = tl_gpu_ctx() {
+        let ctx = unsafe { &*gpu_ptr };
+        if ctx.wf_buf.is_some() {
+            unsafe {
+                crate::gpu_ops::fast_dequant_matvec(ctx, w, s, b, x, out, out_dim, in_dim, group_size);
+            }
+            return;
+        }
     }
     let num_groups = in_dim / group_size;
     let packed_cols = in_dim / 8;

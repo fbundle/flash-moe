@@ -8,6 +8,11 @@ requires-python = ">=3.10"
 version = "0.1.0"
 description = "Flash-MoE inference engine — Rust port"
 license = { text = "MIT" }
+dependencies = [
+    "jinja2>=3.1.6",
+    "numpy>=2.2.6",
+    "transformers>=5.8.1",
+]
 
 [tool.maturin]
 features = ["python"]

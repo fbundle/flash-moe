@@ -9,9 +9,10 @@ crate-type = ["cdylib"]
 
 [features]
 python = ["pyo3/extension-module"]
+timing = []
 
 [dependencies]
-pyo3 = { version = "0.23" }
+pyo3 = { version = "0.28" }
 metal = "0.29"
 objc = "0.2"
 objc-foundation = "0.1"
@@ -19,5 +20,5 @@ half = "2"
 bytemuck = "1"
 parking_lot = "0.12"
 lz4_flex = "0.11"
-numpy = "0.23"
+numpy = "0.28"
 rand = "0.8"

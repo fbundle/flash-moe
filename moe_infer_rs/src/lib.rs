@@ -18,8 +18,11 @@ pub mod gpu_ops;
 pub mod gpu_forward;
 pub mod cpu_forward;
 
+use constants::MAX_K;
 use types::*;
 use std::fs::File;
+#[cfg(feature = "timing")]
+use std::time::Instant;
 
 // ============================================================================
 // Per-generation cache — one per concurrent sequence
@@ -98,6 +101,9 @@ pub struct FlashMoEContext {
     pub expert_cache: Option<expert_io::ExpertLRUCache>,
     pub malloc_cache: Option<expert_io::MallocExpertCache>,
 
+    // Persistent I/O thread pool (4 workers)
+    pub io_pool: Option<expert_io::IOPool>,
+
     // Metal GPU context (None if GPU unavailable)
     pub metal_ctx: Option<metal::MetalCtx>,
 
@@ -106,6 +112,20 @@ pub struct FlashMoEContext {
 
     // Per-token scratch (reused across layers)
     pub layer_scratch: cpu_forward::CpuForwardScratch,
+
+    // Deferred CMD3 for async expert pipeline (None when no pending CMD3)
+    pub deferred: Option<gpu_forward::DeferredCmd3>,
+
+    // GPU pipeline mode
+    pub gpu_mode: gpu_forward::GpuMode,
+
+    // Temporal prediction — previous token's routing predicts next token's
+    pub pred_experts: Vec<i32>,       // [num_layers * MAX_K]
+    pub pred_count: Vec<i32>,         // [num_layers]
+    pub pred_valid: bool,
+    pub pred_generating: bool,
+    pub pred_hits: u64,
+    pub pred_misses: u64,
 
     // Flags
     pub use_2bit: bool,
@@ -139,6 +159,23 @@ pub fn flashmoe_forward(
     let hidden_dim = m.cfg.hidden_dim as usize;
     let vocab_size = m.cfg.vocab_size as usize;
     let mut pos = cache.pos;
+    let mode = m.gpu_mode;
+
+    #[cfg(feature = "timing")]
+    let t_total = Instant::now();
+    #[cfg(feature = "timing")]
+    let mut t_layers_us = 0u128;
+    #[cfg(feature = "timing")]
+    let mut t_lmhead_us = 0u128;
+
+    // Reset prediction state at start of generation
+    if cache.pos == 0 {
+        m.pred_valid = false;
+        m.pred_experts.fill(-1);
+        m.pred_count.fill(0);
+        m.pred_hits = 0;
+        m.pred_misses = 0;
+    }
 
     for tok in 0..n_tokens as usize {
         // Embedding lookup
@@ -146,9 +183,10 @@ pub fn flashmoe_forward(
             &m.wf, &m.ht_data, input_ids[tok],
             m.cfg.hidden_dim, &mut m.hidden,
         );
-
         // Layer loop — GPU when Metal available, CPU fallback
         let gpu_ctx = m.metal_ctx.as_ref();
+        #[cfg(feature = "timing")]
+        let t_layers = Instant::now();
         for layer in 0..m.cfg.num_layers as usize {
             let is_full = ((layer + 1) % m.cfg.full_attn_interval as usize) == 0;
 
@@ -166,38 +204,45 @@ pub fn flashmoe_forward(
             let packed_fd = m.layer_fds[layer].as_ref();
 
             unsafe {
-                if let Some(gctx) = gpu_ctx {
-                    gpu_forward::gpu_layer_forward(
-                        &m.cfg,
-                        m.wf.data,
-                        &m.layer_caches[layer],
-                        &mut m.hidden,
-                        kv,
-                        la_state,
-                        pos,
-                        packed_fd,
-                        m.use_2bit,
-                        &mut m.layer_scratch,
-                        Some(gctx),
-                        m.expert_cache.as_mut(),
-                        layer,
-                    );
-                } else {
-                    cpu_forward::cpu_layer_forward(
-                        &m.cfg,
-                        m.wf.data,
-                        &m.layer_caches[layer],
-                        &mut m.hidden,
-                        kv,
-                        la_state,
-                        pos,
-                        packed_fd,
-                        m.use_2bit,
-                        &mut m.layer_scratch,
-                    );
-                }
+                gpu_forward::gpu_layer_forward(
+                    &m.cfg,
+                    m.wf.data,
+                    &m.layer_caches,
+                    &mut m.hidden,
+                    kv,
+                    la_state,
+                    pos,
+                    packed_fd,
+                    m.use_2bit,
+                    &mut m.layer_scratch,
+                    gpu_ctx,
+                    m.expert_cache.as_mut(),
+                    m.io_pool.as_ref(),
+                    layer,
+                    &mut m.deferred,
+                    mode,
+                    &mut m.pred_experts,
+                    &mut m.pred_count,
+                    &mut m.pred_valid,
+                );
+            }
+
+        }
+
+        // Complete any pending deferred CMD3 from the last layer
+        unsafe {
+            if let Some(ctx) = m.metal_ctx.as_ref() {
+                gpu_forward::complete_deferred_experts(
+                    ctx,
+                    &mut m.deferred,
+                    &mut m.hidden,
+                    hidden_dim,
+                    &mut m.layer_scratch,
+                    m.expert_cache.as_mut(),
+                );
             }
         }
+
         pos += 1;
 
         // Final LayerNorm
@@ -210,13 +255,29 @@ pub fn flashmoe_forward(
             m.hidden.copy_from_slice(&normed);
         }
 
-        // LM head
+        // LM head (GPU when Metal available)
+        #[cfg(feature = "timing")]
+        let t_lm = Instant::now();
         embeddings::lm_head_forward(
             &m.wf, &m.ht_data, &m.hidden,
             &mut logits_out[tok * vocab_size..(tok + 1) * vocab_size],
             m.cfg.vocab_size, m.cfg.hidden_dim, m.cfg.group_size,
+            m.metal_ctx.as_ref(),
         );
+        #[cfg(feature = "timing")]
+        {
+            t_layers_us += t_layers.elapsed().as_micros();
+            t_lmhead_us += t_lm.elapsed().as_micros();
+        }
     }
+
+    #[cfg(feature = "timing")]
+    eprintln!("[timing] {} tokens: tot={}ms, layers={}ms, lmhead={}ms",
+        n_tokens,
+        t_total.elapsed().as_millis(),
+        t_layers_us / 1000,
+        t_lmhead_us / 1000,
+    );
 
     cache.pos = pos;
     Ok(())
@@ -297,6 +358,16 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
         })
         .unwrap_or_default();
 
+    // Init persistent I/O thread pool
+    let io_pool = Some(expert_io::IOPool::new());
+    println!("[init] Persistent I/O pool started ({} threads)", expert_io::NUM_IO_THREADS);
+
+    // ------ Init prediction state ------
+    let nl = cfg.num_layers as usize;
+    let pred_experts = vec![-1i32; nl * MAX_K];
+    let pred_count = vec![0i32; nl];
+
+    println!("[init] Temporal prediction enabled (prev-token routing → next-token prefetch)");
     println!("[init] Model loaded: {} layers ({} full + {} linear)",
         cfg.num_layers, cfg.num_full_attn_layers, cfg.num_linear_layers);
     if metal_ctx.is_some() {
@@ -316,11 +387,20 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
         final_norm_w,
         expert_cache,
         malloc_cache: None,
+        io_pool,
         metal_ctx,
         layer_caches,
         layer_scratch,
+        deferred: None,
+        gpu_mode: gpu_forward::GpuMode::ThreeCommand,
         use_2bit: detect_2bit,
         initialized: true,
+        pred_experts,
+        pred_count,
+        pred_valid: false,
+        pred_generating: true,
+        pred_hits: 0,
+        pred_misses: 0,
     })
 }
 
@@ -390,7 +470,7 @@ mod python {
             Ok(Self { ctx: Mutex::new(ctx) })
         }
 
-        fn forward(&self, py: Python<'_>, input_ids: Vec<i32>, cache: &Cache) -> PyResult<(PyObject, PyObject)> {
+        fn forward(&self, py: Python<'_>, input_ids: Vec<i32>, cache: &Cache) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
             let mut ctx = self.ctx.lock().unwrap();
             let mut c = cache.inner.lock().unwrap();
             let vocab = ctx.cfg.vocab_size as usize;
@@ -408,36 +488,32 @@ mod python {
             Ok((logits_list.into(), py.None()))
         }
 
-        fn generate(
+        /// Single forward + sample step. Takes the current token_id, runs one
+        /// forward pass, samples the next token, and returns it.  Call in a loop
+        /// for true token-by-token streaming.
+        fn sample(
             &self,
-            first_token_id: i32,
+            token_id: i32,
             cache: &Cache,
-            eos_token_id: i32,
-            max_tokens: i32,
             temperature: f32,
             top_k: i32,
             top_p: f32,
             min_p: f32,
-        ) -> PyResult<Vec<i32>> {
+        ) -> PyResult<i32> {
             let mut ctx = self.ctx.lock().unwrap();
             let mut c = cache.inner.lock().unwrap();
             let vocab = ctx.cfg.vocab_size as usize;
 
             let mut logits_buf = vec![0.0f32; vocab];
-            let mut next_id = first_token_id;
-            let mut tokens = Vec::with_capacity(max_tokens as usize);
+            let mut next_id = token_id;
 
-            for _ in 0..max_tokens {
-                generate::generate_step(
-                    &mut ctx, &mut c, &mut next_id, &mut logits_buf,
-                    eos_token_id, temperature, top_k, top_p, min_p,
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            generate::generate_step(
+                &mut ctx, &mut c, &mut next_id, &mut logits_buf,
+                -1, // eos not checked here — caller decides when to stop
+                temperature, top_k, top_p, min_p,
+            ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-                if next_id == eos_token_id { break; }
-                tokens.push(next_id);
-            }
-
-            Ok(tokens)
+            Ok(next_id)
         }
 
         #[getter]

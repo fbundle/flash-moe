@@ -59,8 +59,6 @@ pub fn cpu_dequant_matvec(
                 let packed = w_row[base_packed + p];
                 let xb = base_x + p * 8;
 
-                // Unrolled 8 x 4-bit nibbles with mul_add:
-                //   nibble * (scale * x[n]) + (bias * x[n])
                 let nib0 = ((packed >> 0) & 0xF) as f32;
                 let nib1 = ((packed >> 4) & 0xF) as f32;
                 let nib2 = ((packed >> 8) & 0xF) as f32;
@@ -70,31 +68,16 @@ pub fn cpu_dequant_matvec(
                 let nib6 = ((packed >> 24) & 0xF) as f32;
                 let nib7 = ((packed >> 28) & 0xF) as f32;
 
-                let sx0 = scale * x[xb];
-                let bx0 = bias * x[xb];
-                let sx1 = scale * x[xb + 1];
-                let bx1 = bias * x[xb + 1];
-                let sx2 = scale * x[xb + 2];
-                let bx2 = bias * x[xb + 2];
-                let sx3 = scale * x[xb + 3];
-                let bx3 = bias * x[xb + 3];
-                let sx4 = scale * x[xb + 4];
-                let bx4 = bias * x[xb + 4];
-                let sx5 = scale * x[xb + 5];
-                let bx5 = bias * x[xb + 5];
-                let sx6 = scale * x[xb + 6];
-                let bx6 = bias * x[xb + 6];
-                let sx7 = scale * x[xb + 7];
-                let bx7 = bias * x[xb + 7];
-
-                acc += nib0.mul_add(sx0, bx0);
-                acc += nib1.mul_add(sx1, bx1);
-                acc += nib2.mul_add(sx2, bx2);
-                acc += nib3.mul_add(sx3, bx3);
-                acc += nib4.mul_add(sx4, bx4);
-                acc += nib5.mul_add(sx5, bx5);
-                acc += nib6.mul_add(sx6, bx6);
-                acc += nib7.mul_add(sx7, bx7);
+                // Match C's accumulation order exactly:
+                //   acc += (nibble * scale + bias) * x[n]
+                acc += (nib0 * scale + bias) * x[xb];
+                acc += (nib1 * scale + bias) * x[xb + 1];
+                acc += (nib2 * scale + bias) * x[xb + 2];
+                acc += (nib3 * scale + bias) * x[xb + 3];
+                acc += (nib4 * scale + bias) * x[xb + 4];
+                acc += (nib5 * scale + bias) * x[xb + 5];
+                acc += (nib6 * scale + bias) * x[xb + 6];
+                acc += (nib7 * scale + bias) * x[xb + 7];
             }
         }
         out[row] = acc;

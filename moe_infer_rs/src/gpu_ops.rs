@@ -166,6 +166,7 @@ pub fn gpu_encode_expert_forward_slot(
     cmd: &CommandBufferRef,
     k: usize,
     use_2bit: bool,
+    data_buf: Option<&Buffer>,  // if Some, use this instead of buf_multi_expert_data[k]
 ) {
     let layout = if use_2bit { &cfg.layout_2bit } else { &cfg.layout_4bit };
     let pipe = if use_2bit {
@@ -180,13 +181,15 @@ pub fn gpu_encode_expert_forward_slot(
     let din = cfg.moe_intermediate as u32;
     let gs = cfg.group_size as u32;
 
+    let expert_data = data_buf.unwrap_or(&ctx.buf_multi_expert_data[k]);
+
     // gate_proj
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(&ctx.buf_multi_expert_data[k]), layout.gate_w_off as u64);
-        enc.set_buffer(1, Some(&ctx.buf_multi_expert_data[k]), layout.gate_s_off as u64);
-        enc.set_buffer(2, Some(&ctx.buf_multi_expert_data[k]), layout.gate_b_off as u64);
+        enc.set_buffer(0, Some(expert_data), layout.gate_w_off as u64);
+        enc.set_buffer(1, Some(expert_data), layout.gate_s_off as u64);
+        enc.set_buffer(2, Some(expert_data), layout.gate_b_off as u64);
         enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
         enc.set_buffer(4, Some(&ctx.buf_multi_expert_gate[k]), 0);
         enc.set_bytes(5, 4, &go as *const u32 as *const _);
@@ -200,9 +203,9 @@ pub fn gpu_encode_expert_forward_slot(
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(&ctx.buf_multi_expert_data[k]), layout.up_w_off as u64);
-        enc.set_buffer(1, Some(&ctx.buf_multi_expert_data[k]), layout.up_s_off as u64);
-        enc.set_buffer(2, Some(&ctx.buf_multi_expert_data[k]), layout.up_b_off as u64);
+        enc.set_buffer(0, Some(expert_data), layout.up_w_off as u64);
+        enc.set_buffer(1, Some(expert_data), layout.up_s_off as u64);
+        enc.set_buffer(2, Some(expert_data), layout.up_b_off as u64);
         enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
         enc.set_buffer(4, Some(&ctx.buf_multi_expert_up[k]), 0);
         enc.set_bytes(5, 4, &go as *const u32 as *const _);
@@ -228,9 +231,9 @@ pub fn gpu_encode_expert_forward_slot(
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(&ctx.buf_multi_expert_data[k]), layout.down_w_off as u64);
-        enc.set_buffer(1, Some(&ctx.buf_multi_expert_data[k]), layout.down_s_off as u64);
-        enc.set_buffer(2, Some(&ctx.buf_multi_expert_data[k]), layout.down_b_off as u64);
+        enc.set_buffer(0, Some(expert_data), layout.down_w_off as u64);
+        enc.set_buffer(1, Some(expert_data), layout.down_s_off as u64);
+        enc.set_buffer(2, Some(expert_data), layout.down_b_off as u64);
         enc.set_buffer(3, Some(&ctx.buf_multi_expert_act[k]), 0);
         enc.set_buffer(4, Some(&ctx.buf_multi_expert_out[k]), 0);
         enc.set_bytes(5, 4, &dout as *const u32 as *const _);
@@ -248,34 +251,76 @@ pub fn gpu_encode_shared_down_swiglu(
     cfg: &ModelConfig,
     ctx: &MetalCtx,
     cmd: &CommandBufferRef,
-    sdw: *const u32,
-    sds: *const u16,
-    sdb: *const u16,
+    sgw: *const u32, sgs: *const u16, sgb: *const u16,
+    suw: *const u32, sus: *const u16, sub: *const u16,
+    sdw: *const u32, sds: *const u16, sdb: *const u16,
 ) {
     if ctx.wf_buf.is_none() { return; }
     let wf = ctx.wf_buf.as_ref().unwrap();
     let wf_ptr = wf.contents() as *const u8;
 
-    // SwiGLU dispatch
+    let si = cfg.shared_intermediate as u32;
+    let hd = cfg.hidden_dim as u32;
+    let gs = cfg.group_size as u32;
+
+    // Gate proj: buf_shared_gate = sg_weight @ h_post
+    {
+        let w_off = unsafe { (sgw as *const u8).offset_from(wf_ptr) as u64 };
+        let s_off = unsafe { (sgs as *const u8).offset_from(wf_ptr) as u64 };
+        let b_off = unsafe { (sgb as *const u8).offset_from(wf_ptr) as u64 };
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ctx.matvec_v3);
+        enc.set_buffer(0, Some(wf), w_off);
+        enc.set_buffer(1, Some(wf), s_off);
+        enc.set_buffer(2, Some(wf), b_off);
+        enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
+        enc.set_buffer(4, Some(&ctx.buf_shared_gate), 0);
+        enc.set_bytes(5, 4, &si as *const u32 as *const _);
+        enc.set_bytes(6, 4, &hd as *const u32 as *const _);
+        enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+        let tgs = ((si + 7) / 8) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+
+    // Up proj: buf_shared_up = su_weight @ h_post
+    {
+        let w_off = unsafe { (suw as *const u8).offset_from(wf_ptr) as u64 };
+        let s_off = unsafe { (sus as *const u8).offset_from(wf_ptr) as u64 };
+        let b_off = unsafe { (sub as *const u8).offset_from(wf_ptr) as u64 };
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ctx.matvec_v3);
+        enc.set_buffer(0, Some(wf), w_off);
+        enc.set_buffer(1, Some(wf), s_off);
+        enc.set_buffer(2, Some(wf), b_off);
+        enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
+        enc.set_buffer(4, Some(&ctx.buf_shared_up), 0);
+        enc.set_bytes(5, 4, &si as *const u32 as *const _);
+        enc.set_bytes(6, 4, &hd as *const u32 as *const _);
+        enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+        let tgs = ((si + 7) / 8) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+
+    // SwiGLU: buf_shared_act = swiglu(buf_shared_gate, buf_shared_up)
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&ctx.swiglu);
         enc.set_buffer(0, Some(&ctx.buf_shared_gate), 0);
         enc.set_buffer(1, Some(&ctx.buf_shared_up), 0);
         enc.set_buffer(2, Some(&ctx.buf_shared_act), 0);
-        let dim = cfg.shared_intermediate as u32;
-        enc.set_bytes(3, 4, &dim as *const u32 as *const _);
-        let tgs = ((dim + 255) / 256) as u64;
+        enc.set_bytes(3, 4, &si as *const u32 as *const _);
+        let tgs = ((si + 255) / 256) as u64;
         enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
 
-    // Shared down_proj
-    let w_off = unsafe { (sdw as *const u8).offset_from(wf_ptr) as u64 };
-    let s_off = unsafe { (sds as *const u8).offset_from(wf_ptr) as u64 };
-    let b_off = unsafe { (sdb as *const u8).offset_from(wf_ptr) as u64 };
-
+    // Down proj: buf_shared_out = sd_weight @ buf_shared_act
     {
+        let w_off = unsafe { (sdw as *const u8).offset_from(wf_ptr) as u64 };
+        let s_off = unsafe { (sds as *const u8).offset_from(wf_ptr) as u64 };
+        let b_off = unsafe { (sdb as *const u8).offset_from(wf_ptr) as u64 };
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&ctx.matvec_v3);
         enc.set_buffer(0, Some(wf), w_off);
@@ -283,9 +328,6 @@ pub fn gpu_encode_shared_down_swiglu(
         enc.set_buffer(2, Some(wf), b_off);
         enc.set_buffer(3, Some(&ctx.buf_shared_act), 0);
         enc.set_buffer(4, Some(&ctx.buf_shared_out), 0);
-        let hd = cfg.hidden_dim as u32;
-        let si = cfg.shared_intermediate as u32;
-        let gs = cfg.group_size as u32;
         enc.set_bytes(5, 4, &hd as *const u32 as *const _);
         enc.set_bytes(6, 4, &si as *const u32 as *const _);
         enc.set_bytes(7, 4, &gs as *const u32 as *const _);
@@ -384,28 +426,31 @@ pub fn apply_rotary_emb(
     rope_theta: f32,
 ) {
     let pos_f = pos as f32;
+    let half = rotary_dim / 2;
     for h in 0..num_heads {
         let qh = &mut q[h * head_dim..(h + 1) * head_dim];
-        for i in (0..rotary_dim).step_by(2) {
-            let theta = pos_f / rope_theta.powf(i as f32 / rotary_dim as f32);
-            let cos = theta.cos();
-            let sin = theta.sin();
+        for i in 0..half {
+            let freq = 1.0 / rope_theta.powf((2 * i) as f32 / rotary_dim as f32);
+            let angle = pos_f * freq;
+            let cos = angle.cos();
+            let sin = angle.sin();
             let q0 = qh[i];
-            let q1 = qh[i + 1];
-            qh[i] = q0 * cos - q1 * sin;
-            qh[i + 1] = q0 * sin + q1 * cos;
+            let q1 = qh[i + half];
+            qh[i]        = q0 * cos - q1 * sin;
+            qh[i + half] = q0 * sin + q1 * cos;
         }
     }
     for h in 0..num_kv_heads {
         let kh = &mut k[h * head_dim..(h + 1) * head_dim];
-        for i in (0..rotary_dim).step_by(2) {
-            let theta = pos_f / rope_theta.powf(i as f32 / rotary_dim as f32);
-            let cos = theta.cos();
-            let sin = theta.sin();
+        for i in 0..half {
+            let freq = 1.0 / rope_theta.powf((2 * i) as f32 / rotary_dim as f32);
+            let angle = pos_f * freq;
+            let cos = angle.cos();
+            let sin = angle.sin();
             let k0 = kh[i];
-            let k1 = kh[i + 1];
-            kh[i] = k0 * cos - k1 * sin;
-            kh[i + 1] = k0 * sin + k1 * cos;
+            let k1 = kh[i + half];
+            kh[i]        = k0 * cos - k1 * sin;
+            kh[i + half] = k0 * sin + k1 * cos;
         }
     }
 }

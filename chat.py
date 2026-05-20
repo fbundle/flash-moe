@@ -16,32 +16,28 @@ import moe_infer_rs as _core
 
 def generate_rust(model, cache, prompt_ids, max_tokens, eos_token_id,
                    temperature, top_k, top_p, min_p):
-    """Run prefill then Rust-side autoregressive generation. Yields token_ids one at a time."""
+    """Run prefill then token-by-token autoregressive generation.
+    Yields each token_id immediately after it's sampled — true streaming."""
     pos = cache.position
     new_ids = prompt_ids[pos:]
-    n_prefill = len(new_ids) if new_ids else 1
 
     if new_ids:
         logits, _ = model.forward(new_ids, cache)
     else:
         logits, _ = model.forward([prompt_ids[-1]], cache)
 
-    # logits is a flat list of [n_tokens * vocab_size] floats
-    # Get the last vocab-sized slice and find argmax
+    # Get the last vocab-sized slice and find argmax for the first token
     vocab = model.vocab_size
     last_logits = logits[-vocab:] if len(logits) >= vocab else logits
-    first_id = max(range(len(last_logits)), key=lambda i: last_logits[i])
+    next_id = max(range(len(last_logits)), key=lambda i: last_logits[i])
 
-    # Rust generate returns all tokens at once — yield one at a time for streaming
-    tokens = model.generate(
-        first_id, cache, eos_token_id,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        min_p=min_p,
-    )
-    yield from tokens
+    # Loop in Python — each call to model.sample does one forward + sample
+    # and returns immediately, so we yield tokens as they're produced
+    for _ in range(max_tokens):
+        next_id = model.sample(next_id, cache, temperature, top_k, top_p, min_p)
+        if next_id == eos_token_id:
+            break
+        yield next_id
 
 
 def main():
@@ -55,7 +51,8 @@ def main():
     parser.add_argument("--min-p", type=float, default=0.0)
     args = parser.parse_args()
 
-    tok_path = args.tokenizer or args.model
+    # Default to the Qwen3.6 tokenizer bundled with the converted model
+    tok_path = args.tokenizer or "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
     tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
 
     print(f"Loading model from {args.model} ...")

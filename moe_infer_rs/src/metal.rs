@@ -96,6 +96,9 @@ pub struct MetalCtx {
     pub buf_delta_output: Buffer,
     pub buf_conv_input: Buffer,
     pub buf_conv_output: Buffer,
+
+    // Event pipeline (MTLSharedEvent for non-blocking GPU completion check)
+    pub pipeline_event: SharedEvent,
 }
 
 // Embedded Metal Shading Language source.
@@ -268,6 +271,9 @@ impl MetalCtx {
         let buf_conv_input = device.new_buffer(cfg.linear_conv_dim as u64 * 4, MTLResourceOptions::StorageModeShared);
         let buf_conv_output = device.new_buffer(cfg.linear_conv_dim as u64 * 4, MTLResourceOptions::StorageModeShared);
 
+        // Shared event for non-blocking GPU completion check
+        let pipeline_event = device.new_shared_event();
+
         Ok(Self {
             device,
             queue,
@@ -333,6 +339,7 @@ impl MetalCtx {
             buf_delta_output,
             buf_conv_input,
             buf_conv_output,
+            pipeline_event,
         })
     }
 

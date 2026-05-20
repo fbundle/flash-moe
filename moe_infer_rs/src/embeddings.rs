@@ -59,6 +59,7 @@ pub fn lm_head_forward(
     vocab_size: i32,
     hidden_dim: i32,
     group_size: i32,
+    metal_ctx: Option<&crate::metal::MetalCtx>,
 ) {
     let w_info = ht.find("lm_head.weight").expect("lm_head.weight not found");
     let s_info = ht.find("lm_head.scales").expect("lm_head.scales not found");
@@ -68,29 +69,34 @@ pub fn lm_head_forward(
     let s_ptr = unsafe { wf.data.add(s_info.offset as usize) as *const u16 };
     let b_ptr = unsafe { wf.data.add(b_info.offset as usize) as *const u16 };
 
-    // Use CPU dequant — the GPU version needs Metal context
-    let w_slice = unsafe { std::slice::from_raw_parts(w_ptr, (vocab_size as usize * hidden_dim as usize) / 8) };
-    let s_slice = unsafe {
-        std::slice::from_raw_parts(
-            s_ptr,
-            vocab_size as usize * (hidden_dim as usize / group_size as usize),
-        )
-    };
-    let b_slice = unsafe {
-        std::slice::from_raw_parts(
-            b_ptr,
-            vocab_size as usize * (hidden_dim as usize / group_size as usize),
-        )
-    };
+    if let Some(ctx) = metal_ctx {
+        unsafe {
+            crate::gpu_ops::fast_dequant_matvec(
+                ctx,
+                w_ptr, s_ptr, b_ptr,
+                hidden, logits,
+                vocab_size as usize, hidden_dim as usize, group_size as usize,
+            );
+        }
+    } else {
+        let w_slice = unsafe { std::slice::from_raw_parts(w_ptr, (vocab_size as usize * hidden_dim as usize) / 8) };
+        let s_slice = unsafe {
+            std::slice::from_raw_parts(
+                s_ptr,
+                vocab_size as usize * (hidden_dim as usize / group_size as usize),
+            )
+        };
+        let b_slice = unsafe {
+            std::slice::from_raw_parts(
+                b_ptr,
+                vocab_size as usize * (hidden_dim as usize / group_size as usize),
+            )
+        };
 
-    cpu_dequant_matvec(
-        w_slice,
-        s_slice,
-        b_slice,
-        hidden,
-        logits,
-        vocab_size as usize,
-        hidden_dim as usize,
-        group_size as usize,
-    );
+        cpu_dequant_matvec(
+            w_slice, s_slice, b_slice,
+            hidden, logits,
+            vocab_size as usize, hidden_dim as usize, group_size as usize,
+        );
+    }
 }
