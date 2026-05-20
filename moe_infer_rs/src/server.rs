@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::config::ModelConfig;
 use crate::error::MoEError;
+use crate::gpu_forward::{self, LinearAttnState};
 use crate::metal_context::MetalContext;
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
 use crate::tokenizer::BpeTokenizer;
@@ -175,7 +176,7 @@ fn embed_lookup(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: u
     }
 }
 
-// ─── KV Cache ─────────────────────────────────────────────────────────────
+// ─── Layer state (KV cache or linear attention) ───────────────────────────
 
 struct KVCache {
     k_cache: Vec<f32>,
@@ -192,6 +193,11 @@ impl KVCache {
             len: 0,
         }
     }
+}
+
+enum LayerState {
+    FullAttention(KVCache),
+    LinearAttention(LinearAttnState),
 }
 
 // ─── RoPE ─────────────────────────────────────────────────────────────────
@@ -390,24 +396,6 @@ fn full_attention_forward(
     }
 }
 
-// ─── Linear attention (GatedDeltaNet placeholder) ─────────────────────────
-
-/// Linear attention forward — simplified CPU path.
-/// TODO: port full GatedDeltaNet with conv1d + key/value + recurrence.
-fn linear_attention_forward(
-    wf: &WeightFile,
-    layer_idx: usize,
-    hidden: &mut [f32],
-    hidden_dim: usize,
-) {
-    let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
-    if let Some(nw) = wf.get_tensor_u16(&norm_name) {
-        let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
-        let mut normed = vec![0.0f32; hidden_dim];
-        cpu_rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
-        // Keep input-normed hidden (simplified; full impl has o_proj + residual)
-    }
-}
 
 // ─── LM head ──────────────────────────────────────────────────────────────
 
@@ -479,41 +467,48 @@ impl Vocabulary {
 // ─── Full layer forward ───────────────────────────────────────────────────
 
 /// Run a single transformer layer: attention + MoE + residual.
+///
+/// - Full attention layers (every 4th): self-attention with KV cache, RoPE, sigmoid gate
+/// - Linear attention layers: GatedDeltaNet with conv1d + SSM recurrence
+/// - All layers: MoE block (router → K experts + shared expert → combine)
 fn forward_layer(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
-    kv_caches: &mut [Option<KVCache>],
+    layer_states: &mut [LayerState],
     pos: usize,
-    hidden_dim: usize,
-    num_attn_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-) {
+    packed_fd: std::os::fd::RawFd,
+    ctx: Option<&MetalContext>,
+    config: &ModelConfig,
+) -> Result<(), MoEError> {
+    let hidden_dim = config.hidden_dim;
     let is_full_attn = (layer_idx + 1) % FULL_ATTN_INTERVAL == 0;
 
     if is_full_attn {
-        if let Some(ref mut kv) = kv_caches[layer_idx] {
+        if let LayerState::FullAttention(ref mut kv) = layer_states[layer_idx] {
             full_attention_forward(
                 wf, layer_idx, hidden, kv, pos,
-                hidden_dim, num_attn_heads, num_kv_heads, head_dim, rotary_dim,
+                hidden_dim,
+                config.num_attn_heads, config.num_kv_heads,
+                config.head_dim, config.rotary_dim,
             );
         }
     } else {
-        linear_attention_forward(wf, layer_idx, hidden, hidden_dim);
+        if let LayerState::LinearAttention(ref mut state) = layer_states[layer_idx] {
+            gpu_forward::linear_attention_forward(
+                wf, layer_idx, hidden, state,
+                hidden_dim,
+                config.linear_num_k_heads,
+                config.linear_num_v_heads,
+                config.linear_total_key,
+                config.linear_total_value,
+                config.linear_conv_dim,
+            );
+        }
     }
 
-    // Post-attention RMS norm (after residual which is inside attention)
-    let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
-    if let Some(pnw) = wf.get_tensor_u16(&post_norm_name) {
-        let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
-        let mut normed = vec![0.0f32; hidden_dim];
-        cpu_rms_norm(hidden, &pnw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
-        hidden.copy_from_slice(&normed);
-    }
-
-    // TODO: Run MoE on GPU via the existing kernel infrastructure
+    // MoE block: routing, K experts, shared expert, combine
+    gpu_forward::moe_layer_forward(wf, layer_idx, hidden, packed_fd, ctx, config)
 }
 
 // ─── Final norm ───────────────────────────────────────────────────────────
@@ -537,13 +532,12 @@ pub fn run_server(
 ) -> Result<(), MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_layers = config.num_layers;
-    let _num_attn_heads = config.num_attn_heads;
     let num_kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
-    let _rotary_dim = config.rotary_dim;
     let moe_inter = config.moe_intermediate;
-    let _expert_size = config.expert_size_4bit;
     let num_experts = config.num_experts;
+    let qkv_dim = config.linear_conv_dim;
+    let num_v_heads = config.linear_num_v_heads;
 
     // Load non-expert weights
     let bin_path = model_dir.join("model_weights.bin");
@@ -569,7 +563,7 @@ pub fn run_server(
     let vocab = Vocabulary::load(&vocab_path)?;
 
     // Init Metal
-    let _ctx = MetalContext::init()?;
+    let ctx = MetalContext::init()?;
 
     // Open packed expert layer files
     let packed_dir = model_dir.join("packed_experts");
@@ -590,14 +584,19 @@ pub fn run_server(
         return Err(MoEError::Config("No packed expert layer files found".into()));
     }
 
-    // Allocate KV caches for full attention layers
+    // Allocate per-layer state: KV caches for full attention, linear attn state for others
     let max_seq = 4096;
-    let mut kv_caches: Vec<Option<KVCache>> = (0..num_layers)
+    let mut layer_states: Vec<LayerState> = (0..num_layers)
         .map(|layer| {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
-                Some(KVCache::new(max_seq, head_dim, num_kv_heads))
+                LayerState::FullAttention(KVCache::new(max_seq, head_dim, num_kv_heads))
             } else {
-                None
+                LayerState::LinearAttention(LinearAttnState::new(
+                    num_v_heads,
+                    gpu_forward::LINEAR_KEY_DIM,
+                    gpu_forward::LINEAR_VALUE_DIM,
+                    qkv_dim,
+                ))
             }
         })
         .collect();
@@ -614,8 +613,8 @@ pub fn run_server(
 
     eprintln!("[serve] Listening on http://0.0.0.0:{}", port);
     eprintln!("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health");
-    eprintln!("[serve] Model: {} layers, hidden={}, MoE_inter={}, experts={}",
-        num_layers, hidden_dim, moe_inter, num_experts);
+    eprintln!("[serve] Model: {} layers, hidden={}, MoE_inter={}, experts={}, linear_attn_dim={}",
+        num_layers, hidden_dim, moe_inter, num_experts, qkv_dim);
 
     let req_counter = AtomicU64::new(0);
 
@@ -663,7 +662,9 @@ pub fn run_server(
                     &tokenizer,
                     &vocab,
                     &mut hidden,
-                    &mut kv_caches,
+                    &mut layer_states,
+                    &layer_fds,
+                    Some(&ctx),
                     config,
                 );
             }
@@ -687,15 +688,13 @@ fn handle_chat_completion(
     tokenizer: &BpeTokenizer,
     vocab: &Vocabulary,
     hidden: &mut [f32],
-    kv_caches: &mut [Option<KVCache>],
+    layer_states: &mut [LayerState],
+    layer_fds: &[RawFd],
+    ctx: Option<&MetalContext>,
     config: &ModelConfig,
 ) {
     let hidden_dim = config.hidden_dim;
     let num_layers = config.num_layers;
-    let num_attn_heads = config.num_attn_heads;
-    let num_kv_heads = config.num_kv_heads;
-    let head_dim = config.head_dim;
-    let rotary_dim = config.rotary_dim;
 
     // Extract body
     let body_start = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
@@ -759,9 +758,9 @@ fn handle_chat_completion(
         hidden.copy_from_slice(&embed_batch[i * hidden_dim..(i + 1) * hidden_dim]);
 
         for layer in 0..num_layers {
-            forward_layer(
-                wf, layer, hidden, kv_caches, pos,
-                hidden_dim, num_attn_heads, num_kv_heads, head_dim, rotary_dim,
+            let _ = forward_layer(
+                wf, layer, hidden, layer_states, pos,
+                layer_fds[layer], ctx, config,
             );
         }
         pos += 1;
@@ -773,9 +772,9 @@ fn handle_chat_completion(
         hidden.copy_from_slice(&embed_batch[last_i * hidden_dim..(last_i + 1) * hidden_dim]);
 
         for layer in 0..num_layers {
-            forward_layer(
-                wf, layer, hidden, kv_caches, pos,
-                hidden_dim, num_attn_heads, num_kv_heads, head_dim, rotary_dim,
+            let _ = forward_layer(
+                wf, layer, hidden, layer_states, pos,
+                layer_fds[layer], ctx, config,
             );
         }
         pos += 1;
@@ -796,12 +795,11 @@ fn handle_chat_completion(
             // Feed EOS through model to update state
             embed_lookup(wf, next_token, hidden, hidden_dim);
             for layer in 0..num_layers {
-                forward_layer(
-                    wf, layer, hidden, kv_caches, pos,
-                    hidden_dim, num_attn_heads, num_kv_heads, head_dim, rotary_dim,
+                let _ = forward_layer(
+                    wf, layer, hidden, layer_states, pos,
+                    layer_fds[layer], ctx, config,
                 );
             }
-            // pos advanced by forward_layer calls above; break out
             break;
         }
 
@@ -816,9 +814,9 @@ fn handle_chat_completion(
         // Forward through model for next token
         embed_lookup(wf, next_token, hidden, hidden_dim);
         for layer in 0..num_layers {
-            forward_layer(
-                wf, layer, hidden, kv_caches, pos,
-                hidden_dim, num_attn_heads, num_kv_heads, head_dim, rotary_dim,
+            let _ = forward_layer(
+                wf, layer, hidden, layer_states, pos,
+                layer_fds[layer], ctx, config,
             );
         }
         pos += 1;
