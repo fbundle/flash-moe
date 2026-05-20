@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{IntoRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -122,14 +123,31 @@ fn sse_send_done(mut stream: &TcpStream, request_id: &str) {
 
 static DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant. /think";
 
-fn tokenize_chat_message(
+fn tokenize_chat_messages(
     tokenizer: &BpeTokenizer,
-    user_content: &str,
+    messages: &serde_json::Value,
 ) -> Result<Vec<usize>, MoEError> {
-    let prompt = format!(
-        "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        DEFAULT_SYSTEM_PROMPT, user_content
-    );
+    let msgs = messages.as_array().unwrap_or(&vec![]);
+    let mut prompt = String::new();
+
+    // Always include system message first
+    prompt.push_str("<|im_start|>system\n");
+    prompt.push_str(DEFAULT_SYSTEM_PROMPT);
+    prompt.push_str("<|im_end|>\n");
+
+    for msg in msgs {
+        let role = msg["role"].as_str().unwrap_or("user");
+        let content = msg["content"].as_str().unwrap_or("");
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(content);
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    // Generation prompt (thinking mode)
+    prompt.push_str("<|im_start|>assistant\n<think>\n");
+
     Ok(tokenizer
         .encode(&prompt, 8192)
         .into_iter()
@@ -205,8 +223,9 @@ fn apply_rotary_emb(
     q: &mut [f32], k: &mut [f32], pos: usize,
     num_q_heads: usize, num_kv_heads: usize,
     head_dim: usize, rotary_dim: usize,
+    rope_theta: f64,
 ) {
-    let theta_base = 10000.0f64;
+    let theta_base = rope_theta;
     let pos_f = pos as f32;
 
     for h in 0..num_q_heads {
@@ -241,6 +260,7 @@ fn full_attention_forward(
     hidden: &mut [f32], kv: &mut KVCache, pos: usize,
     hidden_dim: usize, num_attn_heads: usize, num_kv_heads: usize,
     head_dim: usize, rotary_dim: usize,
+    rope_theta: f64,
 ) {
     let q_proj_dim = num_attn_heads * head_dim * 2;
     let q_dim = num_attn_heads * head_dim;
@@ -287,10 +307,11 @@ fn full_attention_forward(
     }
 
     let mut q = vec![0.0f32; q_dim];
-    let q_gate: Vec<f32> = q_proj_out[q_dim..].to_vec();
+    let mut q_gate = vec![0.0f32; q_dim];
     for h in 0..num_attn_heads {
-        let src = &q_proj_out[h * 2 * head_dim..h * 2 * head_dim + head_dim];
-        q[h * head_dim..h * head_dim + head_dim].copy_from_slice(src);
+        let src = &q_proj_out[h * 2 * head_dim..];
+        q[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[..head_dim]);
+        q_gate[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[head_dim..2 * head_dim]);
     }
 
     if let Some(qnw) = wf.get_tensor_u16(&format!("model.layers.{}.self_attn.q_norm.weight", layer_idx)) {
@@ -312,7 +333,7 @@ fn full_attention_forward(
         }
     }
 
-    apply_rotary_emb(&mut q, &mut k, pos, num_attn_heads, num_kv_heads, head_dim, rotary_dim);
+    apply_rotary_emb(&mut q, &mut k, pos, num_attn_heads, num_kv_heads, head_dim, rotary_dim, rope_theta);
 
     let cache_pos = kv.len;
     let start = cache_pos * kv_dim;
@@ -381,6 +402,28 @@ fn cpu_argmax(x: &[f32]) -> usize {
         .map(|(i, _)| i).unwrap_or(0)
 }
 
+// ─── Debug helpers ──────────────────────────────────────────────────────────
+
+fn stats_f32(x: &[f32]) -> (f32, f32, f32, f32, bool) {
+    if x.is_empty() { return (0.0, 0.0, 0.0, 0.0, false); }
+    let mut has_nan = false;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0;
+    let mut sq = 0.0;
+    for &v in x {
+        if v.is_nan() { has_nan = true; continue; }
+        min = min.min(v);
+        max = max.max(v);
+        sum += v;
+        sq += v * v;
+    }
+    let n = x.len() as f32;
+    let mean = sum / n;
+    let std = ((sq / n) - mean * mean).max(0.0).sqrt();
+    (min, max, mean, std, has_nan)
+}
+
 // ─── Vocab ────────────────────────────────────────────────────────────────
 
 struct Vocabulary {
@@ -388,24 +431,19 @@ struct Vocabulary {
 }
 
 impl Vocabulary {
-    fn load(path: &Path) -> Result<Self, MoEError> {
-        let data = std::fs::read(path).map_err(|e| MoEError::Io(e))?;
-        if data.len() < 8 {
-            return Err(MoEError::Config("vocab.bin too short".into()));
+    fn from_tokenizer(tok: &BpeTokenizer) -> Self {
+        let mut entries: Vec<(u32, String)> = tok
+            .vocab
+            .iter()
+            .map(|e| (e.id, String::from_utf8_lossy(&e.str_bytes).to_string()))
+            .collect();
+        // Include added tokens (e.g. <think>, </think>, <|im_start|>)
+        for added in &tok.added {
+            entries.push((added.id, String::from_utf8_lossy(&added.str_bytes).to_string()));
         }
-        let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let mut tokens = Vec::with_capacity(num_entries);
-        let mut pos = 8usize;
-        for _ in 0..num_entries {
-            if pos + 2 > data.len() { break; }
-            let byte_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-            if pos + byte_len > data.len() { break; }
-            tokens.push(String::from_utf8_lossy(&data[pos..pos + byte_len]).to_string());
-            pos += byte_len;
-        }
-        eprintln!("[vocab] Loaded {} tokens", tokens.len());
-        Ok(Vocabulary { tokens })
+        entries.sort_by_key(|(id, _)| *id);
+        let tokens: Vec<String> = entries.into_iter().map(|(_, s)| s).collect();
+        Vocabulary { tokens }
     }
 
     fn decode(&self, token_id: usize) -> &str {
@@ -429,6 +467,7 @@ fn forward_layer(
                 config.hidden_dim,
                 config.num_attn_heads, config.num_kv_heads,
                 config.head_dim, config.rotary_dim,
+                config.rope_theta,
             );
         }
     } else {
@@ -479,19 +518,17 @@ impl ModelInstance {
         let json_path = model_dir.join("model_weights.json");
         let wf = WeightFile::open(&bin_path, &json_path)?;
 
-        let tok_path = model_dir.join("tokenizer.bin");
+        let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = BpeTokenizer::load(&tok_path)
             .map_err(|e| MoEError::Config(format!("tokenizer: {}", e)))?;
-
-        let vocab_path = model_dir.join("vocab.bin");
-        let vocab = Vocabulary::load(&vocab_path)?;
+        let vocab = Vocabulary::from_tokenizer(&tokenizer);
 
         let ctx = MetalContext::init()?;
 
         let packed_dir = model_dir.join("packed_experts");
         let mut layer_fds: Vec<RawFd> = Vec::with_capacity(config.num_layers);
         for layer in 0..config.num_layers {
-            let path = packed_dir.join(format!("layer_{:04}_experts.bin", layer));
+            let path = packed_dir.join(format!("layer_{:02}.bin", layer));
             let file = std::fs::File::open(&path).map_err(|e| {
                 MoEError::Io(std::io::Error::new(e.kind(),
                     format!("Cannot open layer {} expert file: {}", layer, e)))
@@ -539,7 +576,7 @@ pub fn run_server(port: u16, data_dir: &Path) -> Result<(), MoEError> {
         return Err(MoEError::Config(format!("{} not found", data_dir.display())));
     }
 
-    let model_cache: Mutex<HashMap<String, ModelInstance>> = Mutex::new(HashMap::new());
+    let model_cache: Mutex<HashMap<String, Arc<ModelInstance>>> = Mutex::new(HashMap::new());
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
         .map_err(|e| MoEError::Io(e))?;
 
@@ -582,7 +619,7 @@ pub fn run_server(port: u16, data_dir: &Path) -> Result<(), MoEError> {
                 let mut models = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(data_dir) {
                     for entry in entries.flatten() {
-                        if entry.path().join("model_config.json").exists() {
+                        if entry.path().join("config.json").exists() {
                             if let Some(name) = entry.file_name().to_str() {
                                 models.push(format!("{{\"id\":\"{}\",\"object\":\"model\"}}", name));
                             }
@@ -616,7 +653,7 @@ fn handle_chat_completion(
     request_id: &str,
     req_str: &str,
     data_dir: &Path,
-    model_cache: &Mutex<HashMap<String, ModelInstance>>,
+    model_cache: &Mutex<HashMap<String, Arc<ModelInstance>>>,
 ) {
     let body_start = req_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &req_str[body_start..];
@@ -636,30 +673,31 @@ fn handle_chat_completion(
         return;
     }
 
-    // Load or get cached model
+    // Load or get cached model (Arc so we can clone and release the lock)
     let model_dir = data_dir.join(model_name);
-    let mut cache = model_cache.lock().unwrap();
-    let model = if let Some(m) = cache.get(model_name) {
-        m
-    } else {
-        drop(cache); // release lock during load
-        match ModelInstance::load(&model_dir) {
-            Ok(instance) => {
-                let mut cache = model_cache.lock().unwrap();
-                cache.entry(model_name.to_string()).or_insert(instance)
-            }
-            Err(e) => {
-                let err = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"error\":\"failed to load model {}: {}\"}}\n",
-                    model_name, e
-                );
-                http_write_str(stream, &err);
-                return;
+    let model: Arc<ModelInstance> = {
+        let cache = model_cache.lock().unwrap();
+        if let Some(m) = cache.get(model_name) {
+            Arc::clone(m)
+        } else {
+            drop(cache); // release lock during load
+            match ModelInstance::load(&model_dir) {
+                Ok(instance) => {
+                    let arc = Arc::new(instance);
+                    model_cache.lock().unwrap().insert(model_name.to_string(), Arc::clone(&arc));
+                    arc
+                }
+                Err(e) => {
+                    let err = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"error\":\"failed to load model {}: {}\"}}\n",
+                        model_name, e
+                    );
+                    http_write_str(stream, &err);
+                    return;
+                }
             }
         }
     };
-    // cache lock is held here — but we only read &ModelInstance, no mutation
-    let model: &ModelInstance = model; // reborrow
 
     let config = &model.config;
     let wf = &model.wf;
@@ -670,20 +708,13 @@ fn handle_chat_completion(
     let hidden_dim = config.hidden_dim;
     let num_layers = config.num_layers;
 
-    // Extract user content
-    let messages = parsed["messages"].as_array();
-    let user_content = messages
-        .and_then(|msgs| msgs.iter().rev().find(|m| m["role"].as_str() == Some("user")))
-        .and_then(|m| m["content"].as_str())
-        .unwrap_or("");
-
+    // Tokenize full message history
     let max_tokens = parsed["max_tokens"].as_u64().unwrap_or(1024) as usize;
 
-    eprintln!("[serve] {} model={} content={} chars, max_tokens={}",
-        request_id, model_name, user_content.len(), max_tokens);
+    eprintln!("[serve] {} model={} max_tokens={}",
+        request_id, model_name, max_tokens);
 
-    // Tokenize
-    let prompt_ids = match tokenize_chat_message(tokenizer, user_content) {
+    let prompt_ids = match tokenize_chat_messages(tokenizer, &parsed["messages"]) {
         Ok(ids) => ids,
         Err(e) => {
             let err = format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{\"error\":\"{}\"}}\n", e);
@@ -715,6 +746,11 @@ fn handle_chat_completion(
     for (i, &id) in prompt_ids.iter().enumerate() {
         embed_lookup(wf, id, &mut embed_batch[i * hidden_dim..(i + 1) * hidden_dim], hidden_dim);
     }
+    {
+        let e0 = &embed_batch[..hidden_dim.min(8)];
+        let stats = stats_f32(&embed_batch[..hidden_dim]);
+        eprintln!("[dbg] embed[0] first={:?} {:.2?}", e0, stats);
+    }
 
     // Prefill intermediate tokens
     let n_prefill = prompt_ids.len().saturating_sub(1);
@@ -734,15 +770,28 @@ fn handle_chat_completion(
         for layer in 0..num_layers {
             let _ = forward_layer(wf, layer, &mut hidden, &mut layer_states, pos,
                 layer_fds[layer], ctx, config);
+            if layer == 0 || (layer + 1) % 4 == 0 {
+                let stats = stats_f32(&hidden[..hidden_dim.min(128)]);
+                eprintln!("[dbg] after L{} hidden first8={:?} {:.2?}", layer, &hidden[..8], stats);
+            }
         }
         pos += 1;
     }
 
     apply_final_norm(wf, &mut hidden, hidden_dim);
+    {
+        let stats = stats_f32(&hidden);
+        eprintln!("[dbg] after final_norm hidden first8={:?} {:.2?}", &hidden[..8], stats);
+    }
 
     let mut logits = vec![0.0f32; config.vocab_size];
     lm_head_forward(wf, &hidden, &mut logits);
+    {
+        let stats = stats_f32(&logits);
+        eprintln!("[dbg] logits first8={:?} {:.2?}", &logits[..8], stats);
+    }
     let mut next_token = cpu_argmax(&logits);
+    eprintln!("[dbg] next_token={} max_logit={:.4}", next_token, logits[next_token]);
 
     let mut gen_count = 0usize;
 

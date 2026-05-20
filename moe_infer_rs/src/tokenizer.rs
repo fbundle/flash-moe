@@ -1,24 +1,19 @@
-/// BPE tokenizer — Rust port of tokenizer.h.
+/// BPE tokenizer — loads HuggingFace tokenizer.json directly.
 ///
-/// Loads the .bin format created by export_tokenizer.py.
-/// Supports encode (text -> token IDs) with the same pretokenization
-/// and BPE merge algorithm as the C implementation.
+/// Supports encode (text -> token IDs) with pretokenization and BPE merge
+/// algorithm compatible with GPT-2 / Qwen family tokenizers.
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 const BPE_MAX_TOKEN_LEN: usize = 256;
 const BPE_MAX_PIECES: usize = 8192;
 
-/// Tokenizer state (port of bpe_tokenizer struct).
+/// Tokenizer state.
 pub struct BpeTokenizer {
     pub vocab: Vec<VocabEntry>,
     pub merges: Vec<MergeEntry>,
     pub added: Vec<AddedToken>,
-    /// Vocab hash: key (string bytes) -> token ID
     vocab_map: HashMap<Vec<u8>, u32>,
-    /// Merge hash: key (a_bytes + b'\xff' + b_bytes) -> priority index
     merge_map: HashMap<Vec<u8>, u32>,
     byte_char: [u32; 256],
     char_byte: [u8; 512],
@@ -28,7 +23,7 @@ pub struct BpeTokenizer {
 #[derive(Debug, Clone)]
 pub struct VocabEntry {
     pub id: u32,
-    pub str_bytes: Vec<u8>, // UTF-8 bytes of the BPE token string
+    pub str_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,87 +38,60 @@ pub struct AddedToken {
     pub str_bytes: Vec<u8>,
 }
 
-fn read_u32_be(f: &mut File) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u16_be(f: &mut File) -> std::io::Result<u16> {
-    let mut buf = [0u8; 2];
-    f.read_exact(&mut buf)?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-fn fnv1a_hash(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c9dc5;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x01000193);
-    }
-    h
-}
-
 impl BpeTokenizer {
-    /// Load a tokenizer from a .bin file (created by export_tokenizer.py).
+    /// Load a HuggingFace tokenizer.json file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut f = File::open(path)?;
+        let content = std::fs::read_to_string(path)?;
+        let root: serde_json::Value = serde_json::from_str(&content)?;
 
-        // Magic header
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic)?;
-        if &magic != b"BPET" {
-            anyhow::bail!("Invalid tokenizer magic: {:?}", magic);
+        let model = &root["model"];
+        let vocab_obj = model["vocab"].as_object()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer.json: missing model.vocab"))?;
+
+        // Build sorted vocab entries
+        let mut entries: Vec<(u32, Vec<u8>)> = vocab_obj.iter().map(|(k, v)| {
+            let id = v.as_u64().unwrap_or(0) as u32;
+            (id, k.as_bytes().to_vec())
+        }).collect();
+        entries.sort_by_key(|(id, _)| *id);
+        let vocab: Vec<VocabEntry> = entries.into_iter()
+            .map(|(id, str_bytes)| VocabEntry { id, str_bytes })
+            .collect();
+
+        // Merges
+        let mut merges = Vec::new();
+        if let Some(merges_arr) = model["merges"].as_array() {
+            for pair in merges_arr {
+                if let Some(arr) = pair.as_array() {
+                    if arr.len() >= 2 {
+                        if let (Some(a), Some(b)) = (arr[0].as_str(), arr[1].as_str()) {
+                            merges.push(MergeEntry {
+                                a: a.as_bytes().to_vec(),
+                                b: b.as_bytes().to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
         }
 
-        let version = read_u32_be(&mut f)?;
-        if version != 1 {
-            anyhow::bail!("Unsupported tokenizer version: {}", version);
+        // Added tokens
+        let mut added = Vec::new();
+        if let Some(added_arr) = root["added_tokens"].as_array() {
+            for tok in added_arr {
+                let id = tok["id"].as_u64().unwrap_or(0) as u32;
+                let content = tok["content"].as_str().unwrap_or("");
+                added.push(AddedToken { id, str_bytes: content.as_bytes().to_vec() });
+            }
         }
 
-        let vocab_size = read_u32_be(&mut f)?;
-        let num_merges = read_u32_be(&mut f)?;
-        let num_added = read_u32_be(&mut f)?;
-
-        // Read vocab
-        let mut vocab = Vec::with_capacity(vocab_size as usize);
-        for _ in 0..vocab_size {
-            let id = read_u32_be(&mut f)?;
-            let str_len = read_u16_be(&mut f)? as usize;
-            let mut str_bytes = vec![0u8; str_len];
-            f.read_exact(&mut str_bytes)?;
-            vocab.push(VocabEntry { id, str_bytes });
-        }
-
-        // Read merges
-        let mut merges = Vec::with_capacity(num_merges as usize);
-        for _ in 0..num_merges {
-            let len_a = read_u16_be(&mut f)? as usize;
-            let mut a = vec![0u8; len_a];
-            f.read_exact(&mut a)?;
-            let len_b = read_u16_be(&mut f)? as usize;
-            let mut b = vec![0u8; len_b];
-            f.read_exact(&mut b)?;
-            merges.push(MergeEntry { a, b });
-        }
-
-        // Read added tokens
-        let mut added = Vec::with_capacity(num_added as usize);
-        for _ in 0..num_added {
-            let id = read_u32_be(&mut f)?;
-            let str_len = read_u16_be(&mut f)? as usize;
-            let mut str_bytes = vec![0u8; str_len];
-            f.read_exact(&mut str_bytes)?;
-            added.push(AddedToken { id, str_bytes });
-        }
-
-        // Build vocab hashmap
+        // Vocab hashmap
         let mut vocab_map = HashMap::new();
         for entry in &vocab {
             vocab_map.insert(entry.str_bytes.clone(), entry.id);
         }
 
-        // Build merge hashmap
+        // Merge hashmap
         let mut merge_map = HashMap::new();
         for (i, merge) in merges.iter().enumerate() {
             let mut key = merge.a.clone();
@@ -151,24 +119,19 @@ impl BpeTokenizer {
             }
         }
 
+        let vocab_size = vocab.len() as u32;
         eprintln!(
-            "bpe_load: {} vocab, {} merges, {} added tokens",
-            vocab_size, num_merges, num_added
+            "[tokenizer] Loaded {} vocab, {} merges, {} added tokens",
+            vocab_size, merges.len(), added.len()
         );
 
         Ok(BpeTokenizer {
-            vocab,
-            merges,
-            added,
-            vocab_map,
-            merge_map,
-            byte_char,
-            char_byte,
-            vocab_size,
+            vocab, merges, added, vocab_map, merge_map,
+            byte_char, char_byte, vocab_size,
         })
     }
 
-    /// Encode text to token IDs. Returns the list of token IDs.
+    /// Encode text to token IDs.
     pub fn encode(&self, text: &str, max_ids: usize) -> Vec<u32> {
         let text_bytes = text.as_bytes();
         let text_len = text_bytes.len();
@@ -198,11 +161,13 @@ impl BpeTokenizer {
                 continue;
             }
 
-            // Find next added token to know chunk boundary
+            // Find next added token boundary
             let mut chunk_end = text_len;
             for added in &self.added {
                 let alen = added.str_bytes.len();
-                if let Some(j) = text_bytes[pos..].windows(alen).position(|w| w == added.str_bytes.as_slice()) {
+                if let Some(j) = text_bytes[pos..].windows(alen)
+                    .position(|w| w == added.str_bytes.as_slice())
+                {
                     let j_abs = pos + j;
                     if j_abs < chunk_end {
                         chunk_end = j_abs;
@@ -210,10 +175,7 @@ impl BpeTokenizer {
                 }
             }
 
-            let _chunk_len = chunk_end - pos;
             let chunk = &text_bytes[pos..chunk_end];
-
-            // Pretokenize
             let spans = self.pretokenize(chunk);
             let mut bpe_buf = Vec::with_capacity(BPE_MAX_TOKEN_LEN * 4);
 
@@ -221,12 +183,9 @@ impl BpeTokenizer {
                 let piece = &chunk[span.0..span.1];
                 bpe_buf.clear();
                 self.bytes_to_bpe_str(piece, &mut bpe_buf);
-
                 let ids = self.bpe_process(&bpe_buf, max_ids - out_ids.len());
                 out_ids.extend_from_slice(&ids);
-                if out_ids.len() >= max_ids {
-                    break;
-                }
+                if out_ids.len() >= max_ids { break; }
             }
 
             pos = chunk_end;
@@ -235,7 +194,6 @@ impl BpeTokenizer {
         out_ids
     }
 
-    /// Convert raw bytes to BPE-safe UTF-8 string.
     fn bytes_to_bpe_str(&self, raw: &[u8], out: &mut Vec<u8>) {
         out.clear();
         for &byte in raw {
@@ -253,7 +211,6 @@ impl BpeTokenizer {
         }
     }
 
-    /// Pretokenize into spans.
     fn pretokenize(&self, text: &[u8]) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
         let text_len = text.len();
@@ -262,7 +219,6 @@ impl BpeTokenizer {
         while i < text_len && spans.len() < BPE_MAX_PIECES {
             let c = text[i];
 
-            // Whitespace handling
             if is_ws(c) {
                 let start = i;
                 let mut has_nl = false;
@@ -335,12 +291,8 @@ impl BpeTokenizer {
 
                 if !is_alnum_ws(wc) {
                     let mut j = wi;
-                    while j < text_len && !is_alnum_ws(text[j]) {
-                        j += 1;
-                    }
-                    while j < text_len && is_nl(text[j]) {
-                        j += 1;
-                    }
+                    while j < text_len && !is_alnum_ws(text[j]) { j += 1; }
+                    while j < text_len && is_nl(text[j]) { j += 1; }
                     spans.push((ws, j));
                     i = j;
                     continue;
@@ -354,19 +306,11 @@ impl BpeTokenizer {
         spans
     }
 
-    /// BPE merge processing: iterate until no more merges can be applied.
     fn bpe_process(&self, bpe_str: &[u8], max_ids: usize) -> Vec<u32> {
-        if bpe_str.is_empty() {
-            return Vec::new();
-        }
+        if bpe_str.is_empty() { return Vec::new(); }
 
         #[derive(Clone, Copy)]
-        struct Piece {
-            start: usize,
-            len: u16,
-            prev: i32,
-            next: i32,
-        }
+        struct Piece { start: usize, len: u16, prev: i32, next: i32 }
 
         let mut pieces: Vec<Piece> = Vec::with_capacity(BPE_MAX_PIECES);
         let mut i = 0;
@@ -376,20 +320,15 @@ impl BpeTokenizer {
             let clen = clen.min(bpe_str.len() - i);
             let num = pieces.len();
             pieces.push(Piece {
-                start: i,
-                len: clen as u16,
-                prev: num as i32 - 1,
-                next: num as i32 + 1,
+                start: i, len: clen as u16,
+                prev: num as i32 - 1, next: num as i32 + 1,
             });
             i += clen;
         }
-        if pieces.is_empty() {
-            return Vec::new();
-        }
+        if pieces.is_empty() { return Vec::new(); }
         let last = pieces.len() - 1;
         pieces[last].next = -1;
 
-        // Arena for merged strings
         let mut arena: Vec<u8> = Vec::with_capacity(1024 * 16);
         let mut active = pieces.len();
 
@@ -401,14 +340,11 @@ impl BpeTokenizer {
             while ci != -1 {
                 let ni = pieces[ci as usize].next;
                 if ni == -1 { break; }
-
                 let a = &bpe_str[pieces[ci as usize].start..][..pieces[ci as usize].len as usize];
                 let b = &bpe_str[pieces[ni as usize].start..][..pieces[ni as usize].len as usize];
-
                 let mut key = a.to_vec();
                 key.push(0xff);
                 key.extend_from_slice(b);
-
                 if let Some(&prio) = self.merge_map.get(&key) {
                     if prio < best_prio {
                         best_prio = prio;
@@ -419,20 +355,15 @@ impl BpeTokenizer {
             }
 
             if best_idx == -1 { break; }
-
             let bi = best_idx as usize;
             let ni = pieces[bi].next as usize;
             let new_len = pieces[bi].len + pieces[ni].len;
             if new_len as usize > BPE_MAX_TOKEN_LEN { break; }
 
-            // Merge: if pieces are adjacent in the original string, just extend
             if pieces[bi].start + pieces[bi].len as usize == pieces[ni].start {
                 pieces[bi].len = new_len;
             } else {
-                // Need to copy to arena
-                if arena.len() + new_len as usize > arena.capacity() {
-                    arena.clear();
-                }
+                if arena.len() + new_len as usize > arena.capacity() { arena.clear(); }
                 let arena_start = arena.len();
                 arena.extend_from_slice(&bpe_str[pieces[bi].start..][..pieces[bi].len as usize]);
                 arena.extend_from_slice(&bpe_str[pieces[ni].start..][..pieces[ni].len as usize]);
@@ -448,7 +379,6 @@ impl BpeTokenizer {
             active -= 1;
         }
 
-        // Convert final pieces to token IDs
         let mut out_ids = Vec::new();
         let mut ci2 = 0i32;
         while ci2 != -1 && out_ids.len() < max_ids {
@@ -456,7 +386,6 @@ impl BpeTokenizer {
             if let Some(&id) = self.vocab_map.get(piece) {
                 out_ids.push(id);
             } else {
-                // Fallback: encode individual bytes
                 for &byte in piece {
                     let cp = self.byte_char[byte as usize];
                     let single = if cp < 0x80 {
@@ -467,9 +396,7 @@ impl BpeTokenizer {
                         vec![0xE0 | (cp >> 12) as u8, 0x80 | ((cp >> 6) & 0x3F) as u8]
                     };
                     if let Some(&byte_id) = self.vocab_map.get(&single) {
-                        if out_ids.len() < max_ids {
-                            out_ids.push(byte_id);
-                        }
+                        if out_ids.len() < max_ids { out_ids.push(byte_id); }
                     }
                 }
             }

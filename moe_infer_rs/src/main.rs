@@ -74,6 +74,17 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("=== moe-infer: 4-bit dequant MoE engine (Rust/Metal) ===");
 
+    // ========== Serve mode ==========
+    if args.serve > 0 {
+        let data_dir = match &args.model {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from("data"),
+        };
+        eprintln!("[serve] Serving models from: {}", data_dir.display());
+        run_server(args.serve, &data_dir)?;
+        return Ok(());
+    }
+
     // Load model config at runtime from model_config.json
     let (config, model_path) = if let Some(config_path) = &args.config {
         let cfg = load_model_config(Path::new(config_path))?;
@@ -81,23 +92,20 @@ fn main() -> anyhow::Result<()> {
         (cfg, mp)
     } else if let Some(model_path) = &args.model {
         let mp = PathBuf::from(model_path);
-        // If not an existing path and not absolute/relative, look in data/
-        let mp = if mp.exists() {
-            mp
+        if mp.exists() {
+            (load_model_config(&mp)?, mp)
         } else if mp.is_relative() && !mp.starts_with(".") {
             let data_mp = PathBuf::from("data").join(&mp);
             if data_mp.exists() {
-                data_mp
+                (load_model_config(&data_mp)?, data_mp)
             } else {
-                mp
+                (load_model_config(&mp)?, mp)
             }
         } else {
-            mp
-        };
-        let cfg = load_model_config(&mp)?;
-        (cfg, mp)
+            (load_model_config(&mp)?, mp)
+        }
     } else {
-        anyhow::bail!("Either --model <path> or --config <config_path> is required. The model directory must contain model_config.json.");
+        anyhow::bail!("Either --model <path> or --config <path> is required.");
     };
 
     eprintln!("[config] Model path: {}", model_path.display());
@@ -116,12 +124,6 @@ fn main() -> anyhow::Result<()> {
             if args.moe { "YES" } else { "NO" },
             if args.verify { "YES" } else { "NO" },
         );
-    }
-
-    // ========== Serve mode ==========
-    if args.serve > 0 {
-        run_server(args.serve, &model_path, &config)?;
-        return Ok(());
     }
 
     // Initialize Metal

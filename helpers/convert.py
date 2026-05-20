@@ -52,7 +52,7 @@ def main():
     args = parser.parse_args()
 
     model_dir = str(Path(args.model).resolve())
-    output_dir = args.output or os.path.join("data", Path(model_dir).name)
+    output_dir = os.path.join(args.output or "data", Path(model_dir).name)
     output_dir = str(Path(output_dir).resolve())
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -73,11 +73,16 @@ def main():
         print(f"{'=' * 50}")
 
         if step == "tokenizer":
-            export_tokenizer.run(model_dir, output_dir)
+            import shutil
+            hf_tok = os.path.join(model_dir, "tokenizer.json")
+            shutil.copy2(hf_tok, os.path.join(output_dir, "tokenizer.json"))
+            print(f"  Copied {hf_tok} → {output_dir}/tokenizer.json")
 
         elif step == "config":
-            cfg = gen_model_config.load_hf_config(model_dir)
-            gen_model_config.generate_json(cfg, output_dir)
+            import shutil
+            hf_config = os.path.join(model_dir, "config.json")
+            shutil.copy2(hf_config, os.path.join(output_dir, "config.json"))
+            print(f"  Copied {hf_config} → {output_dir}/config.json")
 
         elif step == "weights":
             extract_weights.run(model_dir, output_dir, include_experts=False)

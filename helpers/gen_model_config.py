@@ -107,7 +107,11 @@ def generate_json(cfg, output_dir):
     linear_num_v_heads = cfg.get("linear_num_value_heads", 64)
     linear_num_k_heads = cfg.get("linear_num_key_heads", 16)
 
-    rotary_dim = int(HEAD_DIM * PARTIAL_ROTARY)
+    head_dim = cfg.get("head_dim", HEAD_DIM)
+    rp = cfg.get("rope_parameters", {})
+    rope_theta = rp.get("rope_theta", 10000.0)
+    partial_rotary = rp.get("partial_rotary_factor", PARTIAL_ROTARY)
+    rotary_dim = int(head_dim * partial_rotary)
     linear_total_key = linear_num_k_heads * LINEAR_KEY_DIM
     linear_total_value = linear_num_v_heads * LINEAR_VALUE_DIM
     linear_conv_dim = linear_total_key * 2 + linear_total_value
@@ -121,6 +125,7 @@ def generate_json(cfg, output_dir):
         "num_layers": num_layers,
         "num_attn_heads": num_attn_heads,
         "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
         "vocab_size": vocab_size,
         "num_experts": num_experts,
         "num_experts_per_tok": num_experts_per_tok,
@@ -129,6 +134,7 @@ def generate_json(cfg, output_dir):
         "linear_num_v_heads": linear_num_v_heads,
         "linear_num_k_heads": linear_num_k_heads,
         "rotary_dim": rotary_dim,
+        "rope_theta": rope_theta,
         "linear_total_key": linear_total_key,
         "linear_total_value": linear_total_value,
         "linear_conv_dim": linear_conv_dim,
