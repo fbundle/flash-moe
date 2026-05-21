@@ -348,9 +348,9 @@ pub fn encode_gated_delta_net_step(
     ctx: &MetalContext,
     encoder: &ComputeCommandEncoderRef,
     state: &BufferRef,
-    q: &BufferRef,
-    k: &BufferRef,
-    v: &BufferRef,
+    q: &BufferRef, q_offset: u64,
+    k: &BufferRef, k_offset: u64,
+    v: &BufferRef, v_offset: u64,
     g_decay: &BufferRef,
     beta_gate: &BufferRef,
     output: &BufferRef,
@@ -364,9 +364,9 @@ pub fn encode_gated_delta_net_step(
     let pipeline = ctx.gated_delta_net_step.as_ref().expect("gated_delta_net_step kernel missing");
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(state), 0);
-    encoder.set_buffer(1, Some(q), 0);
-    encoder.set_buffer(2, Some(k), 0);
-    encoder.set_buffer(3, Some(v), 0);
+    encoder.set_buffer(1, Some(q), q_offset);
+    encoder.set_buffer(2, Some(k), k_offset);
+    encoder.set_buffer(3, Some(v), v_offset);
     encoder.set_buffer(4, Some(g_decay), 0);
     encoder.set_buffer(5, Some(beta_gate), 0);
     encoder.set_buffer(6, Some(output), 0);
@@ -383,8 +383,8 @@ pub fn encode_compute_decay_beta(
     encoder: &ComputeCommandEncoderRef,
     alpha: &BufferRef,
     beta: &BufferRef,
-    a_log: &BufferRef,
-    dt_bias: &BufferRef,
+    a_log: &BufferRef, a_log_offset: u64,
+    dt_bias: &BufferRef, dt_bias_offset: u64,
     g_decay: &BufferRef,
     beta_gate: &BufferRef,
     num_v_heads: u32,
@@ -393,8 +393,8 @@ pub fn encode_compute_decay_beta(
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(alpha), 0);
     encoder.set_buffer(1, Some(beta), 0);
-    encoder.set_buffer(2, Some(a_log), 0);
-    encoder.set_buffer(3, Some(dt_bias), 0);
+    encoder.set_buffer(2, Some(a_log), a_log_offset);
+    encoder.set_buffer(3, Some(dt_bias), dt_bias_offset);
     encoder.set_buffer(4, Some(g_decay), 0);
     encoder.set_buffer(5, Some(beta_gate), 0);
     encoder.dispatch_thread_groups(
@@ -407,16 +407,16 @@ pub fn encode_compute_decay_beta(
 pub fn encode_rms_norm_qk(
     ctx: &MetalContext,
     encoder: &ComputeCommandEncoderRef,
-    q: &BufferRef,
-    k: &BufferRef,
+    q: &BufferRef, q_offset: u64,
+    k: &BufferRef, k_offset: u64,
     num_heads: u32,
     key_dim: u32,
     inv_scale: f32,
 ) {
     let pipeline = ctx.rms_norm_qk.as_ref().expect("rms_norm_qk kernel missing");
     encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_buffer(0, Some(q), 0);
-    encoder.set_buffer(1, Some(k), 0);
+    encoder.set_buffer(0, Some(q), q_offset);
+    encoder.set_buffer(1, Some(k), k_offset);
     unsafe {
         set_u32(encoder, 2, key_dim);
         set_f32(encoder, 3, inv_scale);
@@ -433,7 +433,7 @@ pub fn encode_gated_rms_norm(
     encoder: &ComputeCommandEncoderRef,
     values: &BufferRef,
     z: &BufferRef,
-    weight: &BufferRef,   // bf16 u16 weight, value_dim elements, shared across heads
+    weight: &BufferRef, weight_offset: u64,  // bf16 u16 weight, value_dim elements, shared across heads
     output: &BufferRef,
     num_v_heads: u32,
     value_dim: u32,
@@ -442,7 +442,7 @@ pub fn encode_gated_rms_norm(
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(values), 0);
     encoder.set_buffer(1, Some(z), 0);
-    encoder.set_buffer(2, Some(weight), 0);
+    encoder.set_buffer(2, Some(weight), weight_offset);
     encoder.set_buffer(3, Some(output), 0);
     unsafe {
         set_u32(encoder, 4, value_dim);
@@ -460,7 +460,7 @@ pub fn encode_conv1d_step(
     encoder: &ComputeCommandEncoderRef,
     conv_state: &BufferRef,   // [(kernel_size-1) * conv_dim] = [3 * conv_dim]
     input: &BufferRef,        // [conv_dim]
-    weights: &BufferRef,      // bf16 u16 weight, [conv_dim * 4]
+    weights: &BufferRef, weights_offset: u64,  // bf16 u16 weight, [conv_dim * 4]
     output: &BufferRef,       // [conv_dim]
     conv_dim: u32,
 ) {
@@ -468,7 +468,7 @@ pub fn encode_conv1d_step(
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(conv_state), 0);
     encoder.set_buffer(1, Some(input), 0);
-    encoder.set_buffer(2, Some(weights), 0);
+    encoder.set_buffer(2, Some(weights), weights_offset);
     encoder.set_buffer(3, Some(output), 0);
     unsafe { set_u32(encoder, 4, conv_dim); }
     let num_tgs = (conv_dim + 255) / 256;

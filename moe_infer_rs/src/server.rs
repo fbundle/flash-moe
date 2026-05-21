@@ -517,7 +517,14 @@ fn forward_layer(
     hidden: &mut [f32], layer_states: &mut [LayerState], pos: usize,
     packed_fd: RawFd, ctx: Option<&MetalContext>, gpu_wf: Option<&GpuWeightCtx>,
     config: &ModelConfig,
+    prev_deferred: &mut Option<gpu_forward::DeferredExperts>,
 ) -> Result<(), MoEError> {
+    // Complete deferred experts from PREVIOUS layer (updates hidden with combined result)
+    if let Some(ref mut def) = prev_deferred {
+        def.complete(hidden, config.hidden_dim);
+        *prev_deferred = None;
+    }
+
     let is_full_attn = (layer_idx + 1) % FULL_ATTN_INTERVAL == 0;
 
     if is_full_attn {
@@ -532,6 +539,7 @@ fn forward_layer(
         }
     } else {
         if let LayerState::LinearAttention(ref mut state) = layer_states[layer_idx] {
+            let linear_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
             gpu_forward::linear_attention_forward(
                 wf, layer_idx, hidden, state,
                 config.hidden_dim,
@@ -541,11 +549,13 @@ fn forward_layer(
                 config.linear_total_value,
                 config.linear_conv_dim,
                 gpu_wf, ctx,
+                linear_idx,
             );
         }
     }
 
-    gpu_forward::moe_layer_forward(wf, layer_idx, hidden, packed_fd, ctx, gpu_wf, config)
+    gpu_forward::moe_layer_forward(wf, layer_idx, hidden, packed_fd, ctx, gpu_wf, config, prev_deferred)
+        .map(|_deferred| ())  // discard deferred (sync dispatch returns None anyway)
 }
 
 // ─── Final norm ───────────────────────────────────────────────────────────
@@ -585,7 +595,18 @@ impl ModelInstance {
             .map_err(|e| MoEError::Config(format!("tokenizer: {}", e)))?;
         let vocab = Vocabulary::from_tokenizer(&tokenizer);
 
-        let ctx = MetalContext::init()?;
+        let mut ctx = MetalContext::init()?;
+        // Pre-allocate persistent GPU buffers for fused linear attention
+        let key_dim = config.linear_total_key / config.linear_num_k_heads;
+        let value_dim = config.linear_total_value / config.linear_num_v_heads;
+        ctx.init_linear_attn_buffers(
+            config.num_linear_layers,
+            config.linear_conv_dim,
+            config.linear_num_v_heads,
+            config.linear_total_value,
+            key_dim,
+            value_dim,
+        );
         let gpu_wf = GpuWeightCtx::new(&ctx.device, &wf);
 
         let packed_dir = model_dir.join("packed_experts");
@@ -816,13 +837,17 @@ fn handle_chat_completion(
         eprintln!("[dbg] embed[0] first={:?} {:.2?}", e0, stats);
     }
 
-    // Prefill intermediate tokens
+    // Prefill intermediate tokens (discard deferred since hidden gets overwritten)
     let n_prefill = prompt_ids.len().saturating_sub(1);
     for i in 0..n_prefill {
         hidden.copy_from_slice(&embed_batch[i * hidden_dim..(i + 1) * hidden_dim]);
+        let mut deferred = None;
         for layer in 0..num_layers {
             let _ = forward_layer(wf, layer, &mut hidden, &mut layer_states, pos,
-                layer_fds[layer], ctx, gpu_wf, config);
+                layer_fds[layer], ctx, gpu_wf, config, &mut deferred);
+        }
+        if let Some(ref mut def) = deferred {
+            def.discard();
         }
         pos += 1;
     }
@@ -831,13 +856,18 @@ fn handle_chat_completion(
     if !prompt_ids.is_empty() {
         let last_i = prompt_ids.len() - 1;
         hidden.copy_from_slice(&embed_batch[last_i * hidden_dim..(last_i + 1) * hidden_dim]);
+        let mut deferred = None;
         for layer in 0..num_layers {
             let _ = forward_layer(wf, layer, &mut hidden, &mut layer_states, pos,
-                layer_fds[layer], ctx, gpu_wf, config);
+                layer_fds[layer], ctx, gpu_wf, config, &mut deferred);
             if layer == 0 || (layer + 1) % 4 == 0 {
                 let stats = stats_f32(&hidden[..hidden_dim.min(128)]);
                 eprintln!("[dbg] after L{} hidden first8={:?} {:.2?}", layer, &hidden[..8], stats);
             }
+        }
+        // Complete last layer's deferred before final norm / LM head
+        if let Some(ref mut def) = deferred {
+            def.complete(&mut hidden, hidden_dim);
         }
         pos += 1;
     }
@@ -862,9 +892,10 @@ fn handle_chat_completion(
     for _gen in 0..max_tokens {
         if next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2 {
             embed_lookup(wf, next_token, &mut hidden, hidden_dim);
+            let mut deferred = None;
             for layer in 0..num_layers {
                 let _ = forward_layer(wf, layer, &mut hidden, &mut layer_states, pos,
-                    layer_fds[layer], ctx, gpu_wf, config);
+                    layer_fds[layer], ctx, gpu_wf, config, &mut deferred);
             }
             break;
         }
@@ -877,9 +908,14 @@ fn handle_chat_completion(
         gen_count += 1;
 
         embed_lookup(wf, next_token, &mut hidden, hidden_dim);
+        let mut deferred = None;
         for layer in 0..num_layers {
             let _ = forward_layer(wf, layer, &mut hidden, &mut layer_states, pos,
-                layer_fds[layer], ctx, gpu_wf, config);
+                layer_fds[layer], ctx, gpu_wf, config, &mut deferred);
+        }
+        // Complete last layer's deferred before final norm / LM head
+        if let Some(ref mut def) = deferred {
+            def.complete(&mut hidden, hidden_dim);
         }
         pos += 1;
 

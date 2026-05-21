@@ -8,6 +8,10 @@ description = "Rust port of Flash-MoE Metal inference engine for MoE models on A
 name = "moe-infer"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [lib]
 name = "moe_infer"
 path = "src/lib.rs"

@@ -42,6 +42,53 @@ pub struct MetalContext {
     pub rms_norm_qk: Option<ComputePipelineState>,
     pub compute_decay_beta: Option<ComputePipelineState>,
     pub gated_rms_norm: Option<ComputePipelineState>,
+
+    // ── Persistent GPU buffers for fused forward ──
+    /// Per linear-layer conv state: [(kernel_size-1) * qkv_dim] f32
+    pub buf_conv_state: Vec<Buffer>,
+    /// Per linear-layer SSM state: [num_v_heads * value_dim * key_dim] f32
+    pub buf_delta_state: Vec<Buffer>,
+    /// Conv output buffer: [qkv_dim] f32 (q+k+v concatenated)
+    pub buf_conv_output: Option<Buffer>,
+    /// Gated delta intermediate: [num_v_heads] f32
+    pub buf_delta_g_decay: Option<Buffer>,
+    /// Gated delta intermediate: [num_v_heads] f32
+    pub buf_delta_beta: Option<Buffer>,
+    /// Delta net output: [total_value] f32
+    pub buf_delta_output: Option<Buffer>,
+    /// Batch projection outputs (for fused CMD1): QKV, Z, B, A
+    pub batch_out: Vec<Buffer>,
+}
+
+impl MetalContext {
+    /// Allocate persistent GPU buffers for fused linear attention.
+    /// Must be called after model config is loaded.
+    pub fn init_linear_attn_buffers(
+        &mut self,
+        num_linear_layers: usize,
+        qkv_dim: usize,
+        num_v_heads: usize,
+        total_value: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) {
+        self.buf_conv_state.clear();
+        self.buf_delta_state.clear();
+        for _ in 0..num_linear_layers {
+            self.buf_conv_state.push(metal_buf_shared(&self.device, 3 * qkv_dim * 4));
+            self.buf_delta_state.push(metal_buf_shared(&self.device, num_v_heads * value_dim * key_dim * 4));
+        }
+        self.buf_conv_output = Some(metal_buf_shared(&self.device, qkv_dim * 4));
+        self.buf_delta_g_decay = Some(metal_buf_shared(&self.device, num_v_heads * 4));
+        self.buf_delta_beta = Some(metal_buf_shared(&self.device, num_v_heads * 4));
+        self.buf_delta_output = Some(metal_buf_shared(&self.device, total_value * 4));
+        // 4 batch outputs for QKV, Z, B, A projections
+        self.batch_out.clear();
+        self.batch_out.push(metal_buf_shared(&self.device, qkv_dim * 4));
+        self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));
+        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
+        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
+    }
 }
 
 /// Embed the shaders.metal source at compile time.
@@ -147,6 +194,14 @@ impl MetalContext {
                 rms_norm_qk,
                 compute_decay_beta,
                 gated_rms_norm,
+                // Persistent GPU buffers — initialized later via init_linear_attn_buffers()
+                buf_conv_state: Vec::new(),
+                buf_delta_state: Vec::new(),
+                buf_conv_output: None,
+                buf_delta_g_decay: None,
+                buf_delta_beta: None,
+                buf_delta_output: None,
+                batch_out: Vec::new(),
             })
         })
     }
