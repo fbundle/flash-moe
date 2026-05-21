@@ -3,7 +3,6 @@
 /// Port of moe_forward, linear_attention_forward, and fused_layer_forward_debug
 /// from moe_infer/core_src/layer_forward.h and attention.h.
 use std::os::fd::RawFd;
-
 use std::ffi::c_void;
 
 use metal::{Buffer, MTLSize};
@@ -12,7 +11,7 @@ use crate::error::MoEError;
 use crate::kernels;
 
 const MAX_SEQ: usize = 4096;
-use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
+use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext, MAX_K};
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
 use crate::weights::WeightFile;
 
@@ -1144,6 +1143,7 @@ pub fn moe_layer_forward(
     mode: PipelineMode,
     attn_state: Option<FullAttnCmd2State>,
     lin_attn: Option<LinearAttnFused3State>,
+    mut expert_io: Option<&mut ExpertIOState>,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -1533,47 +1533,114 @@ pub fn moe_layer_forward(
         let ctx = ctx.unwrap();
         let gw = gpu_wf.unwrap();
         let k = expert_indices.len();
+        let actual_k = k.min(MAX_K);
 
-        // Pre-read all experts into separate buffers
-        let mut expert_bufs: Vec<Buffer> = Vec::with_capacity(k);
-        for &eidx in &expert_indices {
-            let buf = metal_buf_shared(&ctx.device, expert_size);
-            let nread = unsafe {
-                let ptr = buf.contents() as *mut u8;
-                let slice = std::slice::from_raw_parts_mut(ptr, expert_size);
-                libc::pread(packed_fd, slice.as_mut_ptr() as *mut std::ffi::c_void, expert_size, (eidx as i64) * (expert_size as i64))
-            };
-            if nread == expert_size as isize {
-                expert_bufs.push(buf);
+        let hidden_u32 = hidden_dim as u32;
+        let inter_u32 = moe_inter as u32;
+        let gs_u32 = GROUP_SIZE as u32;
+
+        // ── Phase 1: Parallel pread (cache hits skip I/O) ──
+        let mut valid = [false; MAX_K];
+        let has_io = expert_io.is_some();
+        let mut fallback_expert_bufs: Vec<Buffer> = Vec::new();
+
+        // Mutable phase: check cache, insert misses, parallel pread
+        if let Some(ref mut io) = expert_io {
+            let mut miss_ei = [0usize; MAX_K];
+            let mut miss_k_slot = [0usize; MAX_K];
+            let mut miss_count = 0;
+
+            for ki in 0..actual_k {
+                let eidx = expert_indices[ki];
+                if let Some(buf) = io.cache.lookup(layer_idx, eidx) {
+                    io.expert_data[ki] = buf;
+                    valid[ki] = true;
+                } else {
+                    miss_ei[miss_count] = eidx;
+                    miss_k_slot[miss_count] = ki;
+                    miss_count += 1;
+                }
+            }
+
+            // Insert cache entries for misses BEFORE rayon::scope
+            for m in 0..miss_count {
+                let ki = miss_k_slot[m];
+                let eidx = miss_ei[m];
+                let buf = io.cache.insert_get_buf(layer_idx, eidx);
+                io.expert_data[ki] = buf;
+            }
+
+            // Parallel pread cache misses — raw pointers only, no &io in scope
+            // Use usize to transmit pointers across threads (raw pointers aren't Send)
+            if miss_count > 0 {
+                let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
+                for m in 0..miss_count {
+                    let ki = miss_k_slot[m];
+                    let eidx = miss_ei[m];
+                    let ptr = io.expert_data[ki].contents() as usize;
+                    pread_tasks.push((packed_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+                }
+                rayon::scope(|s| {
+                    for (fd, dst, sz, off) in pread_tasks {
+                        s.spawn(move |_| {
+                            unsafe { libc::pread(fd, dst as *mut std::ffi::c_void, sz, off); }
+                        });
+                    }
+                });
+            }
+            for m in 0..miss_count {
+                valid[miss_k_slot[m]] = true;
+            }
+        } else {
+            // Fallback: sequential pread into ad-hoc buffers
+            for ki in 0..actual_k {
+                let eidx = expert_indices[ki];
+                let buf = metal_buf_shared(&ctx.device, expert_size);
+                let nread = unsafe {
+                    let ptr = buf.contents() as *mut u8;
+                    let slice = std::slice::from_raw_parts_mut(ptr, expert_size);
+                    libc::pread(packed_fd, slice.as_mut_ptr() as *mut std::ffi::c_void, expert_size, (eidx as i64) * (expert_size as i64))
+                };
+                if nread == expert_size as isize {
+                    valid[ki] = true;
+                }
+                fallback_expert_bufs.push(buf);
             }
         }
+        // Mutable borrow of expert_io ends here
 
-        if !expert_bufs.is_empty() {
-            let hidden_u32 = hidden_dim as u32;
-            let inter_u32 = moe_inter as u32;
-            let gs_u32 = GROUP_SIZE as u32;
+        let any_valid = valid.iter().take(actual_k).any(|&v| v);
 
-            // Upload h_post once (reused by all experts)
-            let x_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
-            unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+        if any_valid {
+            // ── Phase 2: GPU dispatch using pre-allocated or ad-hoc buffers ──
+            let io_ref = expert_io.as_deref();  // Option<&ExpertIOState>
 
-            // Scratch buffers (reused across experts)
-            let gate_out = metal_buf_shared(&ctx.device, moe_inter * 4);
-            let up_out = metal_buf_shared(&ctx.device, moe_inter * 4);
-            let act_out = metal_buf_shared(&ctx.device, moe_inter * 4);
-
-            // Per-expert output buffers (read by moe_combine_residual)
-            let mut out_bufs: Vec<Buffer> = Vec::with_capacity(expert_bufs.len());
-            for _ in 0..expert_bufs.len() {
-                out_bufs.push(metal_buf_shared(&ctx.device, hidden_dim * 4));
-            }
-
-            // Shared expert intermediate + output (on GPU)
-            let shared_act_gpu = metal_buf_shared(&ctx.device, shared_inter * 4);
-            let shared_down_gpu = metal_buf_shared(&ctx.device, hidden_dim * 4);
+            let (x_buf, gate_out, up_out, act_out, out_bufs,
+                 shared_act_gpu, shared_down_gpu, hidden_out, params_buf)
+                = if let Some(io) = io_ref {
+                // Pre-allocated path: reuse persistent Metal buffers
+                unsafe { let dst = io.input_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+                let ob: Vec<Buffer> = io.expert_out.iter().take(actual_k).cloned().collect();
+                (io.input_buf.clone(), io.scratch_gate.clone(), io.scratch_up.clone(),
+                 io.scratch_act.clone(), ob,
+                 io.shared_act.clone(), io.shared_down.clone(),
+                 io.combine_out.clone(), io.combine_params.clone())
+            } else {
+                // Legacy path: allocate per-layer
+                let x = metal_buf_shared(&ctx.device, hidden_dim * 4);
+                unsafe { let dst = x.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+                (x,
+                 metal_buf_shared(&ctx.device, moe_inter * 4),
+                 metal_buf_shared(&ctx.device, moe_inter * 4),
+                 metal_buf_shared(&ctx.device, moe_inter * 4),
+                 (0..actual_k).map(|_| metal_buf_shared(&ctx.device, hidden_dim * 4)).collect(),
+                 metal_buf_shared(&ctx.device, shared_inter * 4),
+                 metal_buf_shared(&ctx.device, hidden_dim * 4),
+                 metal_buf_shared(&ctx.device, hidden_dim * 4),
+                 metal_buf_shared(&ctx.device, 40))
+            };
 
             // h_mid on GPU for moe_combine_residual
-            // Use CMD2-fused temp_buf (already has h_mid + attn_out) when available
             let hmid_gpu = if let Some(buf) = hmid_gpu_override.take() {
                 buf
             } else {
@@ -1586,7 +1653,16 @@ pub fn moe_layer_forward(
             let cmd_buf = ctx.queue.new_command_buffer();
             let enc = cmd_buf.new_compute_command_encoder();
 
-            for (ei, expert_buf) in expert_bufs.iter().enumerate() {
+            for ki in 0..actual_k {
+                if !valid[ki] { continue; }
+                // Expert data: from pre-allocated io.expert_data[ki] or fallback
+                let expert_buf: &Buffer = if let Some(io) = io_ref {
+                    &io.expert_data[ki]
+                } else if ki < fallback_expert_bufs.len() {
+                    &fallback_expert_bufs[ki]
+                } else {
+                    continue;
+                };
                 kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.gate_w_off as u64,
                     expert_buf, layout.gate_s_off as u64,
@@ -1607,31 +1683,28 @@ pub fn moe_layer_forward(
                     expert_buf, layout.down_w_off as u64,
                     expert_buf, layout.down_s_off as u64,
                     expert_buf, layout.down_b_off as u64,
-                    &act_out, 0, &out_bufs[ei], 0,
+                    &act_out, 0, &out_bufs[ki], 0,
                     hidden_u32, inter_u32, gs_u32, 3);
             }
 
-            // Shared expert SwiGLU on GPU (sg_buf, su_buf already on GPU from router CMD)
+            // Shared expert SwiGLU on GPU
             if let (Some(ref sg), Some(ref su)) = (sg_buf_gpu.as_ref(), su_buf_gpu.as_ref()) {
                 kernels::encode_swiglu(ctx, &enc, sg, 0, su, 0, &shared_act_gpu, 0, shared_inter as u32);
             }
 
-            // Shared expert down_proj
             gw.encode_matvec_into(wf, ctx, &enc,
                 &format!("{}.shared_expert.down_proj", prefix),
                 &shared_act_gpu, 0, &shared_down_gpu, 0, hidden_dim, shared_inter);
 
-            // ── moe_combine_residual: hidden = h_mid + Σ(w_i * expert_out_i) + sigmoid(gate) * shared_out ──
-            let hidden_out = metal_buf_shared(&ctx.device, hidden_dim * 4);
-            let params_buf = metal_buf_shared(&ctx.device, 40);
+            // ── moe_combine_residual ──
             {
                 let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
                 enc.set_compute_pipeline_state(mcr_pipe);
                 enc.set_buffer(0, Some(&hmid_gpu), 0);
                 enc.set_buffer(1, Some(&shared_down_gpu), 0);
                 enc.set_buffer(2, Some(&hidden_out), 0);
-                for ei in 0..8 {
-                    if ei < out_bufs.len() {
+                for ei in 0..MAX_K {
+                    if ei < actual_k && valid[ei] {
                         enc.set_buffer(3 + ei as u64, Some(&out_bufs[ei]), 0);
                     } else {
                         enc.set_buffer(3 + ei as u64, Some(&hidden_out), 0);
@@ -1643,9 +1716,8 @@ pub fn moe_layer_forward(
                 unsafe { std::ptr::copy_nonoverlapping(params.as_ptr(), params_buf.contents() as *mut f32, 10); }
                 enc.set_buffer(11, Some(&params_buf), 0);
                 unsafe {
-                    let p: *const u32 = &hidden_u32;
-                    enc.set_bytes(12, 4, p as *const c_void);
-                    let ku = k as u32;
+                    enc.set_bytes(12, 4, &hidden_u32 as *const u32 as *const c_void);
+                    let ku = actual_k as u32;
                     enc.set_bytes(13, 4, &ku as *const u32 as *const c_void);
                 }
                 enc.dispatch_thread_groups(
@@ -1655,23 +1727,24 @@ pub fn moe_layer_forward(
             }
 
             enc.end_encoding();
-            cmd_buf.commit();  // NO wait — async dispatch
+            cmd_buf.commit();
 
-            // Collect all GPU buffers that must stay alive until CMD completes
-            let mut keep_alive = Vec::with_capacity(16);
+            // Only per-layer-allocated buffers need keep_alive; pre-allocated live in ExpertIOState
+            let mut keep_alive = Vec::with_capacity(4);
             keep_alive.push(hmid_gpu);
-            keep_alive.push(shared_act_gpu);
-            keep_alive.push(shared_down_gpu);
-            keep_alive.push(params_buf);
-            keep_alive.push(x_buf);
-            keep_alive.push(gate_out);
-            keep_alive.push(up_out);
-            keep_alive.push(act_out);
-            // Keep shared gate/up from router CMD (used in this CMD)
+            if io_ref.is_none() {
+                keep_alive.push(shared_act_gpu);
+                keep_alive.push(shared_down_gpu);
+                keep_alive.push(params_buf);
+                keep_alive.push(x_buf);
+                keep_alive.push(gate_out);
+                keep_alive.push(up_out);
+                keep_alive.push(act_out);
+                keep_alive.extend(out_bufs);
+                keep_alive.extend(fallback_expert_bufs);
+            }
             if let Some(b) = sg_buf_gpu.take() { keep_alive.push(b); }
             if let Some(b) = su_buf_gpu.take() { keep_alive.push(b); }
-            keep_alive.extend(expert_bufs);   // SSD-read expert data
-            keep_alive.extend(out_bufs);       // per-expert outputs
 
             return Ok(Some(DeferredExperts {
                 cmd_buf: Some(cmd_buf.to_owned()),

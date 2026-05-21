@@ -194,8 +194,7 @@ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (lay
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
-static int g_think_budget = 2048;
-static const char *g_verify_logits_path = NULL; // max thinking tokens before force-emitting </think>
+static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -6542,14 +6541,13 @@ int main(int argc, char **argv) {
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
-            {"verify-logits", required_argument, 0, 'V'},
             {"collect-routing", required_argument, 0, 'Z'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:V:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6569,7 +6567,6 @@ int main(int argc, char **argv) {
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
-                case 'V': g_verify_logits_path = optarg; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
@@ -6962,15 +6959,6 @@ int main(int argc, char **argv) {
         // ---- LM head ----
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
-        if (g_verify_logits_path) {
-            FILE *vf = fopen(g_verify_logits_path, "wb");
-            if (vf) {
-                fwrite(logits, sizeof(float), VOCAB_SIZE, vf);
-                fclose(vf);
-            }
-            fprintf(stderr, "[verify] Dumped %d logits to %s\n", (int)VOCAB_SIZE, g_verify_logits_path);
-            exit(0);
-        }
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----

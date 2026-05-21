@@ -16,7 +16,7 @@ use crate::gpu_forward::{
     full_attention_forward, linear_attention_forward, moe_layer_forward, DeferredExperts,
     FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState, PipelineMode,
 };
-use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
+use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext};
 use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
 
@@ -33,6 +33,7 @@ struct ModelState {
     gpu_wf: GpuWeightCtx,
     layer_fds: Vec<RawFd>,
     pipeline_mode: PipelineMode,
+    expert_io: Option<ExpertIOState>,
 }
 
 impl ModelState {
@@ -64,6 +65,12 @@ impl ModelState {
             key_dim,
             value_dim,
         );
+        let expert_io = Some(ctx.init_expert_buffers(
+            config.expert_size_4bit,
+            config.hidden_dim,
+            config.moe_intermediate,
+            config.shared_intermediate,
+        ));
         let gpu_wf = GpuWeightCtx::new(&ctx.device, &wf);
 
         let packed_dir = dir.join("packed_experts");
@@ -80,7 +87,7 @@ impl ModelState {
             "[model] {} layers hidden={} experts={} mode={:?}",
             config.num_layers, config.hidden_dim, config.num_experts, pipeline_mode
         );
-        Ok(ModelState { config, wf, ctx, gpu_wf, layer_fds, pipeline_mode })
+        Ok(ModelState { config, wf, ctx, gpu_wf, layer_fds, pipeline_mode, expert_io })
     }
 }
 
@@ -156,7 +163,7 @@ fn lm_head(
     }
 }
 
-fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
+fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
     kv: &mut [Option<FullAttnCache>], lin: &mut [Option<LinearAttnState>],
     py: Python<'_>,
 ) -> PyResult<()> {
@@ -214,6 +221,7 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         let r = moe_layer_forward(
             &m.wf, layer, hidden, m.layer_fds[layer],
             Some(&m.ctx), Some(&m.gpu_wf), &m.config, mode, attn_state, lin_state,
+            m.expert_io.as_mut(),
         );
         deferred = r.unwrap_or(None);
     }

@@ -3,11 +3,163 @@
 /// Port of metal_init() / MetalContext from main.m:172-322.
 use metal::*;
 use objc::rc::autoreleasepool;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use crate::error::MoEError;
 use crate::kernels;
 use crate::weights::WeightFile;
+
+// ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
+
+pub const MAX_K: usize = 8;
+const CACHE_SIZE: usize = 32;
+
+/// LRU cache for expert Metal buffers. Maps (layer, expert_id) → pre-allocated buffer.
+/// Cache hits skip pread entirely; misses evict the least-recently-used entry.
+pub struct ExpertCache {
+    entries: Vec<CacheEntry>,
+    map: HashMap<(usize, usize), usize>,
+    access_counter: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+struct CacheEntry {
+    buffer: Buffer,
+    layer_idx: i32,   // -1 = unused
+    expert_idx: i32,
+    last_used: u64,
+}
+
+impl ExpertCache {
+    pub fn new(device: &Device, max_entries: usize, expert_size: usize) -> Self {
+        let mut entries = Vec::with_capacity(max_entries);
+        for _ in 0..max_entries {
+            entries.push(CacheEntry {
+                buffer: metal_buf_shared(device, expert_size),
+                layer_idx: -1,
+                expert_idx: -1,
+                last_used: 0,
+            });
+        }
+        ExpertCache {
+            entries,
+            map: HashMap::with_capacity(max_entries),
+            access_counter: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up a cached Metal buffer. Returns None on miss.
+    pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<Buffer> {
+        if let Some(&idx) = self.map.get(&(layer, expert)) {
+            self.entries[idx].last_used = self.access_counter;
+            self.access_counter += 1;
+            self.hits += 1;
+            Some(self.entries[idx].buffer.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Insert/evict: returns a buffer to pread expert data into.
+    /// The returned buffer may be newly unused or LRU-evicted — its old contents
+    /// are invalid and must be overwritten with pread.
+    pub fn insert_get_buf(&mut self, layer: usize, expert: usize) -> Buffer {
+        self.access_counter += 1;
+
+        // Already cached? Just update LRU
+        if let Some(&idx) = self.map.get(&(layer, expert)) {
+            self.entries[idx].last_used = self.access_counter;
+            return self.entries[idx].buffer.clone();
+        }
+
+        // Find slot: unused first, then LRU
+        let target = if self.map.len() < self.entries.len() {
+            self.map.len()
+        } else {
+            // Evict LRU
+            let mut lru = 0;
+            let mut min_used = u64::MAX;
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.last_used < min_used {
+                    min_used = e.last_used;
+                    lru = i;
+                }
+            }
+            let old_layer = self.entries[lru].layer_idx;
+            let old_expert = self.entries[lru].expert_idx;
+            if old_layer >= 0 && old_expert >= 0 {
+                self.map.remove(&(old_layer as usize, old_expert as usize));
+            }
+            lru
+        };
+
+        self.entries[target].layer_idx = layer as i32;
+        self.entries[target].expert_idx = expert as i32;
+        self.entries[target].last_used = self.access_counter;
+        self.map.insert((layer, expert), target);
+        self.entries[target].buffer.clone()
+    }
+}
+
+/// Pre-allocated GPU buffers for expert dispatch — allocated once, reused across
+/// all layers and tokens.  Matches C's `buf_multi_expert_*` and scratch buffers.
+pub struct ExpertIOState {
+    /// Expert data buffers [MAX_K] — pread'd expert weights land here
+    pub expert_data: Vec<Buffer>,
+    /// Per-expert output [MAX_K] — each expert's down_proj result
+    pub expert_out: Vec<Buffer>,
+    /// Scratch buffers (shared across sequential expert dispatches within one CMD)
+    pub scratch_gate: Buffer,
+    pub scratch_up: Buffer,
+    pub scratch_act: Buffer,
+    /// Shared input buffer (h_post copy, reused by all experts)
+    pub input_buf: Buffer,
+    /// Shared expert intermediate + output
+    pub shared_act: Buffer,
+    pub shared_down: Buffer,
+    /// moe_combine_residual output — final hidden state
+    pub combine_out: Buffer,
+    /// Combine params [10 f32]: expert_weights[8] + shared_gate_score + padding
+    pub combine_params: Buffer,
+    /// LRU cache for expert data (avoids pread for repeated experts)
+    pub cache: ExpertCache,
+}
+
+impl ExpertIOState {
+    pub fn new(
+        device: &Device,
+        expert_size: usize,
+        hidden_dim: usize,
+        moe_inter: usize,
+        shared_inter: usize,
+        cache_entries: usize,
+    ) -> Self {
+        let mut expert_data = Vec::with_capacity(MAX_K);
+        let mut expert_out = Vec::with_capacity(MAX_K);
+        for _ in 0..MAX_K {
+            expert_data.push(metal_buf_shared(device, expert_size));
+            expert_out.push(metal_buf_shared(device, hidden_dim * 4));
+        }
+        ExpertIOState {
+            expert_data,
+            expert_out,
+            scratch_gate: metal_buf_shared(device, moe_inter * 4),
+            scratch_up: metal_buf_shared(device, moe_inter * 4),
+            scratch_act: metal_buf_shared(device, moe_inter * 4),
+            input_buf: metal_buf_shared(device, hidden_dim * 4),
+            shared_act: metal_buf_shared(device, shared_inter * 4),
+            shared_down: metal_buf_shared(device, hidden_dim * 4),
+            combine_out: metal_buf_shared(device, hidden_dim * 4),
+            combine_params: metal_buf_shared(device, 40),
+            cache: ExpertCache::new(device, cache_entries, expert_size),
+        }
+    }
+}
 
 /// Holds all Metal device state and compute pipeline handles.
 pub struct MetalContext {
@@ -88,6 +240,33 @@ impl MetalContext {
         self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));
         self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
         self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
+    }
+
+    /// Allocate persistent GPU buffers for expert I/O. Returns the state which
+    /// should be stored separately (in ModelState) to allow independent borrowing.
+    pub fn init_expert_buffers(
+        &self,
+        expert_size: usize,
+        hidden_dim: usize,
+        moe_inter: usize,
+        shared_inter: usize,
+    ) -> ExpertIOState {
+        let io = ExpertIOState::new(
+            &self.device,
+            expert_size,
+            hidden_dim,
+            moe_inter,
+            shared_inter,
+            CACHE_SIZE,
+        );
+        eprintln!(
+            "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch, LRU cache={} entries",
+            MAX_K,
+            expert_size / (1024 * 1024),
+            MAX_K,
+            CACHE_SIZE,
+        );
+        io
     }
 }
 
