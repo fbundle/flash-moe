@@ -21,6 +21,88 @@ The Rust port (`moe_infer_rs/`) builds, runs, and generates coherent text on App
 | KV cache | GPU bf16 buffers | CPU f32 buffers |
 | Python bindings | None (C-only) | PyO3 + Maturin (Context, Cache classes) |
 
+## Stage-by-Stage Comparison: C vs Rust Fused3
+
+Each row is one stage in the per-layer pipeline. Device shows where the work executes.
+
+### Full-Attention Layers (indices 3, 7, 11, ...)
+
+| # | Stage | C (bench.m) | Rust (Fused3) | Device |
+|---|-------|-------------|---------------|--------|
+| 0 | Deferred wait | `wait_until_completed` on prev CMD3 | `DeferredExperts::complete()` — wait + readback | GPU→CPU |
+| 1 | Input norm | CPU `rms_norm` | CPU `rms_norm` | CPU |
+| 2 | CMD1 encode | Q/K/V projections (3× `dequant_matvec_4bit`) | Same (3× `encode_matvec_into`) | GPU |
+| 3 | CMD1 wait | `commit` + `wait_until_completed` | Same | GPU |
+| 4 | Q/K norms | CPU per-head RMS norm | CPU per-head RMS norm | CPU |
+| 5 | RoPE | CPU `apply_rope` on Q/K | CPU `apply_rope` on Q/K | CPU |
+| 6 | KV cache | Append to GPU `gpu_k_cache`/`gpu_v_cache` | Append to CPU `FullAttnCache` (uploaded next layer) | GPU / **CPU** |
+| 7 | Attn scores | GPU `attn_scores_batched` (in CMD2) | GPU `attn_scores_batched` (in CMD2) | GPU |
+| 8 | Attn softmax | GPU `attn_softmax_batched` (in CMD2) | GPU `attn_softmax_batched` (in CMD2) | GPU |
+| 9 | Attn values | GPU `attn_values_batched` (in CMD2) | GPU `attn_values_batched` (in CMD2) | GPU |
+| 10 | Sigmoid gate | GPU `sigmoid` (in CMD2) | GPU `sigmoid_gate` (in CMD2) | GPU |
+| 11 | o_proj | GPU `dequant_matvec_4bit` (in CMD2) | GPU `encode_matvec_into` (in CMD2) | GPU |
+| 12 | Residual add | GPU `residual_add` (in CMD2) | GPU `residual_add` (in CMD2) | GPU |
+| 13 | Post-attn norm | GPU `rms_norm_sum` + `rms_norm_apply` (in CMD2) | GPU `rms_norm_sum` + `rms_norm_apply_bf16` (in CMD2) | GPU |
+| 14 | MoE gate | GPU `dequant_matvec_4bit` (in CMD2) | GPU `encode_matvec_into` (in CMD2) | GPU |
+| 15 | Shared gate/up | GPU 2× `dequant_matvec_4bit` (in CMD2) | GPU 2× `encode_matvec_into` (in CMD2) | GPU |
+| 16 | Shared gate score | GPU `dequant_matvec_4bit` (in CMD2) | GPU `encode_matvec_into` (in CMD2) | GPU |
+| 17 | CMD2 wait | `commit` + `wait_until_completed` (single CMD for steps 7–16) | Same (single CMD) | GPU |
+| 18 | Routing | CPU `softmax` + `topk` | CPU `cpu_softmax` + `cpu_topk` | CPU |
+| 19 | Expert I/O | `pread` K experts from `packed_experts/layer_NN.bin` | Same (`libc::pread`) | Disk→CPU |
+| 20 | CMD3: gate/up | GPU K×2 `dequant_matvec_offset` | GPU K×2 `encode_matvec_offset` | GPU |
+| 21 | CMD3: SwiGLU | GPU K× `swiglu` | GPU K× `encode_swiglu` | GPU |
+| 22 | CMD3: down | GPU K× `dequant_matvec_offset` | GPU K× `encode_matvec_offset` | GPU |
+| 23 | CMD3: shared SwiGLU | GPU `swiglu` | GPU `encode_swiglu` | GPU |
+| 24 | CMD3: shared down | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` | GPU |
+| 25 | CMD3: combine | GPU `moe_combine_residual` | GPU `moe_combine_residual` | GPU |
+| 26 | CMD3 commit | `commit` (async, **no wait**) | `commit` (async, **no wait**) — returns `DeferredExperts` | GPU |
+
+**Full-attn diff**: Only stage 6 — C appends KV to persistent GPU buffers; Rust appends to CPU buffer and uploads next layer.
+
+### Linear-Attention Layers (indices 0, 1, 2, 4, 5, 6, ...)
+
+| # | Stage | C (bench.m) | Rust (Fused3) | Device |
+|---|-------|-------------|---------------|--------|
+| 0 | Deferred wait | `wait_until_completed` on prev CMD3 | `DeferredExperts::complete()` | GPU→CPU |
+| 1 | Input norm | CPU `rms_norm` | CPU `rms_norm` | CPU |
+| 2 | CMD1: qkvz | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` | GPU |
+| 3 | CMD1: ba | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` | GPU |
+| 4 | CMD1: conv1d | GPU `conv1d` (depthwise, kernel=4) | GPU `conv1d` (depthwise, kernel=4) | GPU |
+| 5 | CMD1: SSM | GPU `gated_delta_net_step` | GPU `gated_delta_net_step` | GPU |
+| 6 | CMD1: gated norm | CPU (readback + `_precise_swiglu`) | GPU `gated_norm` | **CPU** / GPU |
+| 7 | CMD1: out_proj | — (in CMD2) | GPU `encode_matvec_into` (fused into CMD1) | GPU |
+| 8 | CMD1: residual add | — (in CMD2) | GPU `residual_add` (fused into CMD1) | GPU |
+| 9 | CMD1 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` (single CMD for steps 2–8) | GPU |
+| 10 | CMD2: out_proj | GPU `dequant_matvec_4bit` | — (already done in CMD1) | GPU / — |
+| 11 | CMD2: residual add | GPU `residual_add` | — (already done in CMD1) | GPU / — |
+| 12 | CMD2: post-attn norm | GPU `rms_norm_sum` + `rms_norm_apply` | — (not needed, residual already in CMD1) | GPU / — |
+| 13 | CMD2: MoE gate | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` (router CMD) | GPU |
+| 14 | CMD2: shared gate/up | GPU 2× `dequant_matvec_4bit` | GPU 2× `encode_matvec_into` (router CMD) | GPU |
+| 15 | CMD2: shared gate score | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` (router CMD) | GPU |
+| 16 | CMD2 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` (router CMD) | GPU |
+| 17 | Routing | CPU `softmax` + `topk` | CPU `cpu_softmax` + `cpu_topk` | CPU |
+| 18 | Expert I/O | `pread` K experts | Same (`libc::pread`) | Disk→CPU |
+| 19 | CMD3: gate/up/down/SwiGLU | GPU (same as full-attn) | GPU (same as full-attn) | GPU |
+| 20 | CMD3: shared SwiGLU+down | GPU (same) | GPU (same) | GPU |
+| 21 | CMD3: combine | GPU `moe_combine_residual` | GPU `moe_combine_residual` | GPU |
+| 22 | CMD3 commit | `commit` (async) | `commit` (async) — returns `DeferredExperts` | GPU |
+
+**Linear-attn diffs:**
+- Stage 6: C does gated norm on CPU (readback after SSM); Rust does it on GPU in CMD1
+- Stages 7–12: Rust fuses out_proj + residual into CMD1; C keeps them in CMD2
+- Net CMD count: C = 3 (CMD1+CMD2+CMD3), Rust = 3 (CMD1+router+CMD3). Same count, different boundaries.
+
+### Summary of Differences
+
+| Diff | Impact |
+|------|--------|
+| KV cache: CPU (Rust) vs GPU persistent (C) | Rust uploads K/V per layer (~0.03ms/layer overhead) |
+| SSM state: CPU↔GPU transfer (Rust) vs GPU persistent (C) | Rust uploads/downloads state per layer |
+| Gated norm: GPU (Rust) vs CPU (C) | Rust offloads more work to GPU |
+| out_proj+residual: in CMD1 (Rust) vs CMD2 (C) for linear layers | Same total work, different CMD boundaries |
+| Speculative routing | C only; Rust doesn't implement expert prediction |
+| Expert cache (LRU) | C only; Rust always reads from disk |
+
 ## Pipeline Mode: Fused3 — COMPLETE
 
 Fused3 matches the C engine's 3-command-buffer architecture. All steps complete:
