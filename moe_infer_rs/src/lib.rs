@@ -19,7 +19,7 @@ pub use constants::*;
 pub use error::MoEError;
 pub use expert::{run_expert_forward, run_expert_forward_fast, ExpertTiming};
 pub use full_forward::{run_full_forward, FullForwardTiming};
-pub use gpu_forward::{moe_layer_forward, linear_attention_forward, LinearAttnState, DeferredExperts};
+pub use gpu_forward::{moe_layer_forward, linear_attention_forward, LinearAttnState, DeferredExperts, PipelineMode};
 pub use metal_context::{MetalContext, GpuWeightCtx, metal_buf_shared};
 pub use moe::{run_moe_forward, run_moe_forward_fused, MoETiming};
 pub use quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_swiglu};

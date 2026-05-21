@@ -550,11 +550,12 @@ fn forward_layer(
                 config.linear_conv_dim,
                 gpu_wf, ctx,
                 linear_idx,
+                gpu_forward::PipelineMode::Fused3,
             );
         }
     }
 
-    gpu_forward::moe_layer_forward(wf, layer_idx, hidden, packed_fd, ctx, gpu_wf, config, prev_deferred)
+    gpu_forward::moe_layer_forward(wf, layer_idx, hidden, packed_fd, ctx, gpu_wf, config, prev_deferred, gpu_forward::PipelineMode::Fused3)
         .map(|_deferred| ())  // discard deferred (sync dispatch returns None anyway)
 }
 

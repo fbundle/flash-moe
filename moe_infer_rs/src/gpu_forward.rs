@@ -18,6 +18,32 @@ pub const LINEAR_KEY_DIM: usize = 128;
 pub const LINEAR_VALUE_DIM: usize = 128;
 const CONV_KERNEL_SIZE: usize = 4;
 
+/// Pipeline execution mode — controls how GPU command buffers are batched.
+///
+/// The C engine uses 3 command buffers per layer, split by CPU-side routing
+/// which must happen between the gate projection and expert dispatch:
+///
+///   CMD1: attention projs → conv1d → SSM
+///   CMD2: o_proj → residual → norm → routing gate
+///   CPU:  softmax + top-K + expert I/O  (inherently serial)
+///   CMD3: expert forward → combine → residual → norm
+///
+/// Since the CPU routing step is unavoidable, the minimum is 2 CMDs (pre-routing
+/// and post-routing). The 3-CMD approach isolates attention from the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMode {
+    /// CPU-only path: all matvecs, activations, and routing on CPU (no Metal).
+    CpuOnly,
+    /// GPU path: individual Metal dispatches per operation (no command-buffer fusion).
+    Gpu,
+    /// 2-CMD fused: merge CMD1+CMD2 (everything up to routing gate), then CMD3 (experts).
+    /// Fewer command buffers than Fused3 but attention and o_proj share one commit.
+    Fused2,
+    /// 3-CMD fused: CMD1 (attention) + CMD2 (o_proj/routing) + CMD3 (experts).
+    /// Matches the original C engine architecture. Isolates attention from o_proj.
+    Fused3,
+}
+
 // ─── CPU helper functions ──────────────────────────────────────────────────
 
 fn cpu_sigmoid(x: f32) -> f32 {
@@ -194,7 +220,12 @@ pub fn linear_attention_forward(
     gpu_wf: Option<&GpuWeightCtx>,
     ctx: Option<&MetalContext>,
     linear_idx: usize,  // index into persistent GPU state buffers
+    mode: PipelineMode,
 ) {
+    let use_gpu = mode != PipelineMode::CpuOnly
+        && gpu_wf.is_some()
+        && ctx.is_some();
+
     // Input RMS norm
     let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
     let nw = wf.get_tensor_u16(&norm_name);
@@ -225,9 +256,10 @@ pub fn linear_attention_forward(
     let mut gated_out = vec![0.0f32; total_value];
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
-    let gpu_compatible = key_dim == 128 && value_dim == 128;
-    let use_fused_gpu = gpu_compatible
-        && gpu_wf.is_some() && ctx.is_some()
+    let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
+    let use_fused_gpu = mode == PipelineMode::Fused3 || mode == PipelineMode::Fused2
+        && gpu_compatible
+        && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
         && linear_idx < ctx.unwrap().buf_conv_state.len()
         && linear_idx < ctx.unwrap().buf_delta_state.len()
@@ -389,8 +421,8 @@ pub fn linear_attention_forward(
         let lin_v = conv_out[2 * total_key..].to_vec();
 
         // Try non-fused GPU SSM (or CPU fallback)
-        let use_gpu = gpu_compatible && ctx.is_some() && gpu_wf.is_some();
-        if use_gpu {
+        let gpu_ssm_ok = gpu_compatible && ctx.is_some();
+        if gpu_ssm_ok {
             let c = ctx.unwrap();
             let ssm_size = num_v_heads * value_dim * key_dim;
             let ssm_gpu = state.ssm_state_gpu.get_or_insert_with(|| {
@@ -518,7 +550,9 @@ pub fn linear_attention_forward(
 
     // Output projection
     let mut attn_out = vec![0.0f32; hidden_dim];
-    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+    if use_gpu {
+        let gw = gpu_wf.unwrap();
+        let c = ctx.unwrap();
         gw.matvec(wf, c, &format!("{}.out_proj", prefix), &gated_out, &mut attn_out, hidden_dim, total_value);
     } else if let (Some(ow), Some(os), Some(ob)) = (
         wf.get_tensor_u32(&format!("{}.out_proj.weight", prefix)),
@@ -554,6 +588,7 @@ pub fn moe_layer_forward(
     gpu_wf: Option<&GpuWeightCtx>,
     config: &ModelConfig,
     _prev_deferred: &mut Option<DeferredExperts>,
+    mode: PipelineMode,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -562,6 +597,10 @@ pub fn moe_layer_forward(
     let expert_size = config.expert_size_4bit;
     let layout = &config.expert_layout_4bit;
     let k = config.num_experts_per_tok;
+
+    let use_gpu = mode != PipelineMode::CpuOnly
+        && ctx.is_some()
+        && gpu_wf.is_some();
 
     // Save h_mid (residual) — prev deferred already completed by caller
     let h_mid = hidden.to_vec();
@@ -585,7 +624,9 @@ pub fn moe_layer_forward(
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
     // Router gate + shared expert projections: all independent (same input) → batch
-    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+    if use_gpu {
+        let gw = gpu_wf.unwrap();
+        let c = ctx.unwrap();
         let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
         unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
         let gate_buf = metal_buf_shared(&c.device, num_experts * 4);
@@ -649,7 +690,8 @@ pub fn moe_layer_forward(
     // ── Routed expert computation ──
     let mut moe_out = vec![0.0f32; hidden_dim];
 
-    if let Some(ctx) = ctx {
+    if use_gpu {
+        let ctx = ctx.unwrap();
         // GPU path — batch all experts in one command buffer
         let k = expert_indices.len();
 
@@ -803,7 +845,9 @@ pub fn moe_layer_forward(
     }
 
     // Shared expert down_proj
-    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+    if use_gpu {
+        let gw = gpu_wf.unwrap();
+        let c = ctx.unwrap();
         let sa_buf = metal_buf_shared(&c.device, shared_inter * 4);
         unsafe { let dst = sa_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(shared_act.as_ptr(), dst, shared_inter); }
         let so_buf = metal_buf_shared(&c.device, hidden_dim * 4);

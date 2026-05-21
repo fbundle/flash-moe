@@ -346,11 +346,11 @@ fn main() -> anyhow::Result<()> {
                     linear_attention_forward(&wf, layer, &mut hidden, state,
                         config.hidden_dim, config.linear_num_k_heads, config.linear_num_v_heads,
                         config.linear_total_key, config.linear_total_value, config.linear_conv_dim,
-                        Some(&gpu_wf), Some(&ctx), linear_idx);
+                        Some(&gpu_wf), Some(&ctx), linear_idx, PipelineMode::Fused3);
                 }
             }
             let _ = moe_layer_forward(&wf, layer, &mut hidden, layer_fds[layer],
-                Some(&ctx), Some(&gpu_wf), &config, &mut deferred);
+                Some(&ctx), Some(&gpu_wf), &config, &mut deferred, PipelineMode::Fused3);
         }
         pos += 1;
     }
@@ -375,11 +375,11 @@ fn main() -> anyhow::Result<()> {
                     linear_attention_forward(&wf, layer, &mut hidden, state,
                         config.hidden_dim, config.linear_num_k_heads, config.linear_num_v_heads,
                         config.linear_total_key, config.linear_total_value, config.linear_conv_dim,
-                        Some(&gpu_wf), Some(&ctx), linear_idx);
+                        Some(&gpu_wf), Some(&ctx), linear_idx, PipelineMode::Fused3);
                 }
             }
             let _ = moe_layer_forward(&wf, layer, &mut hidden, layer_fds[layer],
-                Some(&ctx), Some(&gpu_wf), &config, &mut deferred);
+                Some(&ctx), Some(&gpu_wf), &config, &mut deferred, PipelineMode::Fused3);
         }
         if let Some(ref mut def) = deferred {
             def.complete(&mut hidden, hidden_dim);
@@ -424,6 +424,7 @@ fn main() -> anyhow::Result<()> {
     // ── Generation loop ──
     let mut gen_count = 0usize;
     let mut output_text = String::new();
+    let mut output_ids: Vec<usize> = Vec::new();
     let t_gen_start = Instant::now();
 
     for _gen in 0..args.tokens {
@@ -446,11 +447,11 @@ fn main() -> anyhow::Result<()> {
                         linear_attention_forward(&wf, layer, &mut hidden, state,
                             config.hidden_dim, config.linear_num_k_heads, config.linear_num_v_heads,
                             config.linear_total_key, config.linear_total_value, config.linear_conv_dim,
-                            Some(&gpu_wf), Some(&ctx), linear_idx);
+                            Some(&gpu_wf), Some(&ctx), linear_idx, PipelineMode::Fused3);
                     }
                 }
                 let _ = moe_layer_forward(&wf, layer, &mut hidden, layer_fds[layer],
-                    Some(&ctx), Some(&gpu_wf), &config, &mut deferred);
+                    Some(&ctx), Some(&gpu_wf), &config, &mut deferred, PipelineMode::Fused3);
             }
             break;
         }
@@ -461,6 +462,7 @@ fn main() -> anyhow::Result<()> {
             let _ = std::io::stdout().flush();
         }
         output_text.push_str(tok_str);
+        output_ids.push(next_token);
         gen_count += 1;
 
         em_lookup(&wf, next_token, &mut hidden, hidden_dim);
@@ -480,11 +482,11 @@ fn main() -> anyhow::Result<()> {
                     linear_attention_forward(&wf, layer, &mut hidden, state,
                         config.hidden_dim, config.linear_num_k_heads, config.linear_num_v_heads,
                         config.linear_total_key, config.linear_total_value, config.linear_conv_dim,
-                        Some(&gpu_wf), Some(&ctx), linear_idx);
+                        Some(&gpu_wf), Some(&ctx), linear_idx, PipelineMode::Fused3);
                 }
             }
             let _ = moe_layer_forward(&wf, layer, &mut hidden, layer_fds[layer],
-                Some(&ctx), Some(&gpu_wf), &config, &mut deferred);
+                Some(&ctx), Some(&gpu_wf), &config, &mut deferred, PipelineMode::Fused3);
         }
         if let Some(ref mut def) = deferred {
             def.complete(&mut hidden, hidden_dim);
@@ -507,6 +509,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("[bench]   Generated: {} tokens", gen_count);
     eprintln!("[bench]   Time:      {:.0} ms", gen_elapsed_ms);
     eprintln!("[bench]   Speed:     {:.2} tok/s", tok_s);
+    eprintln!("[bench]   Token IDs: {:?}", &output_ids[..output_ids.len().min(30)]);
     eprintln!("[bench]   Output:    {}", output_text.chars().take(200).collect::<String>());
 
     // Cleanup
