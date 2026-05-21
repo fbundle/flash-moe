@@ -4,14 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust port of Flash-MoE Metal inference engine for MoE models on Apple Silicon"
 
-[[bin]]
-name = "moe-infer"
-path = "src/main.rs"
-
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
 [lib]
 name = "moe_infer"
 path = "src/lib.rs"
@@ -25,12 +17,9 @@ metal = "0.33"
 objc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rayon = "1"
 libc = "0.2"
-log = "0.4"
-env_logger = "0.11"
 memmap2 = "0.9"
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.24", optional = true }

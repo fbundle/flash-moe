@@ -20,10 +20,12 @@ EOS_IDS = [248046, 248044]
 def print_telemetry(t, label=""):
     """Print performance metrics from a telemetry dict."""
     prefix = f"[{label}] " if label else ""
-    print(f"[telemetry] {prefix}prefill: {t['prefill_ms']:.0f} ms, "
-          f"total: {t['total_ms']:.0f} ms, "
-          f"tokens: {t['tokens_generated']}, "
-          f"speed: {t['tokens_per_sec']:.1f} tok/s")
+    parts = [f"ttft: {t['ttft_ms']:.0f} ms"]
+    if t['tokens_generated'] > 0:
+        parts.append(f"total: {t['total_ms']:.0f} ms")
+        parts.append(f"tokens: {t['tokens_generated']}")
+        parts.append(f"speed: {t['tokens_per_sec']:.1f} tok/s")
+    print(f"[telemetry] {prefix}" + ", ".join(parts))
 
 
 def main():

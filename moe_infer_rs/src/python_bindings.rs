@@ -485,15 +485,20 @@ impl Context {
     }
 
     /// Return telemetry from the last forward/generate/stream_generate call.
-    /// Returns a dict with keys: prefill_ms, total_ms, tokens_generated, tokens_per_sec
+    /// Keys: ttft_ms, prefill_ms, total_ms, tokens_generated, tokens_per_sec.
+    /// tokens_per_sec excludes prefill and the first token.
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
         let t = &self.telemetry;
         let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("ttft_ms", t.prefill_ms)?;
         dict.set_item("prefill_ms", t.prefill_ms)?;
         dict.set_item("total_ms", t.total_ms)?;
         dict.set_item("tokens_generated", t.tokens_generated)?;
-        let tps = if t.total_ms > 0.0 && t.tokens_generated > 0 {
-            t.tokens_generated as f64 / (t.total_ms / 1000.0)
+        let tps = if t.total_ms > 0.0 && t.tokens_generated > 1 {
+            let gen_ms = t.total_ms - t.prefill_ms;  // exclude prefill
+            if gen_ms > 0.0 {
+                (t.tokens_generated - 1) as f64 / (gen_ms / 1000.0)  // exclude first token
+            } else { 0.0 }
         } else { 0.0 };
         dict.set_item("tokens_per_sec", tps)?;
         Ok(dict.into_py(py))

@@ -8,8 +8,6 @@ pub mod kernels;
 pub mod metal_context;
 pub mod moe;
 pub mod quant;
-pub mod server;
-pub mod tokenizer;
 pub mod timer;
 pub mod weights;
 
@@ -26,8 +24,6 @@ pub use gpu_forward::{moe_layer_forward, linear_attention_forward, full_attentio
 pub use metal_context::{MetalContext, GpuWeightCtx, metal_buf_shared};
 pub use moe::{run_moe_forward, run_moe_forward_fused, MoETiming};
 pub use quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_swiglu};
-pub use server::run_server;
-pub use tokenizer::BpeTokenizer;
 pub use timer::now_ms;
 pub use weights::WeightFile;
 
