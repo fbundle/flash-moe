@@ -159,4 +159,16 @@ impl WeightFile {
         let len = t.size as usize / 4;
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
+
+    /// Raw base pointer to the mmap'd data (for GPU buffer wrapping).
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        self.data_ptr
+    }
+
+    /// Byte offset of a tensor within the mmap (for GPU buffer dispatch).
+    #[inline]
+    pub fn tensor_offset(&self, name: &str) -> Option<usize> {
+        self.tensors.get(name).map(|t| t.offset as usize)
+    }
 }

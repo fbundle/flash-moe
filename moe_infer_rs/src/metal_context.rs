@@ -6,6 +6,8 @@ use objc::rc::autoreleasepool;
 use std::ffi::c_void;
 
 use crate::error::MoEError;
+use crate::kernels;
+use crate::weights::WeightFile;
 
 /// Holds all Metal device state and compute pipeline handles.
 pub struct MetalContext {
@@ -172,4 +174,97 @@ pub fn metal_buf_pread(device: &Device, fd: std::os::fd::RawFd, size: usize, off
         )));
     }
     Ok(buf)
+}
+
+// ─── GPU weight buffer wrapper ─────────────────────────────────────────────
+
+const GPU_MATVEC_GROUP_SIZE: u32 = 64;
+
+/// Wraps the entire model weight file in a Metal buffer (zero-copy via mmap).
+/// Tensor matvecs dispatch on GPU using byte offsets within this buffer.
+pub struct GpuWeightCtx {
+    pub buf: Buffer,
+    pub base: *const u8,
+}
+
+impl GpuWeightCtx {
+    /// Create a Metal buffer wrapping the weight file mmap.
+    pub fn new(device: &Device, wf: &WeightFile) -> Self {
+        let data = wf.data_ptr();
+        let size = wf.size;
+        let buf = device.new_buffer_with_bytes_no_copy(
+            data as *mut std::ffi::c_void,
+            size as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        eprintln!("[gpu-weight] Wrapped {:.2} GB weight file in Metal buffer", size as f64 / 1e9);
+        GpuWeightCtx { buf, base: data }
+    }
+
+    /// Encode a GPU dequant matvec into an existing encoder (for batched dispatch).
+    /// Returns false if tensor not found. Caller must end_encoding, commit, and wait.
+    pub fn encode_matvec_into(
+        &self,
+        wf: &WeightFile,
+        ctx: &MetalContext,
+        encoder: &ComputeCommandEncoderRef,
+        prefix: &str,
+        x_buf: &BufferRef,
+        x_offset: u64,
+        out_buf: &BufferRef,
+        out_offset: u64,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> bool {
+        let w_ptr = match wf.get_tensor_ptr(&format!("{}.weight", prefix)) {
+            Some(p) => p, None => return false,
+        };
+        let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+            Some(p) => p, None => return false,
+        };
+        let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
+            Some(p) => p, None => return false,
+        };
+
+        let w_off = (w_ptr as usize - self.base as usize) as u64;
+        let s_off = (s_ptr as usize - self.base as usize) as u64;
+        let b_off = (b_ptr as usize - self.base as usize) as u64;
+
+        kernels::encode_matvec_offset(
+            ctx, encoder,
+            &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
+            x_buf, x_offset, out_buf, out_offset,
+            out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, 3,
+        );
+        true
+    }
+
+    /// Dispatch a single GPU dequant matvec (convenience — creates command buffer).
+    pub fn matvec(
+        &self,
+        wf: &WeightFile,
+        ctx: &MetalContext,
+        prefix: &str,
+        x: &[f32],
+        out: &mut [f32],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> bool {
+        let x_buf = metal_buf_shared(&ctx.device, in_dim * 4);
+        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(x.as_ptr(), dst, in_dim); }
+        let out_buf = metal_buf_shared(&ctx.device, out_dim * 4);
+
+        let cmd_buf = ctx.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        let ok = self.encode_matvec_into(wf, ctx, encoder, prefix, &x_buf, 0, &out_buf, 0, out_dim, in_dim);
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        if ok {
+            unsafe { let src = out_buf.contents() as *const f32; std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out_dim); }
+        }
+        ok
+    }
 }

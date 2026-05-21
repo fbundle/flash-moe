@@ -340,3 +340,140 @@ pub fn metal_rms_norm(
     cmd_buf.commit();
     cmd_buf.wait_until_completed();
 }
+
+// ─── Linear attention GPU kernels ─────────────────────────────────────────
+
+/// Encode gated delta net step — SSM recurrence (one threadgroup per v-head).
+pub fn encode_gated_delta_net_step(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    state: &BufferRef,
+    q: &BufferRef,
+    k: &BufferRef,
+    v: &BufferRef,
+    g_decay: &BufferRef,
+    beta_gate: &BufferRef,
+    output: &BufferRef,
+    num_v_heads: u32,
+    k_heads_per_v: u32,
+    _key_dim: u32,   // kernel hardcodes key_dim=128
+    value_dim: u32,
+) {
+    debug_assert!(_key_dim == 128, "gated_delta_net_step kernel hardcodes key_dim=128");
+    debug_assert!(value_dim == 128, "gated_delta_net_step kernel hardcodes value_dim=128");
+    let pipeline = ctx.gated_delta_net_step.as_ref().expect("gated_delta_net_step kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(state), 0);
+    encoder.set_buffer(1, Some(q), 0);
+    encoder.set_buffer(2, Some(k), 0);
+    encoder.set_buffer(3, Some(v), 0);
+    encoder.set_buffer(4, Some(g_decay), 0);
+    encoder.set_buffer(5, Some(beta_gate), 0);
+    encoder.set_buffer(6, Some(output), 0);
+    unsafe { set_u32(encoder, 7, k_heads_per_v); }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_v_heads as u64, 1, 1),
+        MTLSize::new(value_dim as u64, 1, 1),
+    );
+}
+
+/// Encode compute_decay_beta — computes g_decay and beta_gate from alpha, beta, A_log, dt_bias.
+pub fn encode_compute_decay_beta(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    alpha: &BufferRef,
+    beta: &BufferRef,
+    a_log: &BufferRef,
+    dt_bias: &BufferRef,
+    g_decay: &BufferRef,
+    beta_gate: &BufferRef,
+    num_v_heads: u32,
+) {
+    let pipeline = ctx.compute_decay_beta.as_ref().expect("compute_decay_beta kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(alpha), 0);
+    encoder.set_buffer(1, Some(beta), 0);
+    encoder.set_buffer(2, Some(a_log), 0);
+    encoder.set_buffer(3, Some(dt_bias), 0);
+    encoder.set_buffer(4, Some(g_decay), 0);
+    encoder.set_buffer(5, Some(beta_gate), 0);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(num_v_heads as u64, 1, 1),
+    );
+}
+
+/// Encode RMS norm for q/k (per-head, bare norm with scale).
+pub fn encode_rms_norm_qk(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q: &BufferRef,
+    k: &BufferRef,
+    num_heads: u32,
+    key_dim: u32,
+    inv_scale: f32,
+) {
+    let pipeline = ctx.rms_norm_qk.as_ref().expect("rms_norm_qk kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q), 0);
+    encoder.set_buffer(1, Some(k), 0);
+    unsafe {
+        set_u32(encoder, 2, key_dim);
+        set_f32(encoder, 3, inv_scale);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_heads as u64, 1, 1),
+        MTLSize::new(key_dim as u64, 1, 1),
+    );
+}
+
+/// Encode gated RMS norm (z-gated output normalization, per v-head).
+pub fn encode_gated_rms_norm(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    values: &BufferRef,
+    z: &BufferRef,
+    weight: &BufferRef,   // bf16 u16 weight, value_dim elements, shared across heads
+    output: &BufferRef,
+    num_v_heads: u32,
+    value_dim: u32,
+) {
+    let pipeline = ctx.gated_rms_norm.as_ref().expect("gated_rms_norm kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(values), 0);
+    encoder.set_buffer(1, Some(z), 0);
+    encoder.set_buffer(2, Some(weight), 0);
+    encoder.set_buffer(3, Some(output), 0);
+    unsafe {
+        set_u32(encoder, 4, value_dim);
+        set_f32(encoder, 5, 1e-6);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_v_heads as u64, 1, 1),
+        MTLSize::new(value_dim as u64, 1, 1),
+    );
+}
+
+/// Encode depthwise conv1d step (with SiLU activation and state update).
+pub fn encode_conv1d_step(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    conv_state: &BufferRef,   // [(kernel_size-1) * conv_dim] = [3 * conv_dim]
+    input: &BufferRef,        // [conv_dim]
+    weights: &BufferRef,      // bf16 u16 weight, [conv_dim * 4]
+    output: &BufferRef,       // [conv_dim]
+    conv_dim: u32,
+) {
+    let pipeline = ctx.conv1d_step.as_ref().expect("conv1d_step kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(conv_state), 0);
+    encoder.set_buffer(1, Some(input), 0);
+    encoder.set_buffer(2, Some(weights), 0);
+    encoder.set_buffer(3, Some(output), 0);
+    unsafe { set_u32(encoder, 4, conv_dim); }
+    let num_tgs = (conv_dim + 255) / 256;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
