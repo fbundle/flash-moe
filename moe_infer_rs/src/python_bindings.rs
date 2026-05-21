@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use crate::config::{load_model_config, ModelConfig};
 use crate::gpu_forward::{
     full_attention_forward, linear_attention_forward, moe_layer_forward, DeferredExperts,
-    FullAttnCache, LinearAttnState, PipelineMode,
+    FullAttnCache, FullAttnCmd2State, LinearAttnState, PipelineMode,
 };
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::quant::bf16_to_f32;
@@ -172,9 +172,10 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
             def.complete(hidden, m.config.hidden_dim);
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+        let mut attn_state: Option<FullAttnCmd2State> = None;
         if is_full {
             if let Some(ref mut kv) = kv[layer] {
-                full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx));
+                attn_state = full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx));
             }
         } else if let Some(ref mut s) = lin[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
@@ -188,7 +189,7 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         }
         let r = moe_layer_forward(
             &m.wf, layer, hidden, m.layer_fds[layer],
-            Some(&m.ctx), Some(&m.gpu_wf), &m.config, &mut deferred, mode,
+            Some(&m.ctx), Some(&m.gpu_wf), &m.config, mode, attn_state,
         );
         deferred = r.unwrap_or(None);
     }
@@ -317,9 +318,7 @@ impl Context {
             "CpuOnly" => PipelineMode::CpuOnly,
             "Gpu" => PipelineMode::Gpu,
             "FusedExp" => PipelineMode::FusedExp,
-            "Fused3" => return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "Fused3 is not yet implemented. Use FusedExp (current experimental fused path) instead."
-            )),
+            "Fused3" => PipelineMode::Fused3,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Unknown pipeline_mode: {}. Use CpuOnly|Gpu|FusedExp", pipeline_mode)
             )),

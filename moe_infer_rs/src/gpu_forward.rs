@@ -231,10 +231,38 @@ fn apply_rope(
     }
 }
 
+// ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ──
+
+/// GPU-resident attention state for fusing batched attention + o_proj + gate
+/// into a single CMD2 (matching the C engine architecture).
+pub struct FullAttnCmd2State {
+    pub q_buf: Buffer,
+    pub q_gate_buf: Buffer,
+    pub kc_buf: Buffer,
+    pub vc_buf: Buffer,
+    pub scores_buf: Buffer,
+    pub out_buf: Buffer,
+    pub hidden_buf: Buffer,
+    pub seq_len: u32,
+    pub seq_stride: u32,
+    pub num_attn_heads: u32,
+    pub head_dim: u32,
+    pub kv_dim: u32,
+    pub heads_per_kv: u32,
+    pub scale: f32,
+    pub q_dim: u32,
+    pub o_prefix: String,
+}
+
 // ─── Full attention forward ───────────────────────────────────────────────
 
 /// Single-token full (self) attention forward: QKV proj, Q/K norms, RoPE,
-/// KV cache append, scaled dot-product attention, Q-gate, o_proj, residual.
+/// KV cache append.
+///
+/// Returns `FullAttnCmd2State` for GPU-fused CMD2 (batched attn + o_proj + gate).
+/// When GPU is available, skips batched attention/o_proj/residual — those are
+/// deferred to `moe_layer_forward`'s CMD2. When GPU unavailable, computes
+/// everything on CPU/separate CMDs and returns None.
 pub fn full_attention_forward(
     wf: &WeightFile,
     layer_idx: usize,
@@ -244,7 +272,7 @@ pub fn full_attention_forward(
     config: &ModelConfig,
     gpu_wf: Option<&GpuWeightCtx>,
     ctx: Option<&MetalContext>,
-) {
+) -> Option<FullAttnCmd2State> {
     let hidden_dim = config.hidden_dim;
     let num_attn_heads = config.num_attn_heads;
     let num_kv_heads = config.num_kv_heads;
@@ -336,7 +364,8 @@ pub fn full_attention_forward(
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let seq_len = kv.len;
     let seq_stride = MAX_SEQ;
-    let mut attn_out = vec![0.0f32; q_dim];
+    // o_proj output (filled by GPU fused path or CPU fallback below)
+    let mut o_out = vec![0.0f32; hidden_dim];
 
     let use_gpu_attn = ctx.is_some()
         && gpu_wf.is_some()
@@ -346,108 +375,39 @@ pub fn full_attention_forward(
 
     if use_gpu_attn {
         let c = ctx.unwrap();
-        // Upload Q, K_cache, V_cache, Q_gate
+        // Upload Q, K_cache, V_cache, Q_gate, hidden → returned for CMD2 fusion
         let q_buf = metal_buf_shared(&c.device, q_dim * 4);
         let kc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
         let vc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
         let scores_buf = metal_buf_shared(&c.device, num_attn_heads * seq_stride * 4);
         let out_buf = metal_buf_shared(&c.device, q_dim * 4);
         let q_gate_buf = metal_buf_shared(&c.device, q_dim * 4);
+        let hidden_buf = metal_buf_shared(&c.device, hidden_dim * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(q.as_ptr(), q_buf.contents() as *mut f32, q_dim);
             std::ptr::copy_nonoverlapping(kv.k_cache.as_ptr(), kc_buf.contents() as *mut f32, seq_len * kv_dim);
             std::ptr::copy_nonoverlapping(kv.v_cache.as_ptr(), vc_buf.contents() as *mut f32, seq_len * kv_dim);
             std::ptr::copy_nonoverlapping(q_gate.as_ptr(), q_gate_buf.contents() as *mut f32, q_dim);
+            std::ptr::copy_nonoverlapping(hidden.as_ptr(), hidden_buf.contents() as *mut f32, hidden_dim);
         }
 
-        let cmd_buf = c.queue.new_command_buffer();
-        let enc = cmd_buf.new_compute_command_encoder();
-        let num_seq_tgs = seq_len;
-
-        // Helper: set u32/f32 constant bytes (stack-allocated → raw ptr)
-        unsafe fn set_u32(enc: &metal::ComputeCommandEncoderRef, idx: u64, v: u32) {
-            let p: *const u32 = &v;
-            enc.set_bytes(idx, 4, p as *const c_void);
-        }
-        unsafe fn set_f32(enc: &metal::ComputeCommandEncoderRef, idx: u64, v: f32) {
-            let p: *const f32 = &v;
-            enc.set_bytes(idx, 4, p as *const c_void);
-        }
-
-        // 1. attn_scores_batched: Q @ K^T
-        enc.set_compute_pipeline_state(c.attn_scores_batched.as_ref().unwrap());
-        enc.set_buffer(0, Some(&q_buf), 0);
-        enc.set_buffer(1, Some(&kc_buf), 0);
-        enc.set_buffer(2, Some(&scores_buf), 0);
-        unsafe {
-            set_u32(&enc, 3, head_dim as u32);
-            set_u32(&enc, 4, kv_dim as u32);
-            set_u32(&enc, 5, seq_len as u32);
-            set_u32(&enc, 6, seq_stride as u32);
-            set_f32(&enc, 7, scale);
-            set_u32(&enc, 8, heads_per_kv as u32);
-            set_u32(&enc, 9, num_seq_tgs as u32);
-        }
-        enc.dispatch_thread_groups(
-            MTLSize::new(num_attn_heads as u64 * num_seq_tgs as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-
-        // 2. attn_softmax_batched
-        enc.set_compute_pipeline_state(c.attn_softmax_batched.as_ref().unwrap());
-        enc.set_buffer(0, Some(&scores_buf), 0);
-        unsafe {
-            set_u32(&enc, 1, seq_len as u32);
-            set_u32(&enc, 2, seq_stride as u32);
-        }
-        enc.dispatch_thread_groups(
-            MTLSize::new(num_attn_heads as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-
-        // 3. attn_values_batched: scores @ V
-        enc.set_compute_pipeline_state(c.attn_values_batched.as_ref().unwrap());
-        enc.set_buffer(0, Some(&scores_buf), 0);
-        enc.set_buffer(1, Some(&vc_buf), 0);
-        enc.set_buffer(2, Some(&out_buf), 0);
-        unsafe {
-            set_u32(&enc, 3, head_dim as u32);
-            set_u32(&enc, 4, kv_dim as u32);
-            set_u32(&enc, 5, seq_len as u32);
-            set_u32(&enc, 6, seq_stride as u32);
-            set_u32(&enc, 7, heads_per_kv as u32);
-        }
-        enc.dispatch_thread_groups(
-            MTLSize::new((num_attn_heads * head_dim) as u64, 1, 1),
-            MTLSize::new(1, 1, 1),
-        );
-
-        // 4. sigmoid_gate
-        if let Some(ref sig_pipe) = c.sigmoid_gate {
-            enc.set_compute_pipeline_state(sig_pipe);
-            enc.set_buffer(0, Some(&out_buf), 0);
-            enc.set_buffer(1, Some(&q_gate_buf), 0);
-            unsafe { set_u32(&enc, 2, q_dim as u32); }
-            enc.dispatch_thread_groups(
-                MTLSize::new(((q_dim + 255) / 256) as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        }
-
-        enc.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(out_buf.contents() as *const f32, attn_out.as_mut_ptr(), q_dim);
-        }
-
-        // CPU sigmoid fallback if GPU kernel not available
-        if c.sigmoid_gate.is_none() {
-            for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
-        }
-    } else {
-        // CPU fallback for scaled dot-product attention
+        let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
+        return Some(FullAttnCmd2State {
+            q_buf, q_gate_buf, kc_buf, vc_buf, scores_buf, out_buf, hidden_buf,
+            seq_len: seq_len as u32,
+            seq_stride: seq_stride as u32,
+            num_attn_heads: num_attn_heads as u32,
+            head_dim: head_dim as u32,
+            kv_dim: kv_dim as u32,
+            heads_per_kv: heads_per_kv as u32,
+            scale,
+            q_dim: q_dim as u32,
+            o_prefix,
+        });
+    }
+    // CPU fallback — no GPU attention available, do everything on CPU
+    {
+        let mut attn_out = vec![0.0f32; q_dim];
         for h in 0..num_attn_heads {
             let kv_h = h / heads_per_kv;
             let qh = &q[h * head_dim..];
@@ -467,24 +427,24 @@ pub fn full_attention_forward(
             }
         }
         for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
-    }
 
-    // o_proj
-    let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
-    let mut o_out = vec![0.0f32; hidden_dim];
-    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
-        let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
-        unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
-        let out_buf = metal_buf_shared(&c.device, hidden_dim * 4);
-        let cm = c.queue.new_command_buffer();
-        let enc = cm.new_compute_command_encoder();
-        gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &out_buf, 0, hidden_dim, q_dim);
-        enc.end_encoding(); cm.commit(); cm.wait_until_completed();
-        unsafe { std::ptr::copy_nonoverlapping(out_buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
+        // o_proj (separate CMD in CPU fallback path)
+        let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
+        if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+            let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
+            unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
+            let buf = metal_buf_shared(&c.device, hidden_dim * 4);
+            let cm = c.queue.new_command_buffer();
+            let enc = cm.new_compute_command_encoder();
+            gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &buf, 0, hidden_dim, q_dim);
+            enc.end_encoding(); cm.commit(); cm.wait_until_completed();
+            unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
+        }
     }
 
     // Residual add
     for i in 0..hidden_dim { hidden[i] += o_out[i]; }
+    None
 }
 
 // ─── Deferred expert results (CMD3 async dispatch) ─────────────────────────
@@ -597,7 +557,7 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = mode == PipelineMode::FusedExp
+    let use_fused_gpu = (mode == PipelineMode::FusedExp || mode == PipelineMode::Fused3)
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
@@ -911,14 +871,12 @@ pub fn linear_attention_forward(
 
 /// Run the full MoE block for a single layer: routing, shared expert, K routed experts, combine.
 ///
-/// Port of moe_forward from layer_forward.h:298-503.
+/// When `attn_state` is `Some`, fuses batched attention + o_proj + residual + norm + gate
+/// into a single CMD2 (matching the C engine's 3-CMD architecture).
+/// When `attn_state` is `None`, runs gate + shared projections in a separate CMD
+/// (compatible with linear attention layers that don't produce a FullAttnCmd2State).
 ///
-/// When `ctx` is provided, runs expert matvecs on GPU with async dispatch
-/// (CMD3 committed without waiting). The returned `DeferredExperts` must be
-/// completed before the next layer overwrites scratch buffers.
-///
-/// `prev_deferred` carries the async expert results from the previous layer.
-/// It is completed (waited + accumulated) at the start of this function.
+/// Returns `Some(DeferredExperts)` when GPU expert dispatch is used (async CMD3).
 pub fn moe_layer_forward(
     wf: &WeightFile,
     layer_idx: usize,
@@ -927,8 +885,8 @@ pub fn moe_layer_forward(
     ctx: Option<&MetalContext>,
     gpu_wf: Option<&GpuWeightCtx>,
     config: &ModelConfig,
-    _prev_deferred: &mut Option<DeferredExperts>,
     mode: PipelineMode,
+    attn_state: Option<FullAttnCmd2State>,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -942,18 +900,11 @@ pub fn moe_layer_forward(
         && ctx.is_some()
         && gpu_wf.is_some();
 
-    // Save h_mid (residual) — prev deferred already completed by caller
+    // Save h_mid (residual) — already completed by caller before this layer
     let h_mid = hidden.to_vec();
 
     let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
-    let pnw = wf.get_tensor_u16(&post_norm_name);
     let mut h_post = vec![0.0f32; hidden_dim];
-    if let Some(pnw) = pnw {
-        let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
-        cpu_rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
-    } else {
-        h_post.copy_from_slice(hidden);
-    }
 
     // ── Router gate + shared expert projections ──
     let mut gate_scores = vec![0.0f32; num_experts];
@@ -967,12 +918,27 @@ pub fn moe_layer_forward(
     let mut sg_buf_gpu: Option<Buffer> = None;
     let mut su_buf_gpu: Option<Buffer> = None;
 
-    // Router gate + shared expert projections: all independent (same input) → batch
-    if use_gpu {
-        let gw = gpu_wf.unwrap();
+    // ── CMD2 fusion path: batched attn + o_proj + residual + norm + gate ──
+    let use_cmd2_fusion = attn_state.is_some()
+        && use_gpu
+        && ctx.is_some()
+        && ctx.unwrap().attn_scores_batched.is_some()
+        && ctx.unwrap().attn_softmax_batched.is_some()
+        && ctx.unwrap().attn_values_batched.is_some()
+        && ctx.unwrap().sigmoid_gate.is_some()
+        && ctx.unwrap().residual_add.is_some()
+        && ctx.unwrap().rms_norm_apply_bf16.is_some();
+
+    if use_cmd2_fusion {
         let c = ctx.unwrap();
-        let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
-        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+        let gw = gpu_wf.unwrap();
+        let attn = attn_state.unwrap();
+
+        // Allocate intermediate buffers
+        let o_proj_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        let temp_buf = metal_buf_shared(&c.device, hidden_dim * 4);  // residual_add output
+        let sum_sq_buf = metal_buf_shared(&c.device, 4);
+        let normed_buf = metal_buf_shared(&c.device, hidden_dim * 4);
         let gate_buf = metal_buf_shared(&c.device, num_experts * 4);
         let sg_buf = metal_buf_shared(&c.device, shared_inter * 4);
         let su_buf = metal_buf_shared(&c.device, shared_inter * 4);
@@ -980,48 +946,214 @@ pub fn moe_layer_forward(
 
         let cmd_buf = c.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
-        gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", prefix), &x_buf, 0, &gate_buf, 0, num_experts, hidden_dim);
-        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", prefix), &x_buf, 0, &sg_buf, 0, shared_inter, hidden_dim);
-        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", prefix), &x_buf, 0, &su_buf, 0, shared_inter, hidden_dim);
-        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", prefix), &x_buf, 0, &sge_buf, 0, 1, hidden_dim);
+
+        // Step 1: attn_scores_batched
+        {
+            let pipe = c.attn_scores_batched.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&attn.q_buf), 0);
+            enc.set_buffer(1, Some(&attn.kc_buf), 0);
+            enc.set_buffer(2, Some(&attn.scores_buf), 0);
+            unsafe {
+                enc.set_bytes(3, 4, &attn.head_dim as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &attn.kv_dim as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &attn.seq_len as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &attn.seq_stride as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &attn.scale as *const f32 as *const c_void);
+                enc.set_bytes(8, 4, &attn.heads_per_kv as *const u32 as *const c_void);
+                enc.set_bytes(9, 4, &attn.seq_len as *const u32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new((attn.num_attn_heads * attn.seq_len) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 2: attn_softmax_batched
+        {
+            let pipe = c.attn_softmax_batched.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&attn.scores_buf), 0);
+            unsafe {
+                enc.set_bytes(1, 4, &attn.seq_len as *const u32 as *const c_void);
+                enc.set_bytes(2, 4, &attn.seq_stride as *const u32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(attn.num_attn_heads as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 3: attn_values_batched
+        {
+            let pipe = c.attn_values_batched.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&attn.scores_buf), 0);
+            enc.set_buffer(1, Some(&attn.vc_buf), 0);
+            enc.set_buffer(2, Some(&attn.out_buf), 0);
+            unsafe {
+                enc.set_bytes(3, 4, &attn.head_dim as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &attn.kv_dim as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &attn.seq_len as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &attn.seq_stride as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &attn.heads_per_kv as *const u32 as *const c_void);
+            }
+            let total_threads = attn.num_attn_heads * attn.head_dim;
+            enc.dispatch_thread_groups(
+                MTLSize::new(((total_threads + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 4: sigmoid_gate (attn_out *= sigmoid(q_gate))
+        {
+            let pipe = c.sigmoid_gate.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&attn.out_buf), 0);
+            enc.set_buffer(1, Some(&attn.q_gate_buf), 0);
+            unsafe { enc.set_bytes(2, 4, &attn.q_dim as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((attn.q_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 5: o_proj matvec (gated attention → hidden_dim)
+        gw.encode_matvec_into(wf, c, &enc, &attn.o_prefix, &attn.out_buf, 0, &o_proj_buf, 0, hidden_dim, attn.q_dim as usize);
+
+        // Step 6: residual_add (o_proj_out + h_mid → temp_buf)
+        {
+            let pipe = c.residual_add.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&o_proj_buf), 0);
+            enc.set_buffer(1, Some(&attn.hidden_buf), 0);
+            enc.set_buffer(2, Some(&temp_buf), 0);
+            unsafe { enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 7: post_attention_layernorm (rms_norm_sum + rms_norm_apply_bf16)
+        {
+            enc.set_compute_pipeline_state(&c.rms_norm_sum);
+            enc.set_buffer(0, Some(&temp_buf), 0);
+            enc.set_buffer(1, Some(&sum_sq_buf), 0);
+            unsafe { enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        {
+            let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&temp_buf), 0);
+            let pnw_ptr = wf.get_tensor_ptr(&post_norm_name).unwrap();
+            let pnw_off = (pnw_ptr as usize - gw.base as usize) as u64;
+            enc.set_buffer(1, Some(&gw.buf), pnw_off);
+            enc.set_buffer(2, Some(&sum_sq_buf), 0);
+            enc.set_buffer(3, Some(&normed_buf), 0);
+            unsafe {
+                enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 8-11: gate, shared_gate, shared_up, shared_expert_gate matvecs (on normed hidden)
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", prefix), &normed_buf, 0, &gate_buf, 0, num_experts, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", prefix), &normed_buf, 0, &sg_buf, 0, shared_inter, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", prefix), &normed_buf, 0, &su_buf, 0, shared_inter, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", prefix), &normed_buf, 0, &sge_buf, 0, 1, hidden_dim);
+
         enc.end_encoding();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
+        // Read back results
         unsafe {
             std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
             std::ptr::copy_nonoverlapping(sg_buf.contents() as *const f32, shared_gate.as_mut_ptr(), shared_inter);
             std::ptr::copy_nonoverlapping(su_buf.contents() as *const f32, shared_up.as_mut_ptr(), shared_inter);
-            let tmp = sge_buf.contents() as *const f32;
-            shared_gate_score = *tmp;
+            shared_gate_score = *(sge_buf.contents() as *const f32);
+            // Update hidden to post-normed value (h_post for expert input)
+            std::ptr::copy_nonoverlapping(normed_buf.contents() as *const f32, hidden.as_mut_ptr(), hidden_dim);
         }
+
+        // Keep shared gate/up on GPU for CMD3 SwiGLU
         sg_buf_gpu = Some(sg_buf);
         su_buf_gpu = Some(su_buf);
+
+        // h_post already set from normed_buf readback above (stored in hidden[])
+        h_post.copy_from_slice(hidden);
     } else {
-        // CPU fallback
-        if let (Some(gw_p), Some(gs), Some(gb)) = (
-            wf.get_tensor_u32(&format!("{}.gate.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.gate.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.gate.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(gw_p, gs, gb, &h_post, &mut gate_scores, num_experts, hidden_dim, GROUP_SIZE); }
-        if let (Some(sgw), Some(sgs), Some(sgb)) = (
-            wf.get_tensor_u32(&format!("{}.shared_expert.gate_proj.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(sgw, sgs, sgb, &h_post, &mut shared_gate, shared_inter, hidden_dim, GROUP_SIZE); }
-        if let (Some(suw), Some(sus), Some(sub)) = (
-            wf.get_tensor_u32(&format!("{}.shared_expert.up_proj.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(suw, sus, sub, &h_post, &mut shared_up, shared_inter, hidden_dim, GROUP_SIZE); }
-        if let (Some(segw), Some(segs), Some(segb)) = (
-            wf.get_tensor_u32(&format!("{}.shared_expert_gate.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert_gate.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.shared_expert_gate.biases", prefix)),
-        ) {
-            let mut tmp = [0.0f32];
-            cpu_dequant_matvec_4bit(segw, segs, segb, &h_post, &mut tmp, 1, hidden_dim, GROUP_SIZE);
-            shared_gate_score = tmp[0];
+        // ── Non-fused path: post-norm on CPU, router CMD separately ──
+        let pnw = wf.get_tensor_u16(&post_norm_name);
+        if let Some(pnw) = pnw {
+            let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
+            cpu_rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
+        } else {
+            h_post.copy_from_slice(hidden);
+        }
+
+        // Router gate + shared expert projections: all independent (same input) → batch
+        if use_gpu {
+            let gw = gpu_wf.unwrap();
+            let c = ctx.unwrap();
+            let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+            unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+            let gate_buf = metal_buf_shared(&c.device, num_experts * 4);
+            let sg_buf = metal_buf_shared(&c.device, shared_inter * 4);
+            let su_buf = metal_buf_shared(&c.device, shared_inter * 4);
+            let sge_buf = metal_buf_shared(&c.device, 4);
+
+            let cmd_buf = c.queue.new_command_buffer();
+            let enc = cmd_buf.new_compute_command_encoder();
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", prefix), &x_buf, 0, &gate_buf, 0, num_experts, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", prefix), &x_buf, 0, &sg_buf, 0, shared_inter, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", prefix), &x_buf, 0, &su_buf, 0, shared_inter, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", prefix), &x_buf, 0, &sge_buf, 0, 1, hidden_dim);
+            enc.end_encoding();
+            cmd_buf.commit();
+            cmd_buf.wait_until_completed();
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
+                std::ptr::copy_nonoverlapping(sg_buf.contents() as *const f32, shared_gate.as_mut_ptr(), shared_inter);
+                std::ptr::copy_nonoverlapping(su_buf.contents() as *const f32, shared_up.as_mut_ptr(), shared_inter);
+                let tmp = sge_buf.contents() as *const f32;
+                shared_gate_score = *tmp;
+            }
+            sg_buf_gpu = Some(sg_buf);
+            su_buf_gpu = Some(su_buf);
+        } else {
+            // CPU fallback
+            if let (Some(gw_p), Some(gs), Some(gb)) = (
+                wf.get_tensor_u32(&format!("{}.gate.weight", prefix)),
+                wf.get_tensor_u16(&format!("{}.gate.scales", prefix)),
+                wf.get_tensor_u16(&format!("{}.gate.biases", prefix)),
+            ) { cpu_dequant_matvec_4bit(gw_p, gs, gb, &h_post, &mut gate_scores, num_experts, hidden_dim, GROUP_SIZE); }
+            if let (Some(sgw), Some(sgs), Some(sgb)) = (
+                wf.get_tensor_u32(&format!("{}.shared_expert.gate_proj.weight", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.scales", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.biases", prefix)),
+            ) { cpu_dequant_matvec_4bit(sgw, sgs, sgb, &h_post, &mut shared_gate, shared_inter, hidden_dim, GROUP_SIZE); }
+            if let (Some(suw), Some(sus), Some(sub)) = (
+                wf.get_tensor_u32(&format!("{}.shared_expert.up_proj.weight", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.scales", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.biases", prefix)),
+            ) { cpu_dequant_matvec_4bit(suw, sus, sub, &h_post, &mut shared_up, shared_inter, hidden_dim, GROUP_SIZE); }
+            if let (Some(segw), Some(segs), Some(segb)) = (
+                wf.get_tensor_u32(&format!("{}.shared_expert_gate.weight", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert_gate.scales", prefix)),
+                wf.get_tensor_u16(&format!("{}.shared_expert_gate.biases", prefix)),
+            ) {
+                let mut tmp = [0.0f32];
+                cpu_dequant_matvec_4bit(segw, segs, segb, &h_post, &mut tmp, 1, hidden_dim, GROUP_SIZE);
+                shared_gate_score = tmp[0];
+            }
         }
     }
 
