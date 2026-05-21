@@ -489,31 +489,56 @@ pub fn full_attention_forward(
 
 // ─── Deferred expert results (CMD3 async dispatch) ─────────────────────────
 
-/// Holds deferred expert results (for future async CMD3 dispatch).
-/// Currently always empty — expert dispatch is synchronous.
-/// Port of FlashMoE_DeferredExperts from layer_forward.h.
+/// Holds a committed but not-yet-completed CMD3 (expert forward + GPU combine).
+///
+/// In Fused3 mode, CMD3 is committed without `wait_until_completed()`, then
+/// results are collected at the start of the *next* layer — overlapping GPU work.
 pub struct DeferredExperts {
-    _placeholder: (),
+    /// Committed command buffer (CMD3). Wait on next layer.
+    cmd_buf: Option<metal::CommandBuffer>,
+    /// moe_combine_residual output — final hidden state for this layer.
+    out_buf: Option<metal::Buffer>,
+    /// All intermediate GPU buffers kept alive until CMD completes.
+    _keep_alive: Vec<metal::Buffer>,
 }
 
 impl DeferredExperts {
     pub fn new() -> Self {
-        DeferredExperts { _placeholder: () }
+        DeferredExperts {
+            cmd_buf: None,
+            out_buf: None,
+            _keep_alive: Vec::new(),
+        }
     }
 
     pub fn is_active(&self) -> bool {
-        false
+        self.cmd_buf.is_some()
     }
 
-    /// Complete deferred experts: wait for GPU, read back, accumulate, combine.
-    /// Currently a no-op since experts are dispatched synchronously.
-    pub fn complete(&mut self, _hidden: &mut [f32], _hidden_dim: usize) {
-        // No-op: sync dispatch doesn't need deferred completion
+    /// Complete deferred CMD3: wait for GPU, copy result into hidden.
+    pub fn complete(&mut self, hidden: &mut [f32], hidden_dim: usize) {
+        if let Some(ref cmd_buf) = self.cmd_buf {
+            cmd_buf.wait_until_completed();
+        }
+        if let Some(ref out_buf) = self.out_buf {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_buf.contents() as *const f32,
+                    hidden.as_mut_ptr(),
+                    hidden_dim,
+                );
+            }
+        }
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
     }
 
     /// Discard deferred results without CPU readback.
     pub fn discard(&mut self) {
-        // No-op
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
     }
 }
 
@@ -938,6 +963,10 @@ pub fn moe_layer_forward(
 
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
+    // GPU buffers (preserved for expert dispatch combine)
+    let mut sg_buf_gpu: Option<Buffer> = None;
+    let mut su_buf_gpu: Option<Buffer> = None;
+
     // Router gate + shared expert projections: all independent (same input) → batch
     if use_gpu {
         let gw = gpu_wf.unwrap();
@@ -966,6 +995,8 @@ pub fn moe_layer_forward(
             let tmp = sge_buf.contents() as *const f32;
             shared_gate_score = *tmp;
         }
+        sg_buf_gpu = Some(sg_buf);
+        su_buf_gpu = Some(su_buf);
     } else {
         // CPU fallback
         if let (Some(gw_p), Some(gs), Some(gb)) = (
@@ -1007,7 +1038,7 @@ pub fn moe_layer_forward(
 
     if use_gpu {
         let ctx = ctx.unwrap();
-        // GPU path — batch all experts in one command buffer
+        let gw = gpu_wf.unwrap();
         let k = expert_indices.len();
 
         // Pre-read all experts into separate buffers
@@ -1024,32 +1055,39 @@ pub fn moe_layer_forward(
             }
         }
 
-        if expert_bufs.is_empty() {
-            // fall through to CPU
-        } else {
+        if !expert_bufs.is_empty() {
             let hidden_u32 = hidden_dim as u32;
             let inter_u32 = moe_inter as u32;
             let gs_u32 = GROUP_SIZE as u32;
 
-            // Upload h_post once
+            // Upload h_post once (reused by all experts)
             let x_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
             unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
 
-            // Reusable intermediate buffers
+            // Scratch buffers (reused across experts)
             let gate_out = metal_buf_shared(&ctx.device, moe_inter * 4);
             let up_out = metal_buf_shared(&ctx.device, moe_inter * 4);
             let act_out = metal_buf_shared(&ctx.device, moe_inter * 4);
-            // Separate output buffers per expert (read on CPU after commit)
+
+            // Per-expert output buffers (read by moe_combine_residual)
             let mut out_bufs: Vec<Buffer> = Vec::with_capacity(expert_bufs.len());
             for _ in 0..expert_bufs.len() {
                 out_bufs.push(metal_buf_shared(&ctx.device, hidden_dim * 4));
             }
 
+            // Shared expert intermediate + output (on GPU)
+            let shared_act_gpu = metal_buf_shared(&ctx.device, shared_inter * 4);
+            let shared_down_gpu = metal_buf_shared(&ctx.device, hidden_dim * 4);
+
+            // h_mid on GPU for moe_combine_residual
+            let hmid_gpu = metal_buf_shared(&ctx.device, hidden_dim * 4);
+            unsafe { let dst = hmid_gpu.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_mid.as_ptr(), dst, hidden_dim); }
+
+            // ── FUSED CMD: K experts + shared SwiGLU + shared down_proj + moe_combine_residual ──
             let cmd_buf = ctx.queue.new_command_buffer();
             let enc = cmd_buf.new_compute_command_encoder();
 
             for (ei, expert_buf) in expert_bufs.iter().enumerate() {
-                // gate_proj
                 kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.gate_w_off as u64,
                     expert_buf, layout.gate_s_off as u64,
@@ -1057,7 +1095,6 @@ pub fn moe_layer_forward(
                     &x_buf, 0, &gate_out, 0,
                     inter_u32, hidden_u32, gs_u32, 3);
 
-                // up_proj
                 kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.up_w_off as u64,
                     expert_buf, layout.up_s_off as u64,
@@ -1065,10 +1102,8 @@ pub fn moe_layer_forward(
                     &x_buf, 0, &up_out, 0,
                     inter_u32, hidden_u32, gs_u32, 3);
 
-                // SwiGLU
                 kernels::encode_swiglu(ctx, &enc, &gate_out, 0, &up_out, 0, &act_out, 0, inter_u32);
 
-                // down_proj → separate output
                 kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.down_w_off as u64,
                     expert_buf, layout.down_s_off as u64,
@@ -1076,22 +1111,76 @@ pub fn moe_layer_forward(
                     &act_out, 0, &out_bufs[ei], 0,
                     hidden_u32, inter_u32, gs_u32, 3);
             }
-            enc.end_encoding();
-            cmd_buf.commit();
-            cmd_buf.wait_until_completed();
 
-            // Accumulate on CPU
-            for (ei, (out_buf, &ew)) in out_bufs.iter().zip(expert_weights.iter()).enumerate() {
-                if ei >= expert_bufs.len() { break; }
-                unsafe {
-                    let eout = out_buf.contents() as *const f32;
-                    for d in 0..hidden_dim {
-                        moe_out[d] += (*eout.add(d)) * ew;
+            // Shared expert SwiGLU on GPU (sg_buf, su_buf already on GPU from router CMD)
+            if let (Some(ref sg), Some(ref su)) = (sg_buf_gpu.as_ref(), su_buf_gpu.as_ref()) {
+                kernels::encode_swiglu(ctx, &enc, sg, 0, su, 0, &shared_act_gpu, 0, shared_inter as u32);
+            }
+
+            // Shared expert down_proj
+            gw.encode_matvec_into(wf, ctx, &enc,
+                &format!("{}.shared_expert.down_proj", prefix),
+                &shared_act_gpu, 0, &shared_down_gpu, 0, hidden_dim, shared_inter);
+
+            // ── moe_combine_residual: hidden = h_mid + Σ(w_i * expert_out_i) + sigmoid(gate) * shared_out ──
+            let hidden_out = metal_buf_shared(&ctx.device, hidden_dim * 4);
+            let params_buf = metal_buf_shared(&ctx.device, 40);
+            {
+                let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
+                enc.set_compute_pipeline_state(mcr_pipe);
+                enc.set_buffer(0, Some(&hmid_gpu), 0);
+                enc.set_buffer(1, Some(&shared_down_gpu), 0);
+                enc.set_buffer(2, Some(&hidden_out), 0);
+                for ei in 0..8 {
+                    if ei < out_bufs.len() {
+                        enc.set_buffer(3 + ei as u64, Some(&out_bufs[ei]), 0);
+                    } else {
+                        enc.set_buffer(3 + ei as u64, Some(&hidden_out), 0);
                     }
                 }
+                let mut params = [0.0f32; 10];
+                for (i, &w) in expert_weights.iter().enumerate() { params[i] = w; }
+                params[8] = shared_gate_score;
+                unsafe { std::ptr::copy_nonoverlapping(params.as_ptr(), params_buf.contents() as *mut f32, 10); }
+                enc.set_buffer(11, Some(&params_buf), 0);
+                unsafe {
+                    let p: *const u32 = &hidden_u32;
+                    enc.set_bytes(12, 4, p as *const c_void);
+                    let ku = k as u32;
+                    enc.set_bytes(13, 4, &ku as *const u32 as *const c_void);
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
+
+            enc.end_encoding();
+            cmd_buf.commit();  // NO wait — async dispatch
+
+            // Collect all GPU buffers that must stay alive until CMD completes
+            let mut keep_alive = Vec::with_capacity(16);
+            keep_alive.push(hmid_gpu);
+            keep_alive.push(shared_act_gpu);
+            keep_alive.push(shared_down_gpu);
+            keep_alive.push(params_buf);
+            keep_alive.push(x_buf);
+            keep_alive.push(gate_out);
+            keep_alive.push(up_out);
+            keep_alive.push(act_out);
+            // Keep shared gate/up from router CMD (used in this CMD)
+            if let Some(b) = sg_buf_gpu.take() { keep_alive.push(b); }
+            if let Some(b) = su_buf_gpu.take() { keep_alive.push(b); }
+            keep_alive.extend(expert_bufs);   // SSD-read expert data
+            keep_alive.extend(out_bufs);       // per-expert outputs
+
+            return Ok(Some(DeferredExperts {
+                cmd_buf: Some(cmd_buf.to_owned()),
+                out_buf: Some(hidden_out),
+                _keep_alive: keep_alive,
+            }));
         }
-        // No experts loaded successfully — fall through to CPU below
+        // No experts loaded — fall through to CPU below
     }
 
     let gpu_done = !moe_out.iter().all(|&v| v == 0.0);

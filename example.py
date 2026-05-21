@@ -43,7 +43,7 @@ def main():
     print(f"[example] Loading model...")
     t0 = time.time()
     ctx = Context()
-    ctx.load_model(MODEL_PATH, pipeline_mode="Fused3")
+    ctx.load_model(MODEL_PATH, pipeline_mode="FusedExp")
     cache = ctx.new_cache()
     print(f"[example] Model loaded in {(time.time() - t0) * 1000:.0f} ms")
 

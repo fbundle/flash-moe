@@ -7,11 +7,9 @@ Supports both `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35
 ## Quick Start (Python)
 
 ```bash
-# Build Rust + Python bindings
+# Build Rust + Python bindings # Run the example
 cd moe_infer_rs
 maturin develop --release --features python-bindings
-
-# Run the example
 cd ..
 python example.py
 ```
@@ -91,8 +89,8 @@ import numpy as np
 
 ctx = Context()
 
-# Load model (pipeline_mode: "CpuOnly", "Gpu", "Fused2", "Fused3")
-ctx.load_model("/path/to/model", pipeline_mode="Fused3")
+# Load model (pipeline_mode: "CpuOnly", "Gpu", "FusedExp")
+ctx.load_model("/path/to/model", pipeline_mode="FusedExp")
 
 # Create cache (holds KV cache + linear attention states)
 cache = ctx.new_cache()
@@ -132,7 +130,7 @@ ctx.unload_model()
 
 2. **Metal Compute Shaders** — 4-bit dequantized matvec, fused SwiGLU, RMS norm, batched attention, GPU RoPE, MoE combine + residual.
 
-3. **Fused GPU Pipeline** — CMD1 (qkv/z/b/a + conv1d + SSM for linear attention), CMD2 (o_proj + residual + norm + gate), CMD3 (expert dispatch). Three sequential Metal dispatches per layer.
+3. **Fused GPU Pipeline** — FusedExp mode fuses linear attention (qkv/z/b/a + conv1d + SSM) into a single CMD1. MoE experts are dispatched individually with GPU dequant. Fused3 (full C pipeline with async CMD3 + GPU combine) is planned but not yet implemented.
 
 4. **FMA-Optimized Dequant** — Rearranges `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`, using GPU fused multiply-add in one instruction.
 

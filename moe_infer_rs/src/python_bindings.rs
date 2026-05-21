@@ -167,6 +167,10 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         if layer % 4 == 0 {
             py.check_signals()?;
         }
+        // Complete previous layer's async MoE → writes previous layer's output to hidden
+        if let Some(ref mut def) = deferred.take() {
+            def.complete(hidden, m.config.hidden_dim);
+        }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         if is_full {
             if let Some(ref mut kv) = kv[layer] {
@@ -188,6 +192,7 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         );
         deferred = r.unwrap_or(None);
     }
+    // Complete last layer's deferred
     if let Some(ref mut def) = deferred {
         def.complete(hidden, m.config.hidden_dim);
     }
@@ -306,15 +311,17 @@ impl Context {
     }
 
     /// Load a model. Must be called before forward/generate.
-    #[pyo3(signature = (model_path, pipeline_mode="Fused3"))]
+    #[pyo3(signature = (model_path, pipeline_mode="FusedExp"))]
     fn load_model(&mut self, model_path: &str, pipeline_mode: &str) -> PyResult<()> {
         let mode = match pipeline_mode {
             "CpuOnly" => PipelineMode::CpuOnly,
             "Gpu" => PipelineMode::Gpu,
-            "Fused2" => PipelineMode::Fused2,
-            "Fused3" => PipelineMode::Fused3,
+            "FusedExp" => PipelineMode::FusedExp,
+            "Fused3" => return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "Fused3 is not yet implemented. Use FusedExp (current experimental fused path) instead."
+            )),
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown pipeline_mode: {}. Use CpuOnly|Gpu|Fused2|Fused3", pipeline_mode)
+                format!("Unknown pipeline_mode: {}. Use CpuOnly|Gpu|FusedExp", pipeline_mode)
             )),
         };
         let ms = ModelState::load(model_path, mode)?;
