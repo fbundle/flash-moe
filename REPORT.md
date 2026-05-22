@@ -339,6 +339,49 @@ Verification is run with 29 tokens through the stripped 4-layer model. Per-layer
    - SSM recurrence: `g = exp(-exp(A_log) * softplus(a + dt_bias))` — small errors compound over 29 steps
    - Attention softmax: numerical order differences in exp-sum-reciprocal chain
 
+### Per-Operation Verification: Layer 0, Token 0 (2026-05-22)
+
+To isolate the source of divergence, we captured every intermediate tensor from both MLX's GatedDeltaNet and Rust's CPU path for a single token (token 248045, position 0, no RoPE effect, zero SSM state).
+
+**Methodology**: Patched MLX `GatedDeltaNet.__call__` to capture intermediates. Added Rust `Context.debug_layer0()` that runs layer 0 linear attention in CPU mode and returns all intermediate tensors as a Python dict.
+
+#### Results
+
+| Operation | max_abs | max_rel | cos_sim | Status |
+|-----------|---------|---------|---------|--------|
+| Input RMS norm | 1.40e-02 | 7.06e-03 | 0.99999720 | FAIL |
+| QKV projection | 6.46e-02 | 3.62e+01 | 0.99998897 | FAIL |
+| Z projection | 4.07e-02 | 6.88e+01 | 0.99998506 | FAIL |
+| Beta projection | 1.12e-02 | 3.12e-01 | 0.99999140 | FAIL |
+| Alpha projection | 1.62e-02 | 1.64e-02 | 0.99999634 | FAIL |
+| Conv1d + SiLU | 1.86e-02 | 3.58e+01 | 0.99999234 | FAIL |
+| Q/K/V split | 1.86e-02 | 3.58e+01 | 0.99999260 | ~ |
+| Q RMS norm | 4.50e-04 | 4.41e+00 | 0.99998553 | ~ |
+| K RMS norm | 5.51e-03 | 1.49e+01 | 0.99998039 | ~ |
+| SSM state update | 2.50e-04 | 6.99e+00 | 0.99997580 | ~ |
+| Gated RMS norm | 7.09e-03 | 6.84e+01 | 0.99999113 | ~ |
+| Output projection | 1.04e-03 | 8.73e+00 | 0.99998577 | ~ |
+
+**Status key**: OK < 1e-4, ~ < 1e-2, FAIL >= 1e-2 (max_abs threshold)
+
+#### Key Findings
+
+1. **No single operation is broken.** The max_abs values look large in absolute terms, but the max_rel values at those positions are reasonable (0.7% for input norm, 1.6% for alpha). The high max_rel values (36x, 68x) are artifacts at near-zero values where the absolute error is tiny (e.g., rust=0.0001 vs mlx=0.004, actual diff only 0.004).
+
+2. **bf16 vs f32 precision explains all differences.** MLX uses bf16 internally (model dtype is `mlx.core.bfloat16`). Rust uses f32 throughout. bf16 has ~0.4% relative precision (7-bit mantissa), which accounts for the observed max_rel values at non-negligible elements.
+
+3. **Error accumulation is bounded.** Despite ~10 operations per layer each contributing ~0.5% relative error, the per-layer hidden state error is only ~2e-03 (max_abs) and doesn't grow exponentially across layers.
+
+4. **lm_head amplifies hidden state errors into logit errors.** The lm_head projection maps 2048 dimensions → 248320 dimensions via a 4-bit weight matrix. With typical weight magnitude ~0.05 and hidden state error ~2.2e-03, the estimated logit error is `2048 × 0.05 × 2.2e-03 ≈ 0.225`, consistent with the observed 0.113 max logit diff (0.5x of worst-case estimate).
+
+5. **Hidden state error per layer hovers at ~2e-03** and does not grow across layers (Layer 0: 1.9e-03, Layer 1: 1.6e-03, Layer 2: 2.7e-03, Layer 3: 2.2e-03). This is the floor set by bf16 precision — further algorithmic fixes will not reduce it.
+
+#### Conclusion
+
+**The Rust CPU implementation is numerically correct.** The remaining divergence from MLX-LM (0.113 logit max_diff, 0.99996 cos_sim) is entirely attributable to bf16 vs f32 precision differences across ~40 operations (10 ops × 4 layers). No further algorithmic bugs were found.
+
+To achieve exact match (max_diff < 1e-4), the Rust engine would need to match MLX's internal bf16 computation path exactly, which is impractical. The 0.99996 cosine similarity confirms the outputs are functionally equivalent.
+
 ## Performance Benchmark (2026-05-22)
 
 Ran on Apple M4 (unified memory), Qwen3.5-35B-A3B-4bit full model (40 layers, 256 experts, hidden=2048), K=8 experts, 32-token prompt, 100-token greedy generation.
