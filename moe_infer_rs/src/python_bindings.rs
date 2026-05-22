@@ -7,9 +7,9 @@ use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use crate::engine::{
-    Cache as CoreCache, Engine as EngineTrait, Model as CoreModel,
-};
+use crate::cache::Cache as CoreCache;
+use crate::engine::Engine as EngineTrait;
+use crate::model::Model as CoreModel;
 use crate::engine_cpu::EngineCPU;
 use crate::engine_fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
 use crate::engine_fusedwoods::EngineFusedWoods;

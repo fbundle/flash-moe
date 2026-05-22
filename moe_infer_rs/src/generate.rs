@@ -2,7 +2,8 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::engine::{Cache, Engine};
+use crate::cache::Cache;
+use crate::engine::Engine;
 use crate::math::sample;
 
 // ─── Telemetry ──────────────────────────────────────────────────────────────

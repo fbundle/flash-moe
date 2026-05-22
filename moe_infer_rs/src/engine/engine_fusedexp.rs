@@ -17,7 +17,9 @@ use metal::{Buffer, ComputeCommandEncoderRef};
 use crate::metal_kernels;
 use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
-use crate::engine::{Cache, Engine, FullAttnCache, LinearAttnState, Model};
+use crate::cache::{Cache, FullAttnCache, LinearAttnState};
+use crate::engine::Engine;
+use crate::model::Model;
 use crate::metal_context::ExpertBuffer;
 use crate::math::{
     bf16_to_f32, normalize_weights, softmax, topk,

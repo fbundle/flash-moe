@@ -1,17 +1,19 @@
-mod model_config;
+#[path = "model/model.rs"] mod model;
+#[path = "model/model_config.rs"] mod model_config;
+#[path = "model/model_weights.rs"] mod model_weights;
+mod cache;
 mod constants;
-pub mod engine;
+#[path = "engine/engine.rs"] pub mod engine;
+#[path = "engine/engine_cpu.rs"] mod engine_cpu;
+#[path = "engine/engine_gpu.rs"] mod engine_gpu;
+#[path = "engine/engine_fusedexp.rs"] mod engine_fusedexp;
+#[path = "engine/engine_fusedwoods.rs"] mod engine_fusedwoods;
 mod error;
-mod engine_gpu;
 mod metal_kernels;
 mod metal_context;
-mod math;
-mod engine_cpu;
-mod engine_fusedwoods;
-mod engine_fusedexp;
+#[path = "math/math.rs"] mod math;
 mod generate;
 mod timer;
-mod model_weights;
 
 #[cfg(feature = "python-bindings")]
 mod python_bindings;

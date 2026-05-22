@@ -4,7 +4,9 @@
 /// add entirely on CPU. Used when GPU fused pipelines are unavailable or when mode
 /// is CpuOnly.
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
-use crate::engine::{Cache, Engine, LinearAttnState, Model};
+use crate::cache::{Cache, LinearAttnState};
+use crate::engine::Engine;
+use crate::model::Model;
 use crate::math::{
     bf16_to_f32, conv1d_step, dequant_matvec_4bit,
     embed_lookup, final_norm, full_attention_forward, lm_head,

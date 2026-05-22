@@ -161,7 +161,6 @@ pub fn load_model_config(model_path: &Path) -> anyhow::Result<ModelConfig> {
     let hf: HfConfig = serde_json::from_str(&content)?;
 
     let tc = hf.text_config.as_ref().unwrap_or_else(|| {
-        // If no text_config key, try parsing the whole file as text config
         panic!("config.json missing text_config; multimodal wrapper expected")
     });
 

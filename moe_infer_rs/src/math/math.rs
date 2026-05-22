@@ -8,7 +8,7 @@ use rand::Rng;
 use crate::constants::{
     CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
 };
-use crate::engine::{FullAttnCache, LinearAttnState};
+use crate::cache::{FullAttnCache, LinearAttnState};
 use crate::error::MoEError;
 use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, ExpertBuffer, GpuWeightCtx, MetalContext, MAX_K};
