@@ -196,7 +196,39 @@ All verification uses the stripped model (4 layers, 4 experts) to enable fast it
 
 ### C vs Rust FusedWoods (Stripped Model)
 
-C and Rust FusedWoods are numerically identical (max_diff < 1e-5, 100% within 1e-3). The C→Rust port is faithful.
+C and Rust FusedWoods are numerically identical (max_diff < 1e-5, 100% within 1e-3). The C→Rust port is faithful at the algorithmic level. However, C retains several performance optimizations that Rust does not yet implement.
+
+#### Architecture (Identical)
+
+Both engines implement the same 3-command-buffer pipeline per layer:
+
+- **CMD1**: Attention projections (QKV/Z/B/A or Q/K/V) + conv1d (linear) + Q/K RMS norms + SSM/decay-beta + gated RMS norm. For linear attention with GPU path, all 6 encoders run in one command buffer; the gated output lands in `batch_out[6]` for CMD2.
+- **CMD2**: out_proj/o_proj + residual_add + rms_norm + gate + shared_expert projections — fused into a single command buffer. For full-attention layers at seq_len ≥ 32 (C only), attention dispatches (scores, softmax, values, sigmoid gate) are prepended.
+- **CMD3** (async, deferred commit): K expert gate/up + SwiGLU + down + shared SwiGLU + down + moe_combine_residual + GPU-side input_norm for next layer. The `DeferredExperts` struct (Rust) mirrors C's `g_deferred` state; the next layer's CMD1 submits immediately after CMD3 commit, with the GPU queue serializing CMD3(N-1) then CMD1(N).
+
+Both also share the GPU-side input_norm optimization: CMD3 computes RMS norm of the combined output into `buf_input`, so the next layer skips the CPU upload of normed hidden state. Both also have equivalent LRU expert caches (C has two: `expert_cache` MTLBuffer-based and `malloc_cache`; Rust has one via `ExpertIOState`).
+
+#### Performance Differences (C advantages)
+
+1. **Expert prediction** (C only). During CMD1 wait, C predicts the next layer's experts (based on the previous token's routing) and starts async `pread()` into `buf_multi_expert_data_B`. By the time CMD3 runs, if prediction was correct (experts often repeat between consecutive tokens), the I/O is already done. Rust has no prediction infrastructure — every layer always pays the full pread latency in CMD3.
+
+2. **LZ4-compressed experts** (C only). C can read from `packed_experts_lz4/` and decompress inline via the I/O pool. Rust only reads uncompressed expert files. For 4-bit experts (~1.77 MB each), LZ4 compression reduces SSD bandwidth by roughly 30-50%. This is gated by `--lz4` flag in C.
+
+3. **2-bit quantization** (C only). C supports 2-bit expert weights (`--2bit` flag) via `matvec_2bit` kernel, with `packed_experts_2bit/` files. Expert size drops from ~1.77 MB to ~1.44 MB at the cost of ~4% relative logit error (pilot experiments). Rust has no 2-bit code path.
+
+4. **Persistent I/O thread pool**. C uses a pre-spawned `io_pool` of `NUM_IO_THREADS` pthreads coordinated via cond_wait/cond_broadcast. Tasks are dispatched synchronously (`io_pool_dispatch` blocks until all threads report completion). For async I/O, C uses GCD `dispatch_group_async`. Rust uses `rayon::scope()` which spawns threads per invocation. On macOS, GCD may have lower wake-up latency due to kernel integration.
+
+5. **Full attention GPU gating**. C uses batched GPU attention only when `seq_len >= 32` — below 32 tokens, CPU attention is faster because GPU encoder overhead dominates. Rust unconditionally uses GPU attention if pipelines are available, which may be slower for very short sequences.
+
+6. **CPU BLAS acceleration**. C's CPU fallback uses Apple Accelerate (`cblas_sgemv`, `cblas_sger`, `cblas_sscal`) for the linear attention SSM state update. Rust's CPU path uses hand-written loops in `quant.rs`. Accelerate BLAS is highly optimized for Apple Silicon and can be 2-5× faster for the SSM matvec operations.
+
+7. **Per-phase timing telemetry**. C has fine-grained per-phase timing (`cmd1_submit`, `cmd1_wait`, `cpu_attn`, `cmd2_encode`, `cmd2_wait`, `expert_io`, `cmd3_encode`, `deferred_wait`, `deferred_cpu`, `spec_route`, `pred_read`, `routing_io`). Rust's `ctx.telemetry()` only reports `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec`. Adding per-phase timing would help identify where Rust is slower.
+
+8. **Expert dispatch encoding pattern**. C creates 2 separate compute encoders per expert (gate+up in one, SwiGLU+down in another), which may allow the Metal driver to schedule gate/up of expert 1 concurrently with SwiGLU/down of expert 0. Rust puts all K experts in a single encoder (4 dispatches each), serializing all expert work within CMD3.
+
+9. **Shared expert gate/up on GPU**. In C, `shared_gate` and `shared_up` results from CMD2 remain on GPU (`buf_shared_gate`, `buf_shared_up`) — SwiGLU reads them directly in CMD3. Rust reads them back to CPU from CMD2 (`sg_buf_gpu`, `su_buf_gpu`) then re-passes them to CMD3 via `keep_alive`. Both avoid a CPU→GPU re-upload, but C's approach is cleaner.
+
+10. **`h_mid` handling in CMD3 combine**. C reads `h_mid` from `buf_h_mid` (populated by CMD2's `residual_add` kernel) — no CPU round-trip. Rust reads `h_mid` from CMD2's `temp_buf` via `hmid_gpu_override`, also avoiding the CPU round-trip. Both are equivalent.
 
 ## Key Design Decisions
 
