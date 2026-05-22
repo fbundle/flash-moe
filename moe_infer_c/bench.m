@@ -70,14 +70,20 @@
 // ============================================================================
 
 #define HIDDEN_DIM          2048
+#ifndef NUM_LAYERS
 #define NUM_LAYERS          40
+#endif
 #define NUM_ATTN_HEADS      16
 #define NUM_KV_HEADS        2
 #define HEAD_DIM            256
 #define VOCAB_SIZE          248320
 #define RMS_NORM_EPS        1e-6f
+#ifndef NUM_EXPERTS
 #define NUM_EXPERTS         256
+#endif
+#ifndef NUM_EXPERTS_PER_TOK
 #define NUM_EXPERTS_PER_TOK 8
+#endif
 #define MOE_INTERMEDIATE    512
 #define SHARED_INTERMEDIATE 512
 #define FULL_ATTN_INTERVAL  4
@@ -553,6 +559,16 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
 
     printf("[weights] mmap'd %.2f GB from %s\n", size / 1e9, bin_path);
     return wf;
+}
+
+static void close_weights(WeightFile *wf) {
+    if (!wf) return;
+    if (wf->data) munmap(wf->data, wf->size);
+    if (wf->manifest) {
+        free(wf->manifest->tensors);
+        free(wf->manifest);
+    }
+    free(wf);
 }
 
 static void *get_tensor_ptr(WeightFile *wf, const char *name) {
@@ -6503,6 +6519,8 @@ static void print_usage(const char *prog) {
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --verify             Verify mode: run prefill and output logits\n");
+    printf("  --verify-output PATH Write binary f32 logits to PATH (use with --verify)\n");
     printf("  --help               This message\n");
 }
 
@@ -6519,6 +6537,8 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int verify_mode = 0;  // 0 = normal, 1 = output logits and exit
+        const char *verify_output = NULL;  // path for binary logit output
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -6543,11 +6563,13 @@ int main(int argc, char **argv) {
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
             {"help",          no_argument,       0, 'h'},
+            {"verify",        no_argument,       0, 'V'},
+            {"verify-output", required_argument, 0, 'Q'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GQ:Vh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6576,6 +6598,8 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 'V': verify_mode = 1; break;
+                case 'Q': verify_output = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -6960,6 +6984,37 @@ int main(int argc, char **argv) {
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
         double lm_ms = now_ms() - t_lm;
+
+        // ---- Verify mode: dump logits and exit ----
+        if (verify_mode && verify_output) {
+            FILE *vf = fopen(verify_output, "wb");
+            if (vf) {
+                fwrite(logits, sizeof(float), VOCAB_SIZE, vf);
+                fclose(vf);
+                fprintf(stderr, "[verify] Wrote %d logits (%.1f KB) to %s\n",
+                        VOCAB_SIZE, (double)(VOCAB_SIZE * sizeof(float)) / 1024.0, verify_output);
+            } else {
+                fprintf(stderr, "[verify] ERROR: cannot open %s for writing\n", verify_output);
+            }
+            // Cleanup
+            for (int i = 0; i < NUM_LAYERS; i++) {
+                if (kv_caches[i]) kv_cache_free(kv_caches[i]);
+                if (layer_states[i]) linear_attn_state_free(layer_states[i]);
+                if (layer_mmaps[i] != MAP_FAILED) munmap(layer_mmaps[i], layer_mmap_sizes[i]);
+                if (layer_fds[i] >= 0) close(layer_fds[i]);
+                if (layer_fds_cold[i] >= 0) close(layer_fds_cold[i]);
+            }
+            free(layer_states);
+            free(kv_caches);
+            free(hidden);
+            free(logits);
+            close_weights(wf);
+            if (embed_batch) free(embed_batch);
+            io_pool_shutdown();
+            if (g_malloc_cache) { malloc_cache_free(g_malloc_cache); g_malloc_cache = NULL; }
+            if (g_expert_cache) { expert_cache_free(g_expert_cache); g_expert_cache = NULL; }
+            return 0;
+        }
 
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, VOCAB_SIZE);

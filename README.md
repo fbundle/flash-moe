@@ -190,8 +190,6 @@ helpers/                Model conversion scripts
   gen_model_config.py   Config generation
   export_tokenizer.py   Tokenizer export (C path)
 
-diagnose_ops.py         Per-operation Rust vs MLX comparison
-diagnose_per_layer.py   Per-layer hidden state comparison
 verify_nway.py          Multi-engine logit verification
 ```
 

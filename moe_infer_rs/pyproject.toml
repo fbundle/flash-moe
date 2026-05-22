@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.0"]
+build-backend = "maturin"
+
+[project]
+name = "moe_infer"
+version = "0.1.0"
+description = "MoE-Infer: High-performance MoE inference engine for Apple Silicon"
+requires-python = ">=3.8"
+
+[tool.maturin]
+features = ["python-bindings"]
