@@ -1,177 +1,198 @@
-# Flash-MoE
+# MoE-Infer
 
-Pure C/Metal and Rust/Metal inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python ML frameworks, just C, Rust, and hand-tuned Metal shaders.
+High-performance inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python ML frameworks at runtime, just Rust and hand-tuned Metal shaders.
 
-Supports both `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
+Supports `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
 
-## Quick Start (Python)
+## Hardware Requirements
 
-```bash
-# Build Rust + Python bindings # Run the example
-cd moe_infer_rs
-maturin develop --release --features python-bindings
-cd ..
-python example.py
-```
+- Mac with Apple Silicon (M1/M2/M3/M4)
+- ~20 GB free SSD space for model weights
+- macOS 14+ (for Metal 3)
 
-## Rust Build
+## Quick Start
 
-### Prerequisites
-
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Rust toolchain (via [rustup](https://rustup.rs))
-- Xcode Command Line Tools (for Metal framework)
-
-### Prepare model data
+### 1. Download and convert the model
 
 ```bash
-# Download model into hub/
+# Download from HuggingFace
 pip install huggingface_hub
-hf download mlx-community/Qwen3.5-35B-A3B-4bit \
+huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
   --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 
-# Convert to Flash-MoE format → data/
-python helpers/convert.py \
+# Convert to MoE-Infer format
+python helpers/extract_weights.py \
   --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --output data
+  --output hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+
+python helpers/repack_experts_4bit.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+
+python helpers/gen_model_config.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
-### Build and run
-
-```bash
-# Benchmark binary (pure Rust, no Python)
-cd moe_infer_rs
-cargo run --release --bin bench -- \
-  --model ../data/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --tokens 500
-```
-
-### Python bindings
+### 2. Build and install Python bindings
 
 ```bash
 cd moe_infer_rs
-
-# Build and install into current Python environment
 maturin develop --release --features python-bindings
-
-# Python usage
-python -c "
-from moe_infer import Context, Cache
-ctx = Context()
-ctx.load_model('data/models--mlx-community--Qwen3.5-35B-A3B-4bit')
-cache = ctx.new_cache()
-# ... feed input_ids via ctx.forward(...) or ctx.generate(...)
-"
 ```
 
-### Rust server
-
-```bash
-cd moe_infer_rs
-cargo run --release -- --model ../data/models--mlx-community--Qwen3.5-35B-A3B-4bit --serve 8080
-```
-
-## C Build (baseline)
-
-```bash
-cd moe_infer_c
-python3 patch_bench.py
-clang -O2 -Wall -fobjc-arc -framework Metal -framework Foundation \
-      -framework Accelerate bench.m -lpthread -lcompression -o bench
-./bench --prompt "bench" --tokens 500 --k 8
-```
-
-## Python API
+### 3. Run inference
 
 ```python
 from moe_infer import Context, Cache
 import numpy as np
 
 ctx = Context()
-
-# Load model (pipeline_mode: "CpuOnly", "Gpu", "FusedExp")
-ctx.load_model("/path/to/model", pipeline_mode="FusedExp")
-
-# Create cache (holds KV cache + linear attention states)
+ctx.load_model("hub/models--mlx-community--Qwen3.5-35B-A3B-4bit",
+               pipeline_mode="Fused3")
 cache = ctx.new_cache()
 
-# Forward pass: input_ids is the FULL conversation
-# Only new tokens (cache.pos onwards) are processed
-input_ids = np.array([1, 2, 3, ...], dtype=np.int64)
-logits = ctx.forward(input_ids, cache)  # shape: [n_tokens, vocab_size]
+# Forward pass
+input_ids = np.array([248045, 8678, 198], dtype=np.int64)
+logits = ctx.forward(input_ids, cache)
 
-# Generate with sampling
+# Generate
 new_ids = ctx.generate(input_ids, cache,
-    max_tokens=256,
-    temperature=0.7, top_k=50, top_p=0.9,
-    eos_token_ids=np.array([248046, 248044], dtype=np.int64))
+    max_tokens=256, temperature=0.7, top_k=50, top_p=0.9)
 
-# Streaming generate — returns list of (token_id, logits) tuples
-results = ctx.stream_generate(input_ids, cache, max_tokens=256)
-
-# Telemetry from last call
-info = ctx.telemetry()
-# {"prefill_ms": 123.4, "total_ms": 567.8, "tokens_generated": 50, "tokens_per_sec": 88.0}
-
-# Reset for new conversation
-cache.reset()
-
-# Cleanup
-ctx.unload_model()
+# Streaming
+for token_id, logits in ctx.stream_generate(input_ids, cache, max_tokens=256):
+    print(token_id)
 ```
 
-## Architecture
+## Python API
 
-35B-A3B model: 40 layers (30 linear attention + 10 full attention), 256 experts, K=8 active. Hidden dim 2048, head dim 256.
+```python
+from moe_infer import Context, Cache
+```
 
-### Key Techniques
+### Context
 
-1. **SSD Expert Streaming** — Expert weights (~19GB 4-bit) read from SSD on demand via parallel `pread()`. Only K active experts per layer are loaded (~1.77MB each).
+| Method | Description |
+|--------|-------------|
+| `ctx.load_model(path, pipeline_mode="Fused3")` | Load a model. Modes: `Cpu`, `Gpu`, `FusedExp`, `Fused3` |
+| `ctx.unload_model()` | Free Metal resources and close expert files |
+| `ctx.new_cache()` | Create a new KV cache + linear attention state |
+| `ctx.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
+| `ctx.generate(input_ids, cache, max_tokens, temperature, top_k, top_p, min_p, eos_token_ids)` | Autoregressive generation, returns `[n_tokens]` int64 token ids |
+| `ctx.stream_generate(input_ids, cache, ...)` | Like generate but yields `(token_id, logits)` tuples |
+| `ctx.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec` |
 
-2. **Metal Compute Shaders** — 4-bit dequantized matvec, fused SwiGLU, RMS norm, batched attention, GPU RoPE, MoE combine + residual.
+### Cache
 
-3. **Fused GPU Pipeline** — FusedExp mode fuses linear attention (qkv/z/b/a + conv1d + SSM) into a single CMD1. MoE experts are dispatched individually with GPU dequant. Fused3 (full C pipeline with async CMD3 + GPU combine) is planned but not yet implemented.
+| Method | Description |
+|--------|-------------|
+| `cache.reset()` | Reset position, KV caches, and linear attention states for a new conversation |
+| `cache.pos` | Current sequence position (read-only) |
 
-4. **FMA-Optimized Dequant** — Rearranges `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`, using GPU fused multiply-add in one instruction.
+### Pipeline Modes
+
+| Mode | Description |
+|------|-------------|
+| `Cpu` | Pure CPU reference. All operations on CPU. Slow but useful for debugging. |
+| `Gpu` | GPU kernels with individual dispatch. No command buffer fusion. |
+| `FusedExp` | Linear attention fused into one command buffer. MoE experts dispatched individually. |
+| `Fused3` | Full 3-command-buffer pipeline (CMD1 + CMD2 + async CMD3). **Recommended.** |
+
+### Sampling Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_tokens` | 256 | Maximum new tokens to generate |
+| `temperature` | 1.0 | < 0.01 for greedy, > 0 for sampling |
+| `top_k` | 50 | Keep top-k logits (0 = disabled) |
+| `top_p` | 0.9 | Nucleus sampling threshold |
+| `min_p` | 0.0 | Minimum probability relative to max |
+| `eos_token_ids` | [248046, 248044] | Stop tokens |
+
+## Rust CLI
+
+```bash
+cd moe_infer_rs
+
+# Benchmark
+cargo run --release --bin bench -- \
+  --model ../hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+  --tokens 500
+
+# HTTP server with SSE streaming
+cargo run --release -- \
+  --model ../hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+  --serve 8080
+```
+
+## Model Format
+
+MoE-Infer expects a model directory with:
+
+```
+model_dir/
+├── model_weights.bin        # Mmap'd: all non-expert weights (embeddings, norms, projections, shared experts)
+├── model_weights.json       # Tensor manifest (name → offset, size, shape, dtype)
+├── model_config.json        # Model hyperparameters
+├── packed_experts/          # Per-layer expert files
+│   ├── layer_00.bin
+│   ├── layer_01.bin
+│   └── ...
+├── tokenizer.json           # HF tokenizer (used by Python bindings)
+└── vocab.json
+```
+
+Helper scripts in `helpers/` convert from HuggingFace/MLX format:
+- `extract_weights.py` — Non-expert weights → `model_weights.bin` + `model_weights.json`
+- `repack_experts_4bit.py` — MLX 4-bit experts → `packed_experts/` per-layer files
+- `gen_model_config.py` — HF `config.json` → `model_config.json`
+
+## Performance
+
+Apple M4, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 100-token greedy generation:
+
+| Mode | tok/s |
+|------|-------|
+| Fused3 | 2.69 |
+| FusedExp | 2.14 |
+| Gpu | 1.70 |
+| Cpu | 0.15 |
+
+Expert I/O (SSD reads) dominates at ~72% of per-layer time.
 
 ## Project Structure
 
 ```
-moe_infer_c/          Original C vendor code (performance baseline)
-  infer.m             ~7000 line inference engine
-  bench.m             Generated benchmark binary
-  shaders.metal       Metal compute shaders
-  patch_bench.py      Generate bench.m from infer.m
-
-moe_infer_rs/         Rust port
+moe_infer_rs/           Rust engine + Python bindings
   src/
-    main.rs           CLI + HTTP server entry point
-    bin/bench.rs      Pure Rust benchmark
-    gpu_forward.rs    Fused layer forward, linear/full attention, MoE routing
-    metal_context.rs  Metal init, pipeline creation, GPU weight buffer
-    kernels.rs        GPU kernel dispatch wrappers
-    expert.rs         Expert forward (CPU dequant matvec)
-    moe.rs            MoE routing + expert dispatch
-    full_forward.rs   Full model forward pass
-    weights.rs        Weight file mmap + tensor lookup
-    config.rs         JSON model config loading
-    quant.rs          bf16→f32, CPU dequant matvec, SwiGLU
-    tokenizer.rs      BPE tokenizer
-    server.rs         HTTP server + SSE streaming
-    python_bindings.rs PyO3 bindings (Context, Cache)
-    timer.rs          Wall-clock timing
-    lib.rs            Module declarations + re-exports
+    gpu_forward.rs      Layer forward: linear/full attention, MoE routing
+    pipeline_common.rs  Shared types, CPU helpers, DeferredExperts
+    pipeline_cpu.rs     Cpu pipeline mode
+    pipeline_fused3.rs  Fused3 pipeline mode (CMD1+CMD2+CMD3)
+    pipeline_fusedexp.rs FusedExp pipeline mode
+    python_bindings.rs  PyO3 bindings (Context, Cache)
+    metal_context.rs    Metal device init, pipeline creation
+    kernels.rs          GPU kernel dispatch
+    weights.rs          Mmap'd weight file + tensor lookup
+    config.rs           JSON model config
+    quant.rs            bf16↔f32, CPU dequant matvec, SwiGLU, RMS norm
+    tokenizer.rs        BPE tokenizer
+    error.rs            Error types
+    lib.rs              Module declarations
   shaders/
-    shaders.metal     Metal compute shaders (embedded at compile time)
+    shaders.metal       Metal compute shaders (embedded at compile time)
   Cargo.toml
 
-helpers/
-  extract_weights.py       Non-expert weights → model_weights.bin
-  repack_experts_4bit.py   MLX 4-bit experts → packed_experts/
-  repack_experts_2bit.py   4-bit → 2-bit requantization
-  gen_model_config.py      Generate model_config.json from HF config.json
-  export_tokenizer.py      Generate vocab.bin and tokenizer.bin (C path)
+helpers/                Model conversion scripts
+  extract_weights.py    Non-expert weights → model_weights.bin
+  repack_experts_4bit.py MLX experts → packed_experts/
+  gen_model_config.py   Config generation
+  export_tokenizer.py   Tokenizer export (C path)
 
-example.py            Python example using PyO3 bindings
-pyproject.toml        Maturin build configuration
+diagnose_ops.py         Per-operation Rust vs MLX comparison
+diagnose_per_layer.py   Per-layer hidden state comparison
+verify_nway.py          Multi-engine logit verification
 ```
+
+## License
+
+MIT
