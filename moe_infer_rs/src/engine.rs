@@ -7,7 +7,7 @@ use metal::Buffer;
 use crate::constants::{
     CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, MAX_SEQ,
 };
-use crate::engine_common::SignalCheckFn;
+use crate::math::SignalCheckFn;
 use crate::model_config::{load_model_config, ModelConfig};
 use crate::model_weights::WeightFile;
 

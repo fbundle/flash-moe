@@ -13,10 +13,10 @@ use crate::engine::{
 use crate::engine_cpu::EngineCPU;
 use crate::engine_fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
 use crate::engine_fusedwoods::EngineFusedWoods;
-use crate::engine_common::process_token_inner;
 use crate::engine_gpu::EngineGPU;
 use crate::generate::{SampleParams, Telemetry};
-use crate::engine_common::{
+use crate::math::{
+    process_token_inner,
     embed_lookup, final_norm, gpu_lm_head, sample,
     ExecCtxGpu, SignalCheckFn,
 };

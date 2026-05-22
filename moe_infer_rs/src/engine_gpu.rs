@@ -1,6 +1,6 @@
 /// EngineGPU: GPU-accelerated per-token processing using process_token_inner.
 use crate::engine::{Cache, Engine, Model};
-use crate::engine_common::{
+use crate::math::{
     embed_lookup, final_norm, gpu_lm_head, process_token_inner,
     ExecCtxGpu, SignalCheckFn,
 };

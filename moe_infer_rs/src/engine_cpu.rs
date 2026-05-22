@@ -5,7 +5,7 @@
 /// is CpuOnly.
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
 use crate::engine::{Cache, Engine, LinearAttnState, Model};
-use crate::engine_common::{
+use crate::math::{
     bf16_to_f32, conv1d_step, dequant_matvec_4bit,
     embed_lookup, final_norm, full_attention_forward, lm_head,
     moe_layer_forward, rms_norm, rms_norm_bare, rms_norm_gated, sigmoid,

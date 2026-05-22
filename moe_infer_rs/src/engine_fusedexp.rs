@@ -19,13 +19,13 @@ use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
 use crate::engine::{Cache, Engine, FullAttnCache, LinearAttnState, Model};
 use crate::metal_context::ExpertBuffer;
-use crate::engine_common::{
+use crate::math::{
     bf16_to_f32, normalize_weights, softmax, topk,
     embed_lookup, final_norm, gpu_lm_head,
     DeferredExperts, ExecCtxGpu, FullAttnCmd2State,
     SignalCheckFn,
 };
-use crate::engine_common::{gpu_full_attention_forward, moe_layer_forward};
+use crate::math::{gpu_full_attention_forward, moe_layer_forward};
 use crate::model_weights::WeightFile;
 
 /// Encode post_expert for a previously-routed layer into a command encoder.

@@ -6,7 +6,6 @@ mod engine_gpu;
 mod metal_kernels;
 mod metal_context;
 mod math;
-mod engine_common;
 mod engine_cpu;
 mod engine_fusedwoods;
 mod engine_fusedexp;

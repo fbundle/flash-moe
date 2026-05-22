@@ -9,8 +9,8 @@ use crate::metal_context::{metal_buf_shared, ExpertBuffer, GpuWeightCtx, MetalCo
 use crate::model_weights::WeightFile;
 use crate::constants::CONV_KERNEL_SIZE;
 use crate::engine::{Cache, Engine, LinearAttnState, Model};
-use crate::engine_common::{embed_lookup, final_norm, gpu_lm_head, ExecCtxGpu, SignalCheckFn};
-use crate::engine_common::{process_token_inner, LinearAttnFusedWoodsState};
+use crate::math::{embed_lookup, final_norm, gpu_lm_head, ExecCtxGpu, SignalCheckFn};
+use crate::math::{process_token_inner, LinearAttnFusedWoodsState};
 
 /// Run FusedWoods CMD1: attention projections → conv1d → SSM → gated_rms_norm.
 ///
