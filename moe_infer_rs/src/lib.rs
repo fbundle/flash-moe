@@ -1,16 +1,18 @@
-mod config;
+mod model_config;
 mod constants;
 pub mod engine;
 mod error;
-mod pipeline_gpu;
+mod engine_gpu;
 mod metal_kernels;
 mod metal_context;
-mod pipeline_common;
-mod pipeline_cpu;
-mod pipeline_fusedwoods;
-mod pipeline_fusedexp;
+mod math;
+mod engine_common;
+mod engine_cpu;
+mod engine_fusedwoods;
+mod engine_fusedexp;
+mod generate;
 mod timer;
-mod weights;
+mod model_weights;
 
 #[cfg(feature = "python-bindings")]
 mod python_bindings;

@@ -3,12 +3,15 @@
 /// Runs attention projections, conv1d, SSM, gated_rms_norm, out_proj, and residual
 /// add entirely on CPU. Used when GPU fused pipelines are unavailable or when mode
 /// is CpuOnly.
-use crate::pipeline_common::{
-    cpu_conv1d_step, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_sigmoid,
-    LinearAttnState, CONV_KERNEL_SIZE, GROUP_SIZE, RMS_NORM_EPS,
+use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
+use crate::engine::{Cache, Engine, LinearAttnState, Model};
+use crate::engine_common::{
+    bf16_to_f32, conv1d_step, dequant_matvec_4bit,
+    embed_lookup, final_norm, full_attention_forward, lm_head,
+    moe_layer_forward, rms_norm, rms_norm_bare, rms_norm_gated, sigmoid,
+    SignalCheckFn,
 };
-use crate::pipeline_common::{bf16_to_f32, cpu_dequant_matvec_4bit};
-use crate::weights::WeightFile;
+use crate::model_weights::WeightFile;
 
 /// Run CPU linear attention: dequant projections → conv1d → SSM → gated_norm → out_proj → residual.
 ///
@@ -46,27 +49,27 @@ pub fn cpu_linear_attention(
         wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_qkv.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_qkv.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(qw, qs, qb, normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(qw, qs, qb, normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
     if let (Some(zw), Some(zs), Some(zb)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_z.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_z.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_z.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(zw, zs, zb, normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(zw, zs, zb, normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
     if let (Some(bw), Some(bs), Some(bb)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_b.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_b.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_b.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(bw, bs, bb, normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(bw, bs, bb, normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
     if let (Some(aw), Some(ass), Some(ab)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_a.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_a.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_a.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(aw, ass, ab, normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(aw, ass, ab, normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
 
     // Conv1d step (CPU)
     let mut conv_out = vec![0.0f32; qkv_dim];
     if let Some(conv_w) = wf.get_tensor_u16(&format!("{}.conv1d.weight", prefix)) {
-        cpu_conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
+        conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
     } else {
         conv_out.copy_from_slice(&qkv);
     }
@@ -150,14 +153,14 @@ pub fn cpu_linear_attention(
         for h in 0..num_k_heads {
             let qh = &lin_q[h * key_dim..(h + 1) * key_dim];
             let qh_out = &mut q_normed[h * key_dim..(h + 1) * key_dim];
-            cpu_rms_norm_bare(qh, qh_out, key_dim, 1e-6);
+            rms_norm_bare(qh, qh_out, key_dim, 1e-6);
             let q_scale = inv_scale * inv_scale;
             for d in qh_out.iter_mut() { *d *= q_scale; }
         }
         for h in 0..num_k_heads {
             let kh = &lin_k[h * key_dim..(h + 1) * key_dim];
             let kh_out = &mut k_normed[h * key_dim..(h + 1) * key_dim];
-            cpu_rms_norm_bare(kh, kh_out, key_dim, 1e-6);
+            rms_norm_bare(kh, kh_out, key_dim, 1e-6);
             for d in kh_out.iter_mut() { *d *= inv_scale; }
         }
 
@@ -173,7 +176,7 @@ pub fn cpu_linear_attention(
             let dt_b = dt_bias.map_or(0.0, |db| bf16_to_f32(db[vh]));
             let softplus_val = (1.0 + (alpha[vh] + dt_b).exp()).ln();
             let g_decay = (-a_val.exp() * softplus_val).exp();
-            let beta_gate = cpu_sigmoid(beta[vh]);
+            let beta_gate = sigmoid(beta[vh]);
             let s_off = vh * value_dim * key_dim;
             let ssm = &mut state.ssm_state[s_off..s_off + value_dim * key_dim];
             let v_h = &lin_v[vh * value_dim..(vh + 1) * value_dim];
@@ -202,7 +205,7 @@ pub fn cpu_linear_attention(
                 let oh = &out_values[vh * value_dim..(vh + 1) * value_dim];
                 let zh = &z[vh * value_dim..(vh + 1) * value_dim];
                 let gh = &mut gated_out[vh * value_dim..(vh + 1) * value_dim];
-                cpu_rms_norm_gated(oh, zh, gnw, gh, value_dim, RMS_NORM_EPS);
+                rms_norm_gated(oh, zh, gnw, gh, value_dim, RMS_NORM_EPS);
             }
         } else {
             gated_out.copy_from_slice(&out_values);
@@ -220,7 +223,7 @@ pub fn cpu_linear_attention(
         wf.get_tensor_u16(&format!("{}.out_proj.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.out_proj.biases", prefix)),
     ) {
-        cpu_dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
+        dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
     }
 
     // Residual add
@@ -228,4 +231,104 @@ pub fn cpu_linear_attention(
         hidden[i] = residual[i] + attn_out[i];
     }
 
+}
+
+// ─── EngineCPU ────────────────────────────────────────────────────────────
+
+/// CPU-only engine: no GPU resources required.
+pub struct EngineCPU<'a> {
+    pub model: &'a Model,
+}
+
+impl<'a> Engine for EngineCPU<'a> {
+    fn forward(
+        &mut self,
+        input_ids: &[i64],
+        cache: &mut Cache,
+        mut check_signal: SignalCheckFn<'_>,
+    ) -> Result<Vec<f32>, String> {
+        let n = input_ids.len();
+        let hd = self.model.config.hidden_dim;
+        let vs = self.model.config.vocab_size;
+        let num_layers = self.model.config.num_layers;
+
+        let mut logits = vec![0.0f32; n * vs];
+        if n == 0 {
+            return Ok(logits);
+        }
+
+        let mut embed = vec![0.0f32; n * hd];
+        for (i, &id) in input_ids.iter().enumerate() {
+            embed_lookup(&self.model.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
+        }
+
+        let kv_dim = self.model.config.num_kv_heads * self.model.config.head_dim;
+        let num_k_heads = self.model.config.linear_num_k_heads;
+        let num_v_heads = self.model.config.linear_num_v_heads;
+        let total_key = self.model.config.linear_total_key;
+        let total_value = self.model.config.linear_total_value;
+        let qkv_dim = self.model.config.linear_conv_dim;
+        let key_dim = total_key / num_k_heads;
+        let value_dim = total_value / num_v_heads;
+        let inv_scale = 1.0 / (key_dim as f32).sqrt();
+        let k_heads_per_v = num_v_heads / num_k_heads;
+
+        let mut hidden = vec![0.0f32; hd];
+        for (ti, _) in input_ids.iter().enumerate() {
+            hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
+
+            for layer in 0..num_layers {
+                if layer % 4 == 0 && check_signal() {
+                    return Err("interrupted".into());
+                }
+                let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+
+                // Input norm + save residual
+                let norm_name = format!("model.layers.{}.input_layernorm.weight", layer);
+                let nw_u16 = self.model.wf.get_tensor_u16(&norm_name);
+                let residual = hidden.to_vec();
+                let mut normed = vec![0.0f32; hd];
+                if let Some(nw) = nw_u16 {
+                    let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
+                    rms_norm(&hidden, &nw_f32, &mut normed, hd, RMS_NORM_EPS);
+                } else {
+                    normed.copy_from_slice(&hidden);
+                }
+
+                let attn_state = if is_full {
+                    if let Some(ref mut kv) = cache.kv[layer] {
+                        full_attention_forward(
+                            &self.model.wf, layer, &mut hidden, kv, cache.pos,
+                            &self.model.config,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    if let Some(ref mut state) = cache.lin[layer] {
+                        cpu_linear_attention(
+                            &self.model.wf, layer, &mut hidden, &normed, &residual, state,
+                            num_k_heads, num_v_heads, total_key, total_value, qkv_dim,
+                            hd, key_dim, value_dim, inv_scale, k_heads_per_v,
+                            false, None, None,
+                        );
+                    }
+                    None
+                };
+
+                let _ = moe_layer_forward(
+                    &self.model.wf, layer, &mut hidden,
+                    self.model.expert_fds[layer],
+                    None, None, &self.model.config,
+                    attn_state, None, None, false,
+                );
+            }
+
+            cache.pos += 1;
+            final_norm(&self.model.wf, &mut hidden, hd);
+            lm_head(&self.model.wf, &hidden, &mut logits[ti * vs..(ti + 1) * vs]);
+        }
+
+        Ok(logits)
+    }
 }

@@ -6,7 +6,7 @@ use objc::rc::autoreleasepool;
 use std::collections::HashMap;
 use crate::error::MoEError;
 use crate::metal_kernels;
-use crate::weights::WeightFile;
+use crate::model_weights::WeightFile;
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
 
@@ -106,7 +106,7 @@ impl ExpertCache {
 
 /// Pre-allocated GPU buffers for expert dispatch — allocated once, reused across
 /// all layers and tokens.  Matches C's `buf_multi_expert_*` and scratch buffers.
-pub struct ExpertIOState {
+pub struct ExpertBuffer {
     /// Expert data buffers [MAX_K] — pread'd expert weights land here
     pub expert_data: Vec<Buffer>,
     /// Per-expert output [MAX_K] — each expert's down_proj result
@@ -128,7 +128,7 @@ pub struct ExpertIOState {
     pub cache: ExpertCache,
 }
 
-impl ExpertIOState {
+impl ExpertBuffer {
     pub fn new(
         device: &Device,
         expert_size: usize,
@@ -143,7 +143,7 @@ impl ExpertIOState {
             expert_data.push(metal_buf_shared(device, expert_size));
             expert_out.push(metal_buf_shared(device, hidden_dim * 4));
         }
-        ExpertIOState {
+        ExpertBuffer {
             expert_data,
             expert_out,
             scratch_gate: metal_buf_shared(device, moe_inter * 4),
@@ -285,8 +285,8 @@ impl MetalContext {
         hidden_dim: usize,
         moe_inter: usize,
         shared_inter: usize,
-    ) -> ExpertIOState {
-        let io = ExpertIOState::new(
+    ) -> ExpertBuffer {
+        let io = ExpertBuffer::new(
             &self.device,
             expert_size,
             hidden_dim,

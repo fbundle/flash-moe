@@ -1,21 +1,306 @@
-/// GPU-accelerated per-layer operations: MoE, linear attention, full attention.
+/// Shared types, constants, and CPU helpers used across engine modules.
 use std::os::fd::RawFd;
 use std::ffi::c_void;
 
-use metal::{Buffer, MTLSize};
-use crate::config::ModelConfig;
+use metal::{Buffer, CommandBuffer, MTLSize};
+use rand::Rng;
+
+use crate::constants::{
+    CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
+};
+use crate::engine::{FullAttnCache, LinearAttnState};
 use crate::error::MoEError;
 use crate::metal_kernels;
-use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext, MAX_K};
-use crate::pipeline_common::{
-    bf16_to_f32, cpu_conv1d_step, cpu_dequant_matvec_4bit, cpu_normalize_weights,
-    cpu_rms_norm, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_sigmoid,
-    cpu_softmax, cpu_topk,
-    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnState,
-    PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
-};
-use crate::pipeline_fusedwoods::LinearAttnFusedWoodsState;
-use crate::weights::WeightFile;
+use crate::metal_context::{metal_buf_shared, ExpertBuffer, GpuWeightCtx, MetalContext, MAX_K};
+use crate::model_config::ModelConfig;
+use crate::model_weights::WeightFile;
+
+// ─── bf16 / f32 conversion ───────────────────────────────────────────────
+
+/// Convert bf16 (uint16) to f32.
+pub fn bf16_to_f32(bf16: u16) -> f32 {
+    f32::from_bits((bf16 as u32) << 16)
+}
+
+/// CPU reference: 4-bit dequantized matrix-vector multiply.
+pub fn dequant_matvec_4bit(
+    w_packed: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    x: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) {
+    let num_groups = in_dim / group_size;
+    let packed_per_group = group_size / 8;
+    let packed_cols = in_dim / 8;
+
+    for row in 0..out_dim {
+        let mut acc = 0.0f32;
+        let w_row = &w_packed[row * packed_cols..];
+        let s_row = &scales[row * num_groups..];
+        let b_row = &biases[row * num_groups..];
+
+        for g in 0..num_groups {
+            let scale = bf16_to_f32(s_row[g]);
+            let bias = bf16_to_f32(b_row[g]);
+
+            let base_packed = g * packed_per_group;
+            let base_x = g * group_size;
+
+            for p in 0..packed_per_group {
+                let packed = w_row[base_packed + p];
+                let x_base = base_x + p * 8;
+
+                for n in 0..8 {
+                    let nibble = (packed >> (n * 4)) & 0xF;
+                    let w_val = (nibble as f32) * scale + bias;
+                    acc += w_val * x[x_base + n];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+/// CPU reference: RMS normalization.
+pub fn rms_norm(x: &[f32], weight: &[f32], out: &mut [f32], dim: usize, eps: f32) {
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let rms = (sum_sq / dim as f32 + eps).sqrt().recip();
+    for i in 0..dim {
+        out[i] = x[i] * rms * weight[i];
+    }
+}
+
+// ─── Execution context (borrowed view of Engine for pipeline fns) ────────
+
+/// CPU-only execution context — no GPU resources.
+pub struct ExecCtxCpu<'a> {
+    pub wf: &'a WeightFile,
+    pub config: &'a ModelConfig,
+    pub expert_fds: &'a [RawFd],
+}
+
+/// GPU execution context — includes Metal device, GPU weight buffers, and expert I/O.
+pub struct ExecCtxGpu<'a> {
+    pub wf: &'a WeightFile,
+    pub ctx: &'a MetalContext,
+    pub gpu_wf: &'a GpuWeightCtx,
+    pub config: &'a ModelConfig,
+    pub expert_fds: &'a [RawFd],
+    pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+}
+
+/// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
+pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
+
+// ─── CPU helper functions ────────────────────────────────────────────────
+
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+pub fn silu(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+pub fn softmax(x: &mut [f32]) {
+    let max_val = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    let inv = 1.0 / sum;
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+pub fn topk(scores: &[f32], k: usize, indices: &mut [usize], values: &mut [f32]) {
+    for (i, &score) in scores.iter().enumerate() {
+        if i < k {
+            let mut pos = i;
+            while pos > 0 && values[(pos - 1) / 2] > score {
+                values[pos] = values[(pos - 1) / 2];
+                indices[pos] = indices[(pos - 1) / 2];
+                pos = (pos - 1) / 2;
+            }
+            values[pos] = score;
+            indices[pos] = i;
+        } else if score > values[0] {
+            values[0] = score;
+            indices[0] = i;
+            let mut pos = 0;
+            loop {
+                let left = 2 * pos + 1;
+                let right = 2 * pos + 2;
+                let mut smallest = pos;
+                if left < k && values[left] < values[smallest] { smallest = left; }
+                if right < k && values[right] < values[smallest] { smallest = right; }
+                if smallest == pos { break; }
+                values.swap(pos, smallest);
+                indices.swap(pos, smallest);
+                pos = smallest;
+            }
+        }
+    }
+}
+
+pub fn normalize_weights(weights: &mut [f32]) {
+    let sum: f32 = weights.iter().sum();
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for w in weights.iter_mut() { *w *= inv; }
+    }
+}
+
+pub fn rms_norm_bare(x: &[f32], out: &mut [f32], dim: usize, eps: f32) {
+    let sum_sq: f32 = x[..dim].iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+    for i in 0..dim {
+        out[i] = x[i] * inv_rms;
+    }
+}
+
+pub fn rms_norm_gated(
+    x: &[f32], z: &[f32], w_bf16: &[u16],
+    out: &mut [f32], dim: usize, eps: f32,
+) {
+    let sum_sq: f32 = x[..dim].iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+    for i in 0..dim {
+        let w = bf16_to_f32(w_bf16[i]);
+        let silu_z = z[i] / (1.0 + (-z[i]).exp());
+        out[i] = x[i] * inv_rms * w * silu_z;
+    }
+}
+
+pub fn conv1d_step(
+    conv_state: &[f32],
+    new_input: &[f32],
+    weight_bf16: &[u16],
+    out: &mut [f32],
+    channels: usize,
+    kernel_size: usize,
+) {
+    for c in 0..channels {
+        let mut acc = 0.0f32;
+        for k in 0..kernel_size - 1 {
+            let w = bf16_to_f32(weight_bf16[c * kernel_size + k]);
+            acc += conv_state[k * channels + c] * w;
+        }
+        let w = bf16_to_f32(weight_bf16[c * kernel_size + (kernel_size - 1)]);
+        acc += new_input[c] * w;
+        out[c] = acc;
+    }
+    silu(&mut out[..channels]);
+}
+
+// ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ─
+
+pub struct FullAttnCmd2State {
+    pub q_buf: Buffer,
+    pub q_gate_buf: Buffer,
+    pub kc_buf: Buffer,
+    pub vc_buf: Buffer,
+    pub scores_buf: Buffer,
+    pub out_buf: Buffer,
+    pub hidden_buf: Buffer,
+    pub seq_len: u32,
+    pub seq_stride: u32,
+    pub num_attn_heads: u32,
+    pub head_dim: u32,
+    pub kv_dim: u32,
+    pub heads_per_kv: u32,
+    pub scale: f32,
+    pub q_dim: u32,
+    pub o_prefix: String,
+}
+
+// ─── Deferred expert results (CMD3 async dispatch) ───────────────────────
+
+pub struct DeferredExperts {
+    pub(crate) cmd_buf: Option<CommandBuffer>,
+    pub(crate) out_buf: Option<Buffer>,
+    pub(crate) _keep_alive: Vec<Buffer>,
+    pub gpu_combined: bool,
+}
+
+impl DeferredExperts {
+    pub fn new() -> Self {
+        DeferredExperts {
+            cmd_buf: None,
+            out_buf: None,
+            _keep_alive: Vec::new(),
+            gpu_combined: false,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.cmd_buf.is_some()
+    }
+
+    pub fn complete(&mut self, hidden: &mut [f32], hidden_dim: usize) {
+        if let Some(ref cmd_buf) = self.cmd_buf {
+            cmd_buf.wait_until_completed();
+        }
+        if let Some(ref out_buf) = self.out_buf {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_buf.contents() as *const f32,
+                    hidden.as_mut_ptr(),
+                    hidden_dim,
+                );
+            }
+        }
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
+    }
+
+    pub fn complete_fast(&mut self, hidden: &mut [f32], hidden_dim: usize) {
+        // Wait on CMD3's own command buffer for CPU cache coherence.
+        // Even though a later CMD1 on the same serial queue has completed
+        // (guaranteeing CMD3 finished first), Metal requires waiting on the
+        // specific command buffer that wrote the data for CPU visibility.
+        if let Some(ref cmd_buf) = self.cmd_buf {
+            cmd_buf.wait_until_completed();
+        }
+        if let Some(ref out_buf) = self.out_buf {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_buf.contents() as *const f32,
+                    hidden.as_mut_ptr(),
+                    hidden_dim,
+                );
+            }
+        }
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
+    }
+
+    pub fn discard(&mut self) {
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
+    }
+}
+
+// ─── FusedWoods shared state ─────────────────────────────────────────────
+/// GPU/CPU state from linear attention CMD1 for FusedWoods.
+pub struct LinearAttnFusedWoodsState {
+    pub gated_buf: Buffer,
+    pub h_mid: Vec<f32>,
+    pub total_value: usize,
+    pub o_prefix: String,
+    pub post_norm_name: String,
+}
 
 // ─── RoPE ─────────────────────────────────────────────────────────────────
 
@@ -62,7 +347,7 @@ fn apply_rope(
 /// When GPU is available, skips batched attention/o_proj/residual — those are
 /// deferred to `moe_layer_forward`'s CMD2. When GPU unavailable, computes
 /// everything on CPU/separate CMDs and returns None.
-pub fn full_attention_forward(
+pub fn mixed_full_attention_forward(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
@@ -71,7 +356,6 @@ pub fn full_attention_forward(
     config: &ModelConfig,
     gpu_wf: Option<&GpuWeightCtx>,
     ctx: Option<&MetalContext>,
-    mode: PipelineMode,
 ) -> Option<FullAttnCmd2State> {
     let hidden_dim = config.hidden_dim;
     let num_attn_heads = config.num_attn_heads;
@@ -90,7 +374,7 @@ pub fn full_attention_forward(
     let mut normed = vec![0.0f32; hidden_dim];
     if let Some(nw) = nw {
         let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
-        cpu_rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
+        rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
     } else {
         normed.copy_from_slice(hidden);
     }
@@ -119,6 +403,26 @@ pub fn full_attention_forward(
             std::ptr::copy_nonoverlapping(kbuf.contents() as *const f32, k.as_mut_ptr(), kv_dim);
             std::ptr::copy_nonoverlapping(vbuf.contents() as *const f32, v.as_mut_ptr(), kv_dim);
         }
+    } else {
+        // CPU fallback: dequant QKV projections
+        let q_name = format!("model.layers.{}.self_attn.q_proj", layer_idx);
+        let k_name = format!("model.layers.{}.self_attn.k_proj", layer_idx);
+        let v_name = format!("model.layers.{}.self_attn.v_proj", layer_idx);
+        if let (Some(qw), Some(qs), Some(qb)) = (
+            wf.get_tensor_u32(&format!("{}.weight", q_name)),
+            wf.get_tensor_u16(&format!("{}.scales", q_name)),
+            wf.get_tensor_u16(&format!("{}.biases", q_name)),
+        ) { dequant_matvec_4bit(qw, qs, qb, &normed, &mut q_proj_out, q_proj_dim, hidden_dim, GROUP_SIZE); }
+        if let (Some(kw), Some(ks), Some(kb)) = (
+            wf.get_tensor_u32(&format!("{}.weight", k_name)),
+            wf.get_tensor_u16(&format!("{}.scales", k_name)),
+            wf.get_tensor_u16(&format!("{}.biases", k_name)),
+        ) { dequant_matvec_4bit(kw, ks, kb, &normed, &mut k, kv_dim, hidden_dim, GROUP_SIZE); }
+        if let (Some(vw), Some(vs), Some(vb)) = (
+            wf.get_tensor_u32(&format!("{}.weight", v_name)),
+            wf.get_tensor_u16(&format!("{}.scales", v_name)),
+            wf.get_tensor_u16(&format!("{}.biases", v_name)),
+        ) { dequant_matvec_4bit(vw, vs, vb, &normed, &mut v, kv_dim, hidden_dim, GROUP_SIZE); }
     }
 
     // Split Q and Q-gate from concatenated output
@@ -167,8 +471,7 @@ pub fn full_attention_forward(
     // o_proj output (filled by GPU fused path or CPU fallback below)
     let mut o_out = vec![0.0f32; hidden_dim];
 
-    let use_gpu_attn = mode != PipelineMode::Cpu
-        && ctx.is_some()
+    let use_gpu_attn = ctx.is_some()
         && gpu_wf.is_some()
         && ctx.unwrap().attn_scores_batched.is_some()
         && ctx.unwrap().attn_softmax_batched.is_some()
@@ -231,29 +534,53 @@ pub fn full_attention_forward(
 
         // o_proj
         let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
-        if mode != PipelineMode::Cpu {
-            if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
-                let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
-                unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
-                let buf = metal_buf_shared(&c.device, hidden_dim * 4);
-                let cm = c.queue.new_command_buffer();
-                let enc = cm.new_compute_command_encoder();
-                gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &buf, 0, hidden_dim, q_dim);
-                enc.end_encoding(); cm.commit(); cm.wait_until_completed();
-                unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
-            }
+        if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+            let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
+            unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
+            let buf = metal_buf_shared(&c.device, hidden_dim * 4);
+            let cm = c.queue.new_command_buffer();
+            let enc = cm.new_compute_command_encoder();
+            gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &buf, 0, hidden_dim, q_dim);
+            enc.end_encoding(); cm.commit(); cm.wait_until_completed();
+            unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
         } else {
             if let (Some(ow), Some(os), Some(ob)) = (
                 wf.get_tensor_u32(&format!("{}.weight", o_prefix)),
                 wf.get_tensor_u16(&format!("{}.scales", o_prefix)),
                 wf.get_tensor_u16(&format!("{}.biases", o_prefix)),
-            ) { cpu_dequant_matvec_4bit(ow, os, ob, &attn_out, &mut o_out, hidden_dim, q_dim, GROUP_SIZE); }
+            ) { dequant_matvec_4bit(ow, os, ob, &attn_out, &mut o_out, hidden_dim, q_dim, GROUP_SIZE); }
         }
     }
 
     // Residual add
     for i in 0..hidden_dim { hidden[i] += o_out[i]; }
     None
+}
+
+/// CPU wrapper — calls mixed_full_attention_forward without GPU resources.
+pub fn full_attention_forward(
+    wf: &WeightFile,
+    layer_idx: usize,
+    hidden: &mut [f32],
+    kv: &mut FullAttnCache,
+    pos: usize,
+    config: &ModelConfig,
+) -> Option<FullAttnCmd2State> {
+    mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, None, None)
+}
+
+/// GPU wrapper — calls mixed_full_attention_forward with GPU resources.
+pub fn gpu_full_attention_forward(
+    wf: &WeightFile,
+    layer_idx: usize,
+    hidden: &mut [f32],
+    kv: &mut FullAttnCache,
+    pos: usize,
+    config: &ModelConfig,
+    gpu_wf: &GpuWeightCtx,
+    ctx: &MetalContext,
+) -> Option<FullAttnCmd2State> {
+    mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, Some(gpu_wf), Some(ctx))
 }
 
 // ─── Deferred expert results (CMD3 async dispatch) ─────────────────────────
@@ -280,12 +607,11 @@ pub fn linear_attention_forward(
     gpu_wf: Option<&GpuWeightCtx>,
     ctx: Option<&MetalContext>,
     linear_idx: usize,  // index into persistent GPU state buffers
-    mode: PipelineMode,
+    use_fused_cmd1: bool,
+    use_fusedwoods_cmd1: bool,
     prev_gpu_combined: bool,
 ) -> Option<LinearAttnFusedWoodsState> {
-    let use_gpu = mode != PipelineMode::Cpu
-        && gpu_wf.is_some()
-        && ctx.is_some();
+    let use_gpu = gpu_wf.is_some() && ctx.is_some();
 
     // Input RMS norm
     let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
@@ -296,7 +622,7 @@ pub fn linear_attention_forward(
 
     if let Some(nw) = nw {
         let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
-        cpu_rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
+        rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
     } else {
         normed.copy_from_slice(hidden);
     }
@@ -310,7 +636,7 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = (mode == PipelineMode::FusedExp)
+    let use_fused_gpu = use_fused_cmd1
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
@@ -473,7 +799,7 @@ pub fn linear_attention_forward(
 
     // ── FusedWoods path (matching C exactly): CMD1 without gated_norm/out_proj/residual ──
     // C does: CMD1(qkvz+ba+conv1d+SSM) → CPU(gated_norm) → CMD2(out_proj+residual+norm+gate+shared)
-    let use_fusedwoods_gpu = mode == PipelineMode::FusedWoods
+    let use_fusedwoods_gpu = use_fusedwoods_cmd1
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
@@ -617,27 +943,27 @@ pub fn linear_attention_forward(
         wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_qkv.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_qkv.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(qw, qs, qb, &normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(qw, qs, qb, &normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
     if let (Some(zw), Some(zs), Some(zb)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_z.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_z.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_z.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(zw, zs, zb, &normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(zw, zs, zb, &normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
     if let (Some(bw), Some(bs), Some(bb)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_b.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_b.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_b.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(bw, bs, bb, &normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(bw, bs, bb, &normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
     if let (Some(aw), Some(ass), Some(ab)) = (
         wf.get_tensor_u32(&format!("{}.in_proj_a.weight", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_a.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.in_proj_a.biases", prefix)),
-    ) { cpu_dequant_matvec_4bit(aw, ass, ab, &normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
+    ) { dequant_matvec_4bit(aw, ass, ab, &normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
 
     // Conv1d step (CPU)
     let mut conv_out = vec![0.0f32; qkv_dim];
     if let Some(conv_w) = wf.get_tensor_u16(&format!("{}.conv1d.weight", prefix)) {
-        cpu_conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
+        conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
     } else {
         conv_out.copy_from_slice(&qkv);
     }
@@ -717,14 +1043,14 @@ pub fn linear_attention_forward(
         for h in 0..num_k_heads {
             let qh = &lin_q[h * key_dim..(h + 1) * key_dim];
             let qh_out = &mut q_normed[h * key_dim..(h + 1) * key_dim];
-            cpu_rms_norm_bare(qh, qh_out, key_dim, 1e-6);
+            rms_norm_bare(qh, qh_out, key_dim, 1e-6);
             let q_scale = inv_scale * inv_scale;
             for d in qh_out.iter_mut() { *d *= q_scale; }
         }
         for h in 0..num_k_heads {
             let kh = &lin_k[h * key_dim..(h + 1) * key_dim];
             let kh_out = &mut k_normed[h * key_dim..(h + 1) * key_dim];
-            cpu_rms_norm_bare(kh, kh_out, key_dim, 1e-6);
+            rms_norm_bare(kh, kh_out, key_dim, 1e-6);
             for d in kh_out.iter_mut() { *d *= inv_scale; }
         }
 
@@ -739,7 +1065,7 @@ pub fn linear_attention_forward(
             let dt_b = dt_bias.map_or(0.0, |db| bf16_to_f32(db[vh]));
             let softplus_val = (1.0 + (alpha[vh] + dt_b).exp()).ln();
             let g_decay = (-a_val.exp() * softplus_val).exp();
-            let beta_gate = cpu_sigmoid(beta[vh]);
+            let beta_gate = sigmoid(beta[vh]);
             let s_off = vh * value_dim * key_dim;
             let ssm = &mut state.ssm_state[s_off..s_off + value_dim * key_dim];
             let v_h = &lin_v[vh * value_dim..(vh + 1) * value_dim];
@@ -768,7 +1094,7 @@ pub fn linear_attention_forward(
                 let oh = &out_values[vh * value_dim..(vh + 1) * value_dim];
                 let zh = &z[vh * value_dim..(vh + 1) * value_dim];
                 let gh = &mut gated_out[vh * value_dim..(vh + 1) * value_dim];
-                cpu_rms_norm_gated(oh, zh, gnw, gh, value_dim, RMS_NORM_EPS);
+                rms_norm_gated(oh, zh, gnw, gh, value_dim, RMS_NORM_EPS);
             }
         } else {
             gated_out.copy_from_slice(&out_values);
@@ -786,7 +1112,7 @@ pub fn linear_attention_forward(
         wf.get_tensor_u16(&format!("{}.out_proj.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.out_proj.biases", prefix)),
     ) {
-        cpu_dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
+        dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
     }
     for i in 0..hidden_dim {
         hidden[i] = residual[i] + attn_out[i];
@@ -812,10 +1138,10 @@ pub fn moe_layer_forward(
     ctx: Option<&MetalContext>,
     gpu_wf: Option<&GpuWeightCtx>,
     config: &ModelConfig,
-    mode: PipelineMode,
     attn_state: Option<FullAttnCmd2State>,
     lin_attn: Option<LinearAttnFusedWoodsState>,
-    mut expert_io: Option<&mut ExpertIOState>,
+    mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
+    gpu_combined: bool,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -825,9 +1151,7 @@ pub fn moe_layer_forward(
     let layout = &config.expert_layout_4bit;
     let k = config.num_experts_per_tok;
 
-    let use_gpu = mode != PipelineMode::Cpu
-        && ctx.is_some()
-        && gpu_wf.is_some();
+    let use_gpu = ctx.is_some() && gpu_wf.is_some();
 
     // Save h_mid (residual) — already completed by caller before this layer
     let h_mid = hidden.to_vec();
@@ -1125,7 +1449,7 @@ pub fn moe_layer_forward(
         let pnw = wf.get_tensor_u16(&post_norm_name);
         if let Some(pnw) = pnw {
             let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
-            cpu_rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
+            rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
         } else {
             h_post.copy_from_slice(hidden);
         }
@@ -1166,36 +1490,36 @@ pub fn moe_layer_forward(
                 wf.get_tensor_u32(&format!("{}.gate.weight", prefix)),
                 wf.get_tensor_u16(&format!("{}.gate.scales", prefix)),
                 wf.get_tensor_u16(&format!("{}.gate.biases", prefix)),
-            ) { cpu_dequant_matvec_4bit(gw_p, gs, gb, &h_post, &mut gate_scores, num_experts, hidden_dim, GROUP_SIZE); }
+            ) { dequant_matvec_4bit(gw_p, gs, gb, &h_post, &mut gate_scores, num_experts, hidden_dim, GROUP_SIZE); }
             if let (Some(sgw), Some(sgs), Some(sgb)) = (
                 wf.get_tensor_u32(&format!("{}.shared_expert.gate_proj.weight", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.scales", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert.gate_proj.biases", prefix)),
-            ) { cpu_dequant_matvec_4bit(sgw, sgs, sgb, &h_post, &mut shared_gate, shared_inter, hidden_dim, GROUP_SIZE); }
+            ) { dequant_matvec_4bit(sgw, sgs, sgb, &h_post, &mut shared_gate, shared_inter, hidden_dim, GROUP_SIZE); }
             if let (Some(suw), Some(sus), Some(sub)) = (
                 wf.get_tensor_u32(&format!("{}.shared_expert.up_proj.weight", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.scales", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert.up_proj.biases", prefix)),
-            ) { cpu_dequant_matvec_4bit(suw, sus, sub, &h_post, &mut shared_up, shared_inter, hidden_dim, GROUP_SIZE); }
+            ) { dequant_matvec_4bit(suw, sus, sub, &h_post, &mut shared_up, shared_inter, hidden_dim, GROUP_SIZE); }
             if let (Some(segw), Some(segs), Some(segb)) = (
                 wf.get_tensor_u32(&format!("{}.shared_expert_gate.weight", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert_gate.scales", prefix)),
                 wf.get_tensor_u16(&format!("{}.shared_expert_gate.biases", prefix)),
             ) {
                 let mut tmp = [0.0f32];
-                cpu_dequant_matvec_4bit(segw, segs, segb, &h_post, &mut tmp, 1, hidden_dim, GROUP_SIZE);
+                dequant_matvec_4bit(segw, segs, segb, &h_post, &mut tmp, 1, hidden_dim, GROUP_SIZE);
                 shared_gate_score = tmp[0];
             }
         }
     }
 
     // ── Routing: softmax + topk ──
-    cpu_softmax(&mut gate_scores);
+    softmax(&mut gate_scores);
 
     let mut expert_indices = vec![0usize; k];
     let mut expert_weights = vec![0.0f32; k];
-    cpu_topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
-    cpu_normalize_weights(&mut expert_weights);
+    topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
+    normalize_weights(&mut expert_weights);
 
     // ── Routed expert computation ──
     let mut moe_out = vec![0.0f32; hidden_dim];
@@ -1215,7 +1539,7 @@ pub fn moe_layer_forward(
         let mut fallback_expert_bufs: Vec<Buffer> = Vec::new();
 
         // Mutable phase: check cache, insert misses, parallel pread
-        if let Some(ref mut io) = expert_io {
+        if let Some(ref mut io) = expert_gpu_buffer {
             let mut miss_ei = [0usize; MAX_K];
             let mut miss_k_slot = [0usize; MAX_K];
             let mut miss_count = 0;
@@ -1277,13 +1601,13 @@ pub fn moe_layer_forward(
                 fallback_expert_bufs.push(buf);
             }
         }
-        // Mutable borrow of expert_io ends here
+        // Mutable borrow of expert_gpu_buffer ends here
 
         let any_valid = valid.iter().take(actual_k).any(|&v| v);
 
         if any_valid {
             // ── Phase 2: GPU dispatch using pre-allocated or ad-hoc buffers ──
-            let io_ref = expert_io.as_deref();  // Option<&ExpertIOState>
+            let io_ref = expert_gpu_buffer.as_deref();  // Option<&ExpertBuffer>
 
             let (x_buf, gate_out, up_out, act_out, out_bufs,
                  shared_act_gpu, shared_down_gpu, _hidden_out, params_buf)
@@ -1399,11 +1723,11 @@ pub fn moe_layer_forward(
             // GPU-side input_norm for next layer (matches C Enc C2 + Enc C3)
             // Only safe in fused modes where CMD1 reads directly from buf_input,
             // guaranteeing GPU queue serialization of CMD3-then-CMD1.
-            let gpu_combined = (mode == PipelineMode::FusedWoods || mode == PipelineMode::FusedExp)
+            let do_gpu_norm = gpu_combined
                 && layer_idx + 1 < config.num_layers
                 && ctx.rms_norm_apply_bf16.is_some()
                 && wf.get_tensor_ptr(&format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).is_some();
-            if gpu_combined {
+            if do_gpu_norm {
                 let next_norm_ptr = wf.get_tensor_ptr(
                     &format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).unwrap();
                 let next_norm_off = (next_norm_ptr as usize - gw.base as usize) as u64;
@@ -1495,13 +1819,13 @@ pub fn moe_layer_forward(
             let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_w_off) as *const u32, layout.gate_w_size / 4) };
             let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_s_off) as *const u16, layout.gate_s_size / 2) };
             let gb = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_b_off) as *const u16, layout.gate_b_size / 2) };
-            cpu_dequant_matvec_4bit(gw, gs, gb, &h_post, &mut gate_tmp, moe_inter, hidden_dim, GROUP_SIZE);
+            dequant_matvec_4bit(gw, gs, gb, &h_post, &mut gate_tmp, moe_inter, hidden_dim, GROUP_SIZE);
 
             // up_proj
             let uw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.up_w_off) as *const u32, layout.up_w_size / 4) };
             let us = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.up_s_off) as *const u16, layout.up_s_size / 2) };
             let ub = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.up_b_off) as *const u16, layout.up_b_size / 2) };
-            cpu_dequant_matvec_4bit(uw, us, ub, &h_post, &mut up_tmp, moe_inter, hidden_dim, GROUP_SIZE);
+            dequant_matvec_4bit(uw, us, ub, &h_post, &mut up_tmp, moe_inter, hidden_dim, GROUP_SIZE);
 
             // SwiGLU
             for i in 0..moe_inter {
@@ -1514,7 +1838,7 @@ pub fn moe_layer_forward(
             let dw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.down_w_off) as *const u32, layout.down_w_size / 4) };
             let ds = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.down_s_off) as *const u16, layout.down_s_size / 2) };
             let db = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.down_b_off) as *const u16, layout.down_b_size / 2) };
-            cpu_dequant_matvec_4bit(dw, ds, db, &act_tmp, &mut eout, hidden_dim, moe_inter, GROUP_SIZE);
+            dequant_matvec_4bit(dw, ds, db, &act_tmp, &mut eout, hidden_dim, moe_inter, GROUP_SIZE);
 
             for d in 0..hidden_dim {
                 moe_out[d] += eout[d] * ew;
@@ -1552,10 +1876,10 @@ pub fn moe_layer_forward(
         wf.get_tensor_u16(&format!("{}.shared_expert.down_proj.scales", prefix)),
         wf.get_tensor_u16(&format!("{}.shared_expert.down_proj.biases", prefix)),
     ) {
-        cpu_dequant_matvec_4bit(sdw, sds, sdb, &shared_act, &mut shared_out, hidden_dim, shared_inter, GROUP_SIZE);
+        dequant_matvec_4bit(sdw, sds, sdb, &shared_act, &mut shared_out, hidden_dim, shared_inter, GROUP_SIZE);
     }
 
-    let shared_weight = cpu_sigmoid(shared_gate_score);
+    let shared_weight = sigmoid(shared_gate_score);
 
     // ── Final combine: hidden = h_mid + moe_out + shared_weight * shared_out ──
     for i in 0..hidden_dim {
@@ -1563,4 +1887,234 @@ pub fn moe_layer_forward(
     }
 
     Ok(None)
+}
+
+// ─── General-purpose token processing (dispatches by pipeline mode) ────────
+
+pub fn process_token_inner(
+    exec: &mut ExecCtxGpu<'_>,
+    hidden: &mut [f32],
+    pos: usize,
+    kv: &mut [Option<FullAttnCache>],
+    lin: &mut [Option<LinearAttnState>],
+    check_signal: SignalCheckFn<'_>,
+    capture_per_layer: bool,
+    layer_outputs: &mut Vec<Vec<f32>>,
+    use_fusedwoods: bool,
+) -> Result<(), String> {
+    let mut deferred: Option<DeferredExperts> = None;
+    let hd = exec.config.hidden_dim;
+    for layer in 0..exec.config.num_layers {
+        if layer % 4 == 0 && check_signal() {
+            return Err("interrupted".into());
+        }
+        let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
+        if !prev_gpu_combined {
+            if let Some(ref mut def) = deferred.take() {
+                def.complete(hidden, hd);
+            }
+        }
+        let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+        let mut attn_state: Option<FullAttnCmd2State> = None;
+        let mut lin_state: Option<LinearAttnFusedWoodsState> = None;
+        let mut h_mid_saved: Option<Vec<f32>> = None;
+        if is_full {
+            if prev_gpu_combined {
+                if let Some(ref mut def) = deferred.take() {
+                    def.complete_fast(hidden, hd);
+                }
+                h_mid_saved = Some(hidden.to_vec());
+            }
+            if let Some(ref mut kv) = kv[layer] {
+                attn_state = mixed_full_attention_forward(
+                    exec.wf, layer, hidden, kv, pos, exec.config,
+                    Some(exec.gpu_wf), Some(exec.ctx));
+            }
+        } else if let Some(ref mut s) = lin[layer] {
+            let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
+            if use_fusedwoods && !prev_gpu_combined {
+                h_mid_saved = Some(hidden.to_vec());
+            }
+            lin_state = linear_attention_forward(
+                exec.wf, layer, hidden, s,
+                hd,
+                exec.config.linear_num_k_heads, exec.config.linear_num_v_heads,
+                exec.config.linear_total_key, exec.config.linear_total_value,
+                exec.config.linear_conv_dim,
+                Some(exec.gpu_wf), Some(exec.ctx), li,
+                false, use_fusedwoods, prev_gpu_combined,
+            );
+            if prev_gpu_combined {
+                if let Some(ref mut def) = deferred.take() {
+                    def.complete_fast(hidden, hd);
+                }
+                if let Some(ref mut ls) = lin_state {
+                    ls.h_mid.copy_from_slice(hidden);
+                }
+                h_mid_saved = Some(hidden.to_vec());
+            }
+            if let Some(ref hmid) = h_mid_saved {
+                hidden.copy_from_slice(hmid);
+            }
+        }
+        let r = moe_layer_forward(
+            exec.wf, layer, hidden, exec.expert_fds[layer],
+            Some(exec.ctx), Some(exec.gpu_wf), exec.config,
+            attn_state, lin_state,
+            exec.expert_gpu_buffer.as_mut().map(|x| &mut **x),
+            use_fusedwoods,
+        );
+        deferred = r.unwrap_or(None);
+        if capture_per_layer {
+            layer_outputs.push(hidden.to_vec());
+        }
+    }
+    if let Some(ref mut def) = deferred {
+        def.complete(hidden, hd);
+    }
+    Ok(())
+}
+
+pub fn process_token(
+    exec: &mut ExecCtxGpu<'_>,
+    hidden: &mut [f32],
+    pos: usize,
+    kv: &mut [Option<FullAttnCache>],
+    lin: &mut [Option<LinearAttnState>],
+    check_signal: SignalCheckFn<'_>,
+) -> Result<(), String> {
+    process_token_inner(exec, hidden, pos, kv, lin, check_signal, false, &mut Vec::new(), false)
+}
+// ─── Token embedding lookup ────────────────────────────────────────────────
+
+pub fn embed_lookup(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
+    let (Some(w), Some(s), Some(b)) = (
+        wf.get_tensor_u32("model.embed_tokens.weight"),
+        wf.get_tensor_u16("model.embed_tokens.scales"),
+        wf.get_tensor_u16("model.embed_tokens.biases"),
+    ) else {
+        out.fill(0.0);
+        return;
+    };
+    let w_info = wf.get_tensor_info("model.embed_tokens.weight").unwrap();
+    let packed_cols = w_info.shape[1];
+    let s_info = wf.get_tensor_info("model.embed_tokens.scales").unwrap();
+    let num_groups = s_info.shape[1];
+    let group_size = hidden_dim / num_groups;
+    let packed_per_group = group_size / 8;
+    let w_row = &w[token_id * packed_cols..];
+    let s_row = &s[token_id * num_groups..];
+    let b_row = &b[token_id * num_groups..];
+    for g in 0..num_groups {
+        let scale = bf16_to_f32(s_row[g]);
+        let bias = bf16_to_f32(b_row[g]);
+        let base = g * group_size;
+        for p in 0..packed_per_group {
+            let packed = w_row[g * packed_per_group + p];
+            for n in 0..8 {
+                let nibble = (packed >> (n * 4)) & 0xF;
+                out[base + p * 8 + n] = (nibble as f32) * scale + bias;
+            }
+        }
+    }
+}
+
+// ─── Final RMS norm ────────────────────────────────────────────────────────
+
+pub fn final_norm(wf: &WeightFile, hidden: &mut [f32], hidden_dim: usize) {
+    let Some(fnw_u16) = wf.get_tensor_u16("model.norm.weight") else { return };
+    let fnw_f32: Vec<f32> = fnw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+    let sum_sq: f32 = hidden[..hidden_dim].iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + RMS_NORM_EPS).sqrt();
+    for i in 0..hidden_dim {
+        hidden[i] *= inv_rms * fnw_f32[i];
+    }
+}
+
+// ─── LM head (GPU matvec) ──────────────────────────────────────────────────
+
+pub fn gpu_lm_head(
+    wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
+    gpu_wf: &GpuWeightCtx, ctx: &MetalContext,
+) {
+    let x_buf = metal_buf_shared(&ctx.device, hidden.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(hidden.as_ptr(), x_buf.contents() as *mut f32, hidden.len());
+    }
+    let out_buf = metal_buf_shared(&ctx.device, logits.len() * 4);
+    let cm = ctx.queue.new_command_buffer();
+    let enc = cm.new_compute_command_encoder();
+    gpu_wf.encode_matvec_into(wf, ctx, &enc, "lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
+    enc.end_encoding();
+    cm.commit();
+    cm.wait_until_completed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            out_buf.contents() as *const f32, logits.as_mut_ptr(), logits.len());
+    }
+}
+
+/// CPU-only lm_head: dequant matvec for vocab projection.
+pub fn lm_head(wf: &WeightFile, hidden: &[f32], logits: &mut [f32]) {
+    let prefix = "lm_head";
+    let hd = hidden.len();
+    if let (Some(w), Some(s), Some(b)) = (
+        wf.get_tensor_u32(&format!("{}.weight", prefix)),
+        wf.get_tensor_u16(&format!("{}.scales", prefix)),
+        wf.get_tensor_u16(&format!("{}.biases", prefix)),
+    ) {
+        dequant_matvec_4bit(w, s, b, hidden, logits, logits.len(), hd, GROUP_SIZE);
+    }
+}
+
+// ─── Sampling ───────────────────────────────────────────────────────────────
+
+
+pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
+    let n = logits.len();
+    if (temperature - 1.0).abs() > 1e-7 {
+        let inv = 1.0 / temperature.max(1e-8);
+        for v in logits.iter_mut() { *v *= inv; }
+    }
+    if temperature < 0.01 {
+        return logits.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+    }
+    softmax(logits);
+
+    if top_k > 0 && top_k < n {
+        let mut v: Vec<f32> = logits.to_vec();
+        v.select_nth_unstable_by(top_k, |a, b| b.partial_cmp(a).unwrap());
+        let t = v[top_k - 1];
+        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
+    }
+    if top_p < 1.0 {
+        let mut s: Vec<f32> = logits.iter().copied().filter(|&x| x > 0.0).collect();
+        s.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        let total: f32 = s.iter().sum();
+        let mut cum = 0.0;
+        let mut cut = 0.0;
+        for v in s {
+            cum += v;
+            if cum / total >= top_p { cut = v; break; }
+        }
+        for x in logits.iter_mut() { if *x < cut { *x = 0.0; } }
+    }
+    if min_p > 0.0 {
+        let max_p = logits.iter().fold(0.0f32, |a, &b| a.max(b));
+        let t = max_p * min_p;
+        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
+    }
+
+    let sum: f32 = logits.iter().sum();
+    if sum <= 0.0 { return 0; }
+    let inv = 1.0 / sum;
+    let r: f32 = rand::thread_rng().gen();
+    let mut cum = 0.0;
+    for (i, &v) in logits.iter().enumerate() {
+        cum += v * inv;
+        if r <= cum { return i; }
+    }
+    n - 1
 }

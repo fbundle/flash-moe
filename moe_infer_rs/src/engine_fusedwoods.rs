@@ -5,18 +5,12 @@
 /// CMD3: experts + combine + GPU-side input_norm (async, deferred commit)
 use metal::Buffer;
 use crate::metal_kernels;
-use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
-use crate::weights::WeightFile;
-use crate::pipeline_common::{LinearAttnState, CONV_KERNEL_SIZE};
-
-/// GPU/CPU state from linear attention CMD1 for FusedWoods.
-pub struct LinearAttnFusedWoodsState {
-    pub gated_buf: Buffer,
-    pub h_mid: Vec<f32>,
-    pub total_value: usize,
-    pub o_prefix: String,
-    pub post_norm_name: String,
-}
+use crate::metal_context::{metal_buf_shared, ExpertBuffer, GpuWeightCtx, MetalContext};
+use crate::model_weights::WeightFile;
+use crate::constants::CONV_KERNEL_SIZE;
+use crate::engine::{Cache, Engine, LinearAttnState, Model};
+use crate::engine_common::{embed_lookup, final_norm, gpu_lm_head, ExecCtxGpu, SignalCheckFn};
+use crate::engine_common::{process_token_inner, LinearAttnFusedWoodsState};
 
 /// Run FusedWoods CMD1: attention projections → conv1d → SSM → gated_rms_norm.
 ///
@@ -165,5 +159,69 @@ pub fn fusedwoods_cmd1(
         total_value,
         o_prefix: format!("{}.out_proj", prefix),
         post_norm_name: format!("model.layers.{}.post_attention_layernorm.weight", layer_idx),
+    }
+}
+
+// ─── EngineFusedWoods ─────────────────────────────────────────────────────
+
+pub struct EngineFusedWoods<'a> {
+    pub model: &'a Model,
+    pub ctx: &'a MetalContext,
+    pub gpu_wf: &'a GpuWeightCtx,
+    pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+}
+
+impl<'a> EngineFusedWoods<'a> {
+    fn make_exec_ctx(&mut self) -> ExecCtxGpu<'_> {
+        ExecCtxGpu {
+            wf: &self.model.wf,
+            ctx: self.ctx,
+            gpu_wf: self.gpu_wf,
+            config: &self.model.config,
+            expert_fds: &self.model.expert_fds,
+            expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
+        }
+    }
+}
+
+impl<'a> Engine for EngineFusedWoods<'a> {
+    fn forward(
+        &mut self,
+        input_ids: &[i64],
+        cache: &mut Cache,
+        mut check_signal: SignalCheckFn<'_>,
+    ) -> Result<Vec<f32>, String> {
+        let n = input_ids.len();
+        let hd = self.model.config.hidden_dim;
+        let vs = self.model.config.vocab_size;
+
+        let mut logits = vec![0.0f32; n * vs];
+        if n == 0 {
+            return Ok(logits);
+        }
+
+        let mut embed = vec![0.0f32; n * hd];
+        for (i, &id) in input_ids.iter().enumerate() {
+            embed_lookup(&self.model.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
+        }
+
+        let mut hidden = vec![0.0f32; hd];
+        for (ti, _) in input_ids.iter().enumerate() {
+            hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
+            let mut exec = self.make_exec_ctx();
+            process_token_inner(
+                &mut exec, &mut hidden,
+                cache.pos, &mut cache.kv, &mut cache.lin,
+                &mut || check_signal(), false, &mut Vec::new(),
+                true,
+            )?;
+            cache.pos += 1;
+            final_norm(exec.wf, &mut hidden, hd);
+            gpu_lm_head(exec.wf, &hidden,
+                &mut logits[ti * vs..(ti + 1) * vs],
+                exec.gpu_wf, exec.ctx);
+        }
+
+        Ok(logits)
     }
 }

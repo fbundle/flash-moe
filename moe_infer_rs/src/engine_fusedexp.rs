@@ -16,13 +16,17 @@ use metal::{Buffer, ComputeCommandEncoderRef};
 
 use crate::metal_kernels;
 use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
-use crate::pipeline_common::{
-    bf16_to_f32, cpu_normalize_weights, cpu_softmax, cpu_topk,
-    DeferredExperts, ExecCtx, FullAttnCache, FullAttnCmd2State, LinearAttnState,
-    SignalCheckFn, CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, RMS_NORM_EPS,
+use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
+use crate::engine::{Cache, Engine, FullAttnCache, LinearAttnState, Model};
+use crate::metal_context::ExpertBuffer;
+use crate::engine_common::{
+    bf16_to_f32, normalize_weights, softmax, topk,
+    embed_lookup, final_norm, gpu_lm_head,
+    DeferredExperts, ExecCtxGpu, FullAttnCmd2State,
+    SignalCheckFn,
 };
-use crate::pipeline_gpu::{full_attention_forward, moe_layer_forward};
-use crate::weights::WeightFile;
+use crate::engine_common::{gpu_full_attention_forward, moe_layer_forward};
+use crate::model_weights::WeightFile;
 
 /// Encode post_expert for a previously-routed layer into a command encoder.
 ///
@@ -57,11 +61,11 @@ pub fn encode_post_expert(
     moe_inter: usize,
     shared_inter: usize,
     num_experts_per_tok: usize,
-    layout: &crate::config::ExpertLayout,
+    layout: &crate::model_config::ExpertLayout,
 ) {
     let hidden_u32 = hidden_dim as u32;
     let inter_u32 = moe_inter as u32;
-    let gs_u32 = crate::pipeline_common::GROUP_SIZE as u32;
+    let gs_u32 = GROUP_SIZE as u32;
     let actual_k = num_experts_per_tok.min(MAX_K);
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
@@ -167,7 +171,7 @@ pub fn encode_post_expert(
         enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
         unsafe {
             enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
-            let eps = crate::pipeline_common::RMS_NORM_EPS;
+            let eps = RMS_NORM_EPS;
             enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
         }
         enc.dispatch_thread_groups(
@@ -326,7 +330,7 @@ pub fn encode_pre_expert(
         enc.set_buffer(3, Some(c.buf_post_normed.as_ref().unwrap()), 0);
         unsafe {
             enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &crate::pipeline_common::RMS_NORM_EPS as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const std::ffi::c_void);
         }
         enc.dispatch_thread_groups(
             metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
@@ -363,7 +367,7 @@ pub fn update_conv_state(state: &mut LinearAttnState, qkv_dim: usize) {
 /// Full attention layers break the pipeline and are handled with the existing
 /// CMD2 fusion approach. Consecutive linear layers are pipelined.
 pub fn process_token_fusedexp_pipelined(
-    exec: &mut ExecCtx<'_>,
+    exec: &mut ExecCtxGpu<'_>,
     hidden: &mut [f32],
     pos: usize,
     kv: &mut [Option<FullAttnCache>],
@@ -417,7 +421,7 @@ pub fn process_token_fusedexp_pipelined(
         };
 
     let route_and_pread = |ctx: &MetalContext,
-                           expert_io: &mut crate::metal_context::ExpertIOState,
+                           expert_gpu_buffer: &mut crate::metal_context::ExpertBuffer,
                            layer_idx: usize,
                            layer_fd: RawFd|
         -> (Vec<usize>, Vec<f32>, f32)
@@ -431,11 +435,11 @@ pub fn process_token_fusedexp_pipelined(
         let shared_gate_score =
             unsafe { *(ctx.buf_shared_gate_score.as_ref().unwrap().contents() as *const f32) };
 
-        cpu_softmax(&mut gate_scores);
+        softmax(&mut gate_scores);
         let mut expert_indices = vec![0usize; k];
         let mut expert_weights = vec![0.0f32; k];
-        cpu_topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
-        cpu_normalize_weights(&mut expert_weights);
+        topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
+        normalize_weights(&mut expert_weights);
 
         let actual_k = k.min(MAX_K);
         let mut miss_ei = [0usize; MAX_K];
@@ -443,8 +447,8 @@ pub fn process_token_fusedexp_pipelined(
         let mut miss_count = 0;
         for ki in 0..actual_k {
             let eidx = expert_indices[ki];
-            if let Some(buf) = expert_io.cache.lookup(layer_idx, eidx) {
-                expert_io.expert_data[ki] = buf;
+            if let Some(buf) = expert_gpu_buffer.cache.lookup(layer_idx, eidx) {
+                expert_gpu_buffer.expert_data[ki] = buf;
             } else {
                 miss_ei[miss_count] = eidx;
                 miss_k_slot[miss_count] = ki;
@@ -454,8 +458,8 @@ pub fn process_token_fusedexp_pipelined(
         for m in 0..miss_count {
             let ki = miss_k_slot[m];
             let eidx = miss_ei[m];
-            let buf = expert_io.cache.insert_get_buf(layer_idx, eidx);
-            expert_io.expert_data[ki] = buf;
+            let buf = expert_gpu_buffer.cache.insert_get_buf(layer_idx, eidx);
+            expert_gpu_buffer.expert_data[ki] = buf;
         }
         if miss_count > 0 {
             let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> =
@@ -463,7 +467,7 @@ pub fn process_token_fusedexp_pipelined(
             for m in 0..miss_count {
                 let ki = miss_k_slot[m];
                 let eidx = miss_ei[m];
-                let ptr = expert_io.expert_data[ki].contents() as usize;
+                let ptr = expert_gpu_buffer.expert_data[ki].contents() as usize;
                 pread_tasks.push((
                     layer_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
             }
@@ -495,15 +499,16 @@ pub fn process_token_fusedexp_pipelined(
             }
             let mut attn_state: Option<FullAttnCmd2State> = None;
             if let Some(ref mut kv_entry) = kv[layer] {
-                attn_state = full_attention_forward(
+                attn_state = gpu_full_attention_forward(
                     exec.wf, layer, hidden, kv_entry, pos, exec.config,
-                    Some(exec.gpu_wf), Some(exec.ctx), exec.pipeline_mode,
+                    exec.gpu_wf, exec.ctx,
                 );
             }
             let r = moe_layer_forward(
                 exec.wf, layer, hidden, exec.expert_fds[layer],
                 Some(exec.ctx), Some(exec.gpu_wf), exec.config,
-                exec.pipeline_mode, attn_state, None, exec.expert_io.as_mut().map(|x| &mut **x),
+                attn_state, None, exec.expert_gpu_buffer.as_mut().map(|x| &mut **x),
+                true,
             );
             pending_deferred = r.unwrap_or(None);
             layer += 1;
@@ -551,7 +556,7 @@ pub fn process_token_fusedexp_pipelined(
 
         let (expert_indices_0, expert_weights_0, shared_gate_score_0) =
             route_and_pread(
-                exec.ctx, exec.expert_io.as_mut().unwrap(),
+                exec.ctx, exec.expert_gpu_buffer.as_mut().unwrap(),
                 first_layer, exec.expert_fds[first_layer]);
 
         let mut _prev_expert_indices = expert_indices_0;
@@ -572,7 +577,7 @@ pub fn process_token_fusedexp_pipelined(
             let enc = cmd.new_compute_command_encoder();
 
             {
-                let io = exec.expert_io.as_ref().unwrap();
+                let io = exec.expert_gpu_buffer.as_ref().unwrap();
                 encode_post_expert(
                     exec.wf, exec.gpu_wf, exec.ctx, &enc, prev_layer,
                     &prev_expert_weights, prev_shared_gate_score,
@@ -609,7 +614,7 @@ pub fn process_token_fusedexp_pipelined(
 
             {
                 let (indices, weights, gate_score) = route_and_pread(
-                    exec.ctx, exec.expert_io.as_mut().unwrap(),
+                    exec.ctx, exec.expert_gpu_buffer.as_mut().unwrap(),
                     curr_layer, exec.expert_fds[curr_layer]);
                 _prev_expert_indices = indices;
                 prev_expert_weights = weights;
@@ -630,7 +635,7 @@ pub fn process_token_fusedexp_pipelined(
             let cmd = exec.ctx.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             {
-                let io = exec.expert_io.as_ref().unwrap();
+                let io = exec.expert_gpu_buffer.as_ref().unwrap();
                 encode_post_expert(
                     exec.wf, exec.gpu_wf, exec.ctx, &enc, last_layer,
                     &prev_expert_weights, prev_shared_gate_score,
@@ -665,3 +670,67 @@ pub fn process_token_fusedexp_pipelined(
 
     Ok(())
 }
+
+// ─── EngineFusedExp ───────────────────────────────────────────────────────
+
+pub struct EngineFusedExp<'a> {
+    pub model: &'a Model,
+    pub ctx: &'a MetalContext,
+    pub gpu_wf: &'a GpuWeightCtx,
+    pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+}
+
+impl<'a> EngineFusedExp<'a> {
+    fn make_exec_ctx(&mut self) -> ExecCtxGpu<'_> {
+        ExecCtxGpu {
+            wf: &self.model.wf,
+            ctx: self.ctx,
+            gpu_wf: self.gpu_wf,
+            config: &self.model.config,
+            expert_fds: &self.model.expert_fds,
+            expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
+        }
+    }
+}
+
+impl<'a> Engine for EngineFusedExp<'a> {
+    fn forward(
+        &mut self,
+        input_ids: &[i64],
+        cache: &mut Cache,
+        mut check_signal: SignalCheckFn<'_>,
+    ) -> Result<Vec<f32>, String> {
+        let n = input_ids.len();
+        let hd = self.model.config.hidden_dim;
+        let vs = self.model.config.vocab_size;
+
+        let mut logits = vec![0.0f32; n * vs];
+        if n == 0 {
+            return Ok(logits);
+        }
+
+        let mut embed = vec![0.0f32; n * hd];
+        for (i, &id) in input_ids.iter().enumerate() {
+            embed_lookup(&self.model.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
+        }
+
+        let mut hidden = vec![0.0f32; hd];
+        for (ti, _) in input_ids.iter().enumerate() {
+            hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
+            let mut exec = self.make_exec_ctx();
+            process_token_fusedexp_pipelined(
+                &mut exec, &mut hidden,
+                cache.pos, &mut cache.kv, &mut cache.lin,
+                &mut || check_signal(), false, &mut Vec::new(),
+            )?;
+            cache.pos += 1;
+            final_norm(exec.wf, &mut hidden, hd);
+            gpu_lm_head(exec.wf, &hidden,
+                &mut logits[ti * vs..(ti + 1) * vs],
+                exec.gpu_wf, exec.ctx);
+        }
+
+        Ok(logits)
+    }
+}
+
