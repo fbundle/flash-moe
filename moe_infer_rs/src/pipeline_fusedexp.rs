@@ -12,7 +12,7 @@
 /// ```
 use metal::{Buffer, ComputeCommandEncoderRef};
 use crate::kernels;
-use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
+use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
 use crate::weights::WeightFile;
 use crate::pipeline_common::{LinearAttnState, CONV_KERNEL_SIZE};
 
@@ -54,7 +54,7 @@ pub fn encode_post_expert(
     let hidden_u32 = hidden_dim as u32;
     let inter_u32 = moe_inter as u32;
     let gs_u32 = crate::pipeline_common::GROUP_SIZE as u32;
-    let actual_k = num_experts_per_tok.min(crate::pipeline_common::MAX_K);
+    let actual_k = num_experts_per_tok.min(MAX_K);
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
     let post_normed = ctx.buf_post_normed.as_ref().unwrap();
@@ -103,17 +103,19 @@ pub fn encode_post_expert(
         shared_down_buf, 0, hidden_dim, shared_inter);
 
     // ── moe_combine_residual ──
-    // Reads: buf_moe_hidden (= previous combine output or initial residual)
-    //        shared_down_buf, expert_out_bufs[0..K-1], combine_params_buf
-    // Writes: buf_moe_hidden
+    // h_mid = buf_temp_residual = previous_layer_output + current_attention_output.
+    // This is set by pre_expert(L)'s residual_add in the previous CMD (or by CPU
+    // upload for the very first layer). Using buf_moe_hidden directly would miss
+    // the attention contribution.
+    // Writes: buf_moe_hidden = h_mid + moe_out + shared_out
     {
         let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
         enc.set_compute_pipeline_state(mcr_pipe);
-        let hmid_src = ctx.buf_moe_hidden.as_ref().unwrap();
+        let hmid_src = ctx.buf_temp_residual.as_ref().unwrap();
         enc.set_buffer(0, Some(hmid_src), 0);
         enc.set_buffer(1, Some(shared_down_buf), 0);
         enc.set_buffer(2, Some(ctx.buf_moe_hidden.as_ref().unwrap()), 0);
-        for ei in 0..crate::pipeline_common::MAX_K {
+        for ei in 0..MAX_K {
             if ei < actual_k {
                 enc.set_buffer(3 + ei as u64, Some(&expert_out_bufs[ei]), 0);
             } else {

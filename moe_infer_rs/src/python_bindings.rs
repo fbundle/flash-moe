@@ -165,6 +165,332 @@ fn lm_head(
     }
 }
 
+/// Pipelined FusedExp: N+1 command buffers for N consecutive linear layers.
+///
+/// CMD layout for a group of M linear layers [L0..L_{M-1}]:
+///   CMD 0: pre_expert(L0)
+///   CMD i (1..M-1): post_expert(L_{i-1}) + pre_expert(L_i)
+///   CMD M: post_expert(L_{M-1})
+///
+/// Full attention layers break the pipeline and are handled with the existing
+/// CMD2 fusion approach. Consecutive linear layers are pipelined.
+fn process_token_fusedexp_pipelined(
+    m: &mut ModelState,
+    hidden: &mut [f32],
+    pos: usize,
+    kv: &mut [Option<FullAttnCache>],
+    lin: &mut [Option<LinearAttnState>],
+    py: Python<'_>,
+    capture_per_layer: bool,
+    layer_outputs: &mut Vec<Vec<f32>>,
+) -> PyResult<()> {
+    use crate::pipeline_common::{cpu_softmax, cpu_topk, cpu_normalize_weights, CONV_KERNEL_SIZE};
+    use crate::metal_context::{ExpertIOState, MAX_K};
+
+    let hd = m.config.hidden_dim;
+    let num_layers = m.config.num_layers;
+    let num_experts = m.config.num_experts;
+    let moe_inter = m.config.moe_intermediate;
+    let shared_inter = m.config.shared_intermediate;
+    let k = m.config.num_experts_per_tok;
+    let expert_size = m.config.expert_size_4bit;
+    let layout = &m.config.expert_layout_4bit;
+    let qkv_dim = m.config.linear_conv_dim;
+    let total_key = m.config.linear_total_key;
+    let total_val = m.config.linear_total_value;
+    let num_k_heads = m.config.linear_num_k_heads;
+    let num_v_heads = m.config.linear_num_v_heads;
+    let key_dim = total_key / num_k_heads;
+    let val_dim = total_val / num_v_heads;
+    let inv_scale = 1.0 / (key_dim as f32).sqrt();
+    let k_heads_per_v = num_v_heads / num_k_heads;
+
+    // Helper: upload hidden to GPU buffers for the first layer of a pipeline group.
+    // buf_moe_hidden = hidden (residual for residual_add in pre_expert)
+    // buf_input = CPU input_norm(hidden, layer's input_layernorm weight)
+    let upload_first_layer = |ctx: &MetalContext, wf: &WeightFile, hidden: &[f32], layer_idx: usize| {
+        let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
+        unsafe { std::ptr::copy_nonoverlapping(hidden.as_ptr(), buf_moe.contents() as *mut f32, hd); }
+        let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
+        let buf_in = ctx.buf_input.as_ref().unwrap();
+        if let Some(nw_u16) = wf.get_tensor_u16(&norm_name) {
+            let nw: Vec<f32> = nw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+            let sum_sq: f32 = hidden[..hd].iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hd as f32 + RMS_NORM_EPS).sqrt();
+            unsafe {
+                let dst = buf_in.contents() as *mut f32;
+                for i in 0..hd {
+                    *dst.add(i) = hidden[i] * inv_rms * nw[i];
+                }
+            }
+        } else {
+            unsafe { std::ptr::copy_nonoverlapping(hidden.as_ptr(), buf_in.contents() as *mut f32, hd); }
+        }
+    };
+
+    // Helper: route + pread for a layer after its pre_expert completed.
+    // Reads gate_scores from GPU, does softmax+topk, preads experts into expert_io.
+    let route_and_pread = |ctx: &MetalContext,
+                           expert_io: &mut ExpertIOState,
+                           layer_idx: usize,
+                           layer_fd: RawFd|
+        -> (Vec<usize>, Vec<f32>, f32)
+    {
+        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap();
+        let mut gate_scores = vec![0.0f32; num_experts];
+        unsafe { std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts); }
+        let shared_gate_score = unsafe { *(ctx.buf_shared_gate_score.as_ref().unwrap().contents() as *const f32) };
+
+        cpu_softmax(&mut gate_scores);
+        let mut expert_indices = vec![0usize; k];
+        let mut expert_weights = vec![0.0f32; k];
+        cpu_topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
+        cpu_normalize_weights(&mut expert_weights);
+
+        let actual_k = k.min(MAX_K);
+        let mut miss_ei = [0usize; MAX_K];
+        let mut miss_k_slot = [0usize; MAX_K];
+        let mut miss_count = 0;
+        for ki in 0..actual_k {
+            let eidx = expert_indices[ki];
+            if let Some(buf) = expert_io.cache.lookup(layer_idx, eidx) {
+                expert_io.expert_data[ki] = buf;
+            } else {
+                miss_ei[miss_count] = eidx;
+                miss_k_slot[miss_count] = ki;
+                miss_count += 1;
+            }
+        }
+        for m in 0..miss_count {
+            let ki = miss_k_slot[m];
+            let eidx = miss_ei[m];
+            let buf = expert_io.cache.insert_get_buf(layer_idx, eidx);
+            expert_io.expert_data[ki] = buf;
+        }
+        if miss_count > 0 {
+            let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
+            for m in 0..miss_count {
+                let ki = miss_k_slot[m];
+                let eidx = miss_ei[m];
+                let ptr = expert_io.expert_data[ki].contents() as usize;
+                pread_tasks.push((layer_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+            }
+            rayon::scope(|s| {
+                for (fd, dst, sz, off) in pread_tasks {
+                    s.spawn(move |_| {
+                        unsafe { libc::pread(fd, dst as *mut std::ffi::c_void, sz, off); }
+                    });
+                }
+            });
+        }
+        (expert_indices, expert_weights, shared_gate_score)
+    };
+
+    let mut layer = 0;
+    let mut pending_deferred: Option<DeferredExperts> = None;
+    while layer < num_layers {
+        py.check_signals()?;
+
+        let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+
+        if is_full {
+            // ── Full attention layer: use existing approach, defer CMD3 ──
+            // Complete pending deferred from previous layer first (if any)
+            if let Some(ref mut def) = pending_deferred.take() {
+                def.complete(hidden, hd);
+                if capture_per_layer {
+                    layer_outputs.push(hidden.to_vec());
+                }
+            }
+
+            let mut attn_state: Option<FullAttnCmd2State> = None;
+            if let Some(ref mut kv_entry) = kv[layer] {
+                attn_state = full_attention_forward(
+                    &m.wf, layer, hidden, kv_entry, pos, &m.config,
+                    Some(&m.gpu_wf), Some(&m.ctx), m.pipeline_mode,
+                );
+            }
+            let r = moe_layer_forward(
+                &m.wf, layer, hidden, m.layer_fds[layer],
+                Some(&m.ctx), Some(&m.gpu_wf), &m.config,
+                m.pipeline_mode, attn_state, None, m.expert_io.as_mut(),
+            );
+            // Defer CMD3 completion — will be completed before next pipeline group
+            pending_deferred = r.unwrap_or(None);
+            // Capture deferred until completion
+            layer += 1;
+            continue;
+        }
+
+        // ── Gather consecutive linear layers into a pipeline group ──
+        let group_start = layer;
+        while layer < num_layers && (layer + 1) % FULL_ATTN_INTERVAL != 0 {
+            layer += 1;
+        }
+        let group_layers: Vec<usize> = (group_start..layer).collect();
+        let m_layers = group_layers.len();
+        if m_layers == 0 { continue; }
+
+        let first_layer = group_layers[0];
+        let last_layer = group_layers[m_layers - 1];
+
+        // Complete pending deferred from previous full-attn layer before upload
+        if let Some(ref mut def) = pending_deferred.take() {
+            def.complete(hidden, hd);
+            if capture_per_layer {
+                layer_outputs.push(hidden.to_vec());
+            }
+        }
+
+        // Upload initial hidden for first layer of the group
+        upload_first_layer(&m.ctx, &m.wf, hidden, first_layer);
+
+        // ── CMD 0: pre_expert(first_layer) ──
+        {
+            let li = first_layer - (first_layer + 1) / FULL_ATTN_INTERVAL;
+            let cmd = m.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            crate::pipeline_fusedexp::encode_pre_expert(
+                &m.wf, &m.gpu_wf, &m.ctx, &enc, first_layer, li,
+                hd, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
+                key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // Update conv_state on CPU
+            if let Some(ref mut s) = lin[first_layer] {
+                crate::pipeline_fusedexp::update_conv_state(s, qkv_dim);
+            }
+        }
+
+        // Route for first layer
+        let (expert_indices_0, expert_weights_0, shared_gate_score_0) =
+            route_and_pread(&m.ctx, m.expert_io.as_mut().unwrap(), first_layer, m.layer_fds[first_layer]);
+
+        // ── Middle CMDs: post_expert(L_{i-1}) + pre_expert(L_i) ──
+        // Keep track of the previous layer's routing results for the current CMD
+        let mut prev_expert_indices = expert_indices_0;
+        let mut prev_expert_weights = expert_weights_0;
+        let mut prev_shared_gate_score = shared_gate_score_0;
+
+        for gi in 1..m_layers {
+            let prev_layer = group_layers[gi - 1];
+            let curr_layer = group_layers[gi];
+            let curr_li = curr_layer - (curr_layer + 1) / FULL_ATTN_INTERVAL;
+
+            // Next layer's norm weight for GPU input_norm in post_expert
+            let next_norm = m.wf.get_tensor_ptr(
+                &format!("model.layers.{}.input_layernorm.weight", curr_layer));
+            let next_norm_info = next_norm.map(|p| (p as *const std::ffi::c_void, m.gpu_wf.base as usize));
+
+            let cmd = m.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+
+            // post_expert(prev_layer)
+            {
+                let io = m.expert_io.as_ref().unwrap();
+                crate::pipeline_fusedexp::encode_post_expert(
+                    &m.wf, &m.gpu_wf, &m.ctx, &enc, prev_layer,
+                    &prev_expert_weights, prev_shared_gate_score,
+                    &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
+                    &io.expert_out, &io.shared_act, &io.shared_down, &io.combine_params,
+                    next_norm_info,
+                    hd, moe_inter, shared_inter, k, layout,
+                );
+            }
+
+            // pre_expert(curr_layer)
+            crate::pipeline_fusedexp::encode_pre_expert(
+                &m.wf, &m.gpu_wf, &m.ctx, &enc, curr_layer, curr_li,
+                hd, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
+                key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
+            );
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // Update conv_state for curr_layer
+            if let Some(ref mut s) = lin[curr_layer] {
+                crate::pipeline_fusedexp::update_conv_state(s, qkv_dim);
+            }
+
+            // Capture hidden for prev_layer (buf_moe_hidden has post_expert(prev_layer) output)
+            if capture_per_layer {
+                let mut h = vec![0.0f32; hd];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        m.ctx.buf_moe_hidden.as_ref().unwrap().contents() as *const f32,
+                        h.as_mut_ptr(), hd);
+                }
+                layer_outputs.push(h);
+            }
+
+            // Route for curr_layer (needed by next iteration's post_expert or last CMD)
+            {
+                let (indices, weights, gate_score) =
+                    route_and_pread(&m.ctx, m.expert_io.as_mut().unwrap(), curr_layer, m.layer_fds[curr_layer]);
+                prev_expert_indices = indices;
+                prev_expert_weights = weights;
+                prev_shared_gate_score = gate_score;
+            }
+        }
+
+        // ── Last CMD: post_expert(last_layer) only ──
+        {
+            // Next norm may be None (last layer of model) or point to next layer
+            let next_norm_info = if last_layer + 1 < num_layers {
+                m.wf.get_tensor_ptr(
+                    &format!("model.layers.{}.input_layernorm.weight", last_layer + 1))
+                    .map(|p| (p as *const std::ffi::c_void, m.gpu_wf.base as usize))
+            } else {
+                None
+            };
+
+            let cmd = m.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            {
+                let io = m.expert_io.as_ref().unwrap();
+                crate::pipeline_fusedexp::encode_post_expert(
+                    &m.wf, &m.gpu_wf, &m.ctx, &enc, last_layer,
+                    &prev_expert_weights, prev_shared_gate_score,
+                    &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
+                    &io.expert_out, &io.shared_act, &io.shared_down, &io.combine_params,
+                    next_norm_info,
+                    hd, moe_inter, shared_inter, k, layout,
+                );
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // Read final hidden from buf_moe_hidden
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    m.ctx.buf_moe_hidden.as_ref().unwrap().contents() as *const f32,
+                    hidden.as_mut_ptr(), hd);
+            }
+
+            // Capture per-layer output for last_layer
+            if capture_per_layer {
+                layer_outputs.push(hidden.to_vec());
+            }
+        }
+    }
+
+    // Complete any remaining deferred (last layer was full attention)
+    if let Some(ref mut def) = pending_deferred.take() {
+        def.complete(hidden, hd);
+        if capture_per_layer {
+            layer_outputs.push(hidden.to_vec());
+        }
+    }
+
+    Ok(())
+}
+
 fn process_token_inner(
     m: &mut ModelState,
     hidden: &mut [f32],
@@ -175,6 +501,10 @@ fn process_token_inner(
     capture_per_layer: bool,
     layer_outputs: &mut Vec<Vec<f32>>,
 ) -> PyResult<()> {
+    if m.pipeline_mode == PipelineMode::FusedExp {
+        return process_token_fusedexp_pipelined(m, hidden, pos, kv, lin, py, capture_per_layer, layer_outputs);
+    }
+
     let mut deferred: Option<DeferredExperts> = None;
     let mode = m.pipeline_mode;
     for layer in 0..m.config.num_layers {
@@ -541,8 +871,8 @@ impl Context {
         Ok((arr.into_py(py), py_list.into_py(py)))
     }
 
-    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=1.0,
-                        top_k=50, top_p=0.9, min_p=0.0, eos_token_ids=None))]
+    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
+                        top_k=0, top_p=1.0, min_p=0.0, eos_token_ids=None))]
     fn generate(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>, cache: &mut Cache,
         max_tokens: usize, temperature: f32, top_k: usize, top_p: f32, min_p: f32,
         eos_token_ids: Option<&Bound<PyArray1<i64>>>,
@@ -589,8 +919,8 @@ impl Context {
         Ok(PyArray1::<i64>::from_vec(py, output).into_py(py))
     }
 
-    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=1.0,
-                        top_k=50, top_p=0.9, min_p=0.0, eos_token_ids=None))]
+    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
+                        top_k=0, top_p=1.0, min_p=0.0, eos_token_ids=None))]
     fn stream_generate(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>, cache: &mut Cache,
         max_tokens: usize, temperature: f32, top_k: usize, top_p: f32, min_p: f32,
         eos_token_ids: Option<&Bound<PyArray1<i64>>>,
@@ -647,7 +977,6 @@ impl Context {
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
         let t = &self.telemetry;
         let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("ttft_ms", t.prefill_ms)?;
         dict.set_item("prefill_ms", t.prefill_ms)?;
         dict.set_item("total_ms", t.total_ms)?;
         dict.set_item("tokens_generated", t.tokens_generated)?;
