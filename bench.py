@@ -10,7 +10,7 @@ C_DIR = os.path.join(ROOT, "moe_infer_c")
 RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
 TOKEN_COUNTS = [20, 50, 100]
-RUST_MODES = ["Gpu", "FusedWoods", "FusedExp"]
+RUST_MODES = ["FusedWoods", "FusedExp"]
 WARMUP_TOKENS = 32
 
 

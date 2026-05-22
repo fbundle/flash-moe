@@ -247,17 +247,3 @@ pub fn mixed_full_attention_forward(
     for i in 0..hidden_dim { hidden[i] += o_out[i]; }
     None
 }
-
-/// GPU wrapper — calls mixed_full_attention_forward with GPU resources.
-pub fn gpu_full_attention_forward(
-    wf: &WeightFile,
-    layer_idx: usize,
-    hidden: &mut [f32],
-    kv: &mut FullAttnCache,
-    pos: usize,
-    config: &ModelConfig,
-    gpu_wf: &WeightBuffer,
-    ctx: &MetalContext,
-) -> Option<FullAttnGpuOut> {
-    mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, Some(gpu_wf), Some(ctx))
-}
