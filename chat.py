@@ -3,21 +3,17 @@
 from typing import Iterator
 import numpy as np
 from transformers import AutoTokenizer
-from moe_infer import Context, Cache # type: ignore
+from moe_infer import Model, Cache, Context # type: ignore
 
 class Conversation:
     def __init__(self, tokenizer_path: str, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    
-        self.context = Context()
-        self.context.load_model(model_path, pipeline_mode="FusedWoods")
+        self.model = Model(model_path)
+        
+        self.context = Context(self.model, pipeline_mode="FusedWoods")
+        self.cache = Cache(self.model)
         
         self.messages = []
-        self.cache = self.context.new_cache()
-    
-    def __del__(self):
-        self.context.unload_model()
-        
     
     def chat(self, message: str) -> Iterator[str]:
         self.messages.append({
