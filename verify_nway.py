@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3-way logit verification: mlx-lm vs Fused3 vs FusedExp on stripped model."""
+"""3-way logit verification: mlx-lm vs FusedWoods vs FusedExp on stripped model."""
 import subprocess, sys, os, json
 import numpy as np
 
@@ -93,13 +93,13 @@ def compare(label1, logits1, label2, logits2, eps=1e-3):
 
 def main():
     print("=" * 60)
-    print("3-Way Verification: mlx-lm vs Fused3 vs FusedExp")
+    print("3-Way Verification: mlx-lm vs FusedWoods vs FusedExp")
     print(f"Model: stripped  (4 layers, 4 experts)")
     print(f"Tokens: {len(TOKENS)}")
     print("=" * 60)
 
     results = {}
-    for mode in ["Cpu", "Gpu", "Fused3", "FusedExp"]:
+    for mode in ["Cpu", "Gpu", "FusedWoods", "FusedExp"]:
         results[mode] = run_rust(mode)
 
     results["mlx-lm"] = run_mlx()
@@ -108,7 +108,7 @@ def main():
     print("Pairwise comparisons")
     print("=" * 60)
 
-    engines = ["Cpu", "Gpu", "Fused3", "FusedExp", "mlx-lm"]
+    engines = ["Cpu", "Gpu", "FusedWoods", "FusedExp", "mlx-lm"]
     max_diffs = {}
     for i, e1 in enumerate(engines):
         for e2 in engines[i+1:]:

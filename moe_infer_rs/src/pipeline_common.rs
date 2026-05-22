@@ -18,7 +18,7 @@ pub enum PipelineMode {
     Cpu,
     Gpu,
     FusedExp,
-    Fused3,
+    FusedWoods,
 }
 
 // ─── CPU helper functions ────────────────────────────────────────────────
@@ -187,9 +187,9 @@ pub struct FullAttnCmd2State {
     pub o_prefix: String,
 }
 
-// ─── GPU/CPU state from linear attention CMD1 for Fused3 ─────────────────
+// ─── GPU/CPU state from linear attention CMD1 for FusedWoods ─────────────────
 
-pub struct LinearAttnFused3State {
+pub struct LinearAttnFusedWoodsState {
     pub gated_buf: Buffer,
     pub h_mid: Vec<f32>,
     pub total_value: usize,

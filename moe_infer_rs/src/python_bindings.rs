@@ -14,7 +14,7 @@ use pyo3::types::PyList;
 
 use crate::config::{load_model_config, ModelConfig};
 use crate::gpu_forward::{full_attention_forward, linear_attention_forward, moe_layer_forward};
-use crate::pipeline_common::{DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState, PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_conv1d_step, cpu_sigmoid};
+use crate::pipeline_common::{DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFusedWoodsState, LinearAttnState, PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_conv1d_step, cpu_sigmoid};
 use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext};
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
 use crate::weights::WeightFile;
@@ -191,7 +191,7 @@ fn process_token_inner(
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         let mut attn_state: Option<FullAttnCmd2State> = None;
-        let mut lin_state: Option<LinearAttnFused3State> = None;
+        let mut lin_state: Option<LinearAttnFusedWoodsState> = None;
         let mut h_mid_saved: Option<Vec<f32>> = None;
         if is_full {
             // FAST PATH: complete previous layer's MoE before full attention.
@@ -217,11 +217,11 @@ fn process_token_inner(
                     def.complete_fast(hidden, m.config.hidden_dim);
                 }
             }
-            // In Fused3, h_mid must be saved before linear_attention_forward because
+            // In FusedWoods, h_mid must be saved before linear_attention_forward because
             // it doesn't modify hidden (matching C: CMD2 handles residual_add).
             // FAST PATH: hidden is stale (CMD3(N-1) not yet completed), so defer
             // h_mid capture until after CMD1 + complete_fast().
-            if mode == PipelineMode::Fused3 && !prev_gpu_combined {
+            if mode == PipelineMode::FusedWoods && !prev_gpu_combined {
                 h_mid_saved = Some(hidden.to_vec());
             }
             lin_state = linear_attention_forward(
@@ -242,7 +242,7 @@ fn process_token_inner(
                 }
                 h_mid_saved = Some(hidden.to_vec());
             }
-            // In Fused3: restore hidden to h_mid so moe_layer_forward uses pre-attention state
+            // In FusedWoods: restore hidden to h_mid so moe_layer_forward uses pre-attention state
             if let Some(ref hmid) = h_mid_saved {
                 hidden.copy_from_slice(hmid);
             }
@@ -392,9 +392,9 @@ impl Context {
             "Cpu" | "CpuOnly" => PipelineMode::Cpu,
             "Gpu" => PipelineMode::Gpu,
             "FusedExp" => PipelineMode::FusedExp,
-            "Fused3" => PipelineMode::Fused3,
+            "FusedWoods" => PipelineMode::FusedWoods,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown pipeline_mode: {}. Use Cpu|Gpu|FusedExp|Fused3", pipeline_mode)
+                format!("Unknown pipeline_mode: {}. Use Cpu|Gpu|FusedExp|FusedWoods", pipeline_mode)
             )),
         };
         let ms = ModelState::load(model_path, mode)?;

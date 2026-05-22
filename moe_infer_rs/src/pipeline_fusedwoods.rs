@@ -1,4 +1,4 @@
-/// Fused3 pipeline mode: 3-CMD architecture matching the C engine.
+/// FusedWoods pipeline mode: 3-CMD architecture matching the C engine.
 ///
 /// CMD1: attention projections + conv1d + SSM + gated_rms_norm (no out_proj/residual)
 /// CMD2: out_proj + residual_add + rms_norm + gate + shared (1 fused encoder)
@@ -7,13 +7,13 @@ use metal::Buffer;
 use crate::kernels;
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::weights::WeightFile;
-use crate::pipeline_common::{LinearAttnFused3State, LinearAttnState, CONV_KERNEL_SIZE};
+use crate::pipeline_common::{LinearAttnFusedWoodsState, LinearAttnState, CONV_KERNEL_SIZE};
 
-/// Run Fused3 CMD1: attention projections → conv1d → SSM → gated_rms_norm.
+/// Run FusedWoods CMD1: attention projections → conv1d → SSM → gated_rms_norm.
 ///
-/// Returns `LinearAttnFused3State` with gated_buf (= batch_out[6]) and h_mid (residual).
+/// Returns `LinearAttnFusedWoodsState` with gated_buf (= batch_out[6]) and h_mid (residual).
 /// CMD2 will read from batch_out[6] for out_proj and use h_mid for residual_add.
-pub fn fused3_cmd1(
+pub fn fusedwoods_cmd1(
     wf: &WeightFile,
     gpu_wf: &GpuWeightCtx,
     ctx: &MetalContext,
@@ -33,7 +33,7 @@ pub fn fused3_cmd1(
     residual: Vec<f32>,
     state: &mut LinearAttnState,
     prev_gpu_combined: bool,
-) -> LinearAttnFused3State {
+) -> LinearAttnFusedWoodsState {
     let c = ctx;
     let gw = gpu_wf;
     let prefix = format!("model.layers.{}.linear_attn", layer_idx);
@@ -150,7 +150,7 @@ pub fn fused3_cmd1(
     state.conv_state.copy_within(qkv_dim.., 0);
     state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
 
-    LinearAttnFused3State {
+    LinearAttnFusedWoodsState {
         gated_buf: c.batch_out[6].clone(),
         h_mid: residual,
         total_value,

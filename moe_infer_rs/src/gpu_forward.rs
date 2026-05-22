@@ -13,7 +13,7 @@ use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalC
 use crate::pipeline_common::{
     cpu_conv1d_step, cpu_normalize_weights, cpu_rms_norm_bare, cpu_rms_norm_gated,
     cpu_sigmoid, cpu_silu, cpu_softmax, cpu_topk,
-    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState,
+    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFusedWoodsState, LinearAttnState,
     PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
 };
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
@@ -284,7 +284,7 @@ pub fn linear_attention_forward(
     linear_idx: usize,  // index into persistent GPU state buffers
     mode: PipelineMode,
     prev_gpu_combined: bool,
-) -> Option<LinearAttnFused3State> {
+) -> Option<LinearAttnFusedWoodsState> {
     let use_gpu = mode != PipelineMode::Cpu
         && gpu_wf.is_some()
         && ctx.is_some();
@@ -484,9 +484,9 @@ pub fn linear_attention_forward(
         return None;
     }
 
-    // ── Fused3 path (matching C exactly): CMD1 without gated_norm/out_proj/residual ──
+    // ── FusedWoods path (matching C exactly): CMD1 without gated_norm/out_proj/residual ──
     // C does: CMD1(qkvz+ba+conv1d+SSM) → CPU(gated_norm) → CMD2(out_proj+residual+norm+gate+shared)
-    let use_fused3_gpu = mode == PipelineMode::Fused3
+    let use_fusedwoods_gpu = mode == PipelineMode::FusedWoods
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
@@ -494,7 +494,7 @@ pub fn linear_attention_forward(
         && linear_idx < ctx.unwrap().buf_delta_state.len()
         && ctx.unwrap().batch_out.len() >= 8;
 
-    if use_fused3_gpu {
+    if use_fusedwoods_gpu {
         let c = ctx.unwrap();
         let gw = gpu_wf.unwrap();
         let prefix_std = format!("{}.in_proj_qkv", prefix);
@@ -610,7 +610,7 @@ pub fn linear_attention_forward(
         state.conv_state.copy_within(qkv_dim.., 0);
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
 
-        return Some(LinearAttnFused3State {
+        return Some(LinearAttnFusedWoodsState {
             gated_buf: c.batch_out[6].clone(),
             h_mid: residual,  // pre-attention hidden (saved before norm)
             total_value,
@@ -810,7 +810,7 @@ pub fn linear_attention_forward(
 /// When `attn_state` is `Some`, fuses batched attention + o_proj + residual + norm + gate
 /// into a single CMD2 (matching the C engine's 3-CMD architecture).
 /// When `attn_state` is `None` and `lin_attn` is `Some`, fuses out_proj + residual + norm + gate
-/// into a single CMD2 for linear attention layers (Fused3 mode, matching C exactly).
+/// into a single CMD2 for linear attention layers (FusedWoods mode, matching C exactly).
 ///
 /// Returns `Some(DeferredExperts)` when GPU expert dispatch is used (async CMD3).
 pub fn moe_layer_forward(
@@ -823,7 +823,7 @@ pub fn moe_layer_forward(
     config: &ModelConfig,
     mode: PipelineMode,
     attn_state: Option<FullAttnCmd2State>,
-    lin_attn: Option<LinearAttnFused3State>,
+    lin_attn: Option<LinearAttnFusedWoodsState>,
     mut expert_io: Option<&mut ExpertIOState>,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
@@ -1035,7 +1035,7 @@ pub fn moe_layer_forward(
         && ctx.unwrap().residual_add.is_some()
         && ctx.unwrap().rms_norm_apply_bf16.is_some()
     {
-        // ── Fused3 linear CMD2: out_proj + residual_add + rms_norm + gate + shared ──
+        // ── FusedWoods linear CMD2: out_proj + residual_add + rms_norm + gate + shared ──
         // Matches C engine exactly: CMD1(SSM) → CPU(gated_norm) → CMD2(this block) → CMD3
         let c = ctx.unwrap();
         let gw = gpu_wf.unwrap();
@@ -1409,7 +1409,7 @@ pub fn moe_layer_forward(
             // GPU-side input_norm for next layer (matches C Enc C2 + Enc C3)
             // Only safe in fused modes where CMD1 reads directly from buf_input,
             // guaranteeing GPU queue serialization of CMD3-then-CMD1.
-            let gpu_combined = (mode == PipelineMode::Fused3 || mode == PipelineMode::FusedExp)
+            let gpu_combined = (mode == PipelineMode::FusedWoods || mode == PipelineMode::FusedExp)
                 && layer_idx + 1 < config.num_layers
                 && ctx.rms_norm_apply_bf16.is_some()
                 && wf.get_tensor_ptr(&format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).is_some();
