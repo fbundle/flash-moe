@@ -19,7 +19,7 @@ The `FusedWoods` pipeline mode is named after Dan Woods, author of the original 
 ```bash
 # Download from HuggingFace
 pip install huggingface_hub
-huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
+hf download mlx-community/Qwen3.5-35B-A3B-4bit \
   --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 
 # Convert to MoE-Infer format
