@@ -10,7 +10,7 @@ use crate::math::{apply_rope, bf16_to_f32, dequant_matvec_4bit, rms_norm};
 
 // ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ──
 
-pub struct FullAttnCmd2State {
+pub struct FullAttnGpuOut {
     pub q_buf: Buffer,
     pub q_gate_buf: Buffer,
     pub kc_buf: Buffer,
@@ -34,7 +34,7 @@ pub struct FullAttnCmd2State {
 /// Single-token full (self) attention forward: QKV proj, Q/K norms, RoPE,
 /// KV cache append.
 ///
-/// Returns `FullAttnCmd2State` for GPU-fused CMD2 (batched attn + o_proj + gate).
+/// Returns `FullAttnGpuOut` for GPU-fused CMD2 (batched attn + o_proj + gate).
 /// When GPU is available, skips batched attention/o_proj/residual — those are
 /// deferred to `moe_layer_forward`'s CMD2. When GPU unavailable, computes
 /// everything on CPU/separate CMDs and returns None.
@@ -47,7 +47,7 @@ pub fn mixed_full_attention_forward(
     config: &ModelConfig,
     gpu_wf: Option<&WeightBuffer>,
     ctx: Option<&MetalContext>,
-) -> Option<FullAttnCmd2State> {
+) -> Option<FullAttnGpuOut> {
     let hidden_dim = config.hidden_dim;
     let num_attn_heads = config.num_attn_heads;
     let num_kv_heads = config.num_kv_heads;
@@ -187,7 +187,7 @@ pub fn mixed_full_attention_forward(
         }
 
         let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
-        return Some(FullAttnCmd2State {
+        return Some(FullAttnGpuOut {
             q_buf, q_gate_buf, kc_buf, vc_buf, scores_buf, out_buf, hidden_buf,
             seq_len: seq_len as u32,
             seq_stride: seq_stride as u32,
@@ -256,7 +256,7 @@ pub fn full_attention_forward(
     kv: &mut FullAttnCache,
     pos: usize,
     config: &ModelConfig,
-) -> Option<FullAttnCmd2State> {
+) -> Option<FullAttnGpuOut> {
     mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, None, None)
 }
 
@@ -270,6 +270,6 @@ pub fn gpu_full_attention_forward(
     config: &ModelConfig,
     gpu_wf: &WeightBuffer,
     ctx: &MetalContext,
-) -> Option<FullAttnCmd2State> {
+) -> Option<FullAttnGpuOut> {
     mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, Some(gpu_wf), Some(ctx))
 }

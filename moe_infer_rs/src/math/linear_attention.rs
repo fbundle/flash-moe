@@ -12,7 +12,7 @@ use crate::math::{bf16_to_f32, conv1d_step, dequant_matvec_4bit, rms_norm, rms_n
 
 // ─── FusedWoods shared state ─────────────────────────────────────────────
 /// GPU/CPU state from linear attention CMD1 for FusedWoods.
-pub struct LinearAttnFusedWoodsState {
+pub struct LinearAttnGpuOut {
     pub gated_buf: Buffer,
     pub h_mid: Vec<f32>,
     pub total_value: usize,
@@ -45,7 +45,7 @@ pub fn gpu_linear_attention(
     use_fused_cmd1: bool,
     use_fusedwoods_cmd1: bool,
     prev_gpu_combined: bool,
-) -> Option<LinearAttnFusedWoodsState> {
+) -> Option<LinearAttnGpuOut> {
     let use_gpu = gpu_wf.is_some() && ctx.is_some();
 
     // Input RMS norm
@@ -358,7 +358,7 @@ pub fn gpu_linear_attention(
         state.conv_state.copy_within(qkv_dim.., 0);
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
 
-        return Some(LinearAttnFusedWoodsState {
+        return Some(LinearAttnGpuOut {
             gated_buf: c.batch_out[6].clone(),
             h_mid: residual,  // pre-attention hidden (saved before norm)
             total_value,

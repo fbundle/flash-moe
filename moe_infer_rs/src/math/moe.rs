@@ -10,9 +10,9 @@ use crate::metal_context::{metal_buf_shared, ExpertBuffer, WeightBuffer, MetalCo
 use crate::model::config::ModelConfig;
 use crate::model::weights::WeightFile;
 
-use crate::math_full_attention::FullAttnCmd2State;
+use crate::math_full_attention::FullAttnGpuOut;
 use crate::math::{bf16_to_f32, dequant_matvec_4bit, softmax, topk, normalize_weights, rms_norm, sigmoid};
-use crate::math_linear_attention::LinearAttnFusedWoodsState;
+use crate::math_linear_attention::LinearAttnGpuOut;
 
 // ─── Deferred expert results (CMD3 async dispatch) ───────────────────────
 
@@ -83,8 +83,8 @@ pub fn moe_layer_forward(
     ctx: Option<&MetalContext>,
     gpu_wf: Option<&WeightBuffer>,
     config: &ModelConfig,
-    attn_state: Option<FullAttnCmd2State>,
-    lin_attn: Option<LinearAttnFusedWoodsState>,
+    attn_state: Option<FullAttnGpuOut>,
+    lin_attn: Option<LinearAttnGpuOut>,
     mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
     gpu_combined: bool,
 ) -> Result<Option<DeferredExperts>, MoEError> {

@@ -26,7 +26,7 @@ use crate::math::{
     bf16_to_f32, normalize_weights, softmax, topk,
     embed_lookup, final_norm,
 };
-use crate::math_full_attention::FullAttnCmd2State;
+use crate::math_full_attention::FullAttnGpuOut;
 use crate::math_full_attention::gpu_full_attention_forward;
 use crate::math_moe::{DeferredExperts, moe_layer_forward};
 use crate::math_lm_head::gpu_lm_head;
@@ -501,7 +501,7 @@ pub fn process_token_fusedexp_pipelined(
                     layer_outputs.push(hidden.to_vec());
                 }
             }
-            let mut attn_state: Option<FullAttnCmd2State> = None;
+            let mut attn_state: Option<FullAttnGpuOut> = None;
             if let Some(ref mut kv_entry) = kv[layer] {
                 attn_state = gpu_full_attention_forward(
                     exec.wf, layer, hidden, kv_entry, pos, exec.config,

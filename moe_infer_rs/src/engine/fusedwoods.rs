@@ -10,9 +10,9 @@ use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 use crate::model::Model;
 use crate::engine::{ExecCtxGpu, SignalCheckFn};
 use crate::math::{embed_lookup, final_norm};
-use crate::math_full_attention::FullAttnCmd2State;
+use crate::math_full_attention::FullAttnGpuOut;
 use crate::math_full_attention::mixed_full_attention_forward;
-use crate::math_linear_attention::{self, LinearAttnFusedWoodsState};
+use crate::math_linear_attention::{self, LinearAttnGpuOut};
 use crate::math_lm_head::gpu_lm_head;
 use crate::math_moe::{DeferredExperts, moe_layer_forward};
 
@@ -42,8 +42,8 @@ pub fn process_token_inner(
             }
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
-        let mut attn_state: Option<FullAttnCmd2State> = None;
-        let mut lin_state: Option<LinearAttnFusedWoodsState> = None;
+        let mut attn_state: Option<FullAttnGpuOut> = None;
+        let mut lin_state: Option<LinearAttnGpuOut> = None;
         let mut h_mid_saved: Option<Vec<f32>> = None;
         if is_full {
             if prev_gpu_combined {
