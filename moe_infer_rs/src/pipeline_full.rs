@@ -1,6 +1,4 @@
-/// Full 60-layer MoE forward pass with double-buffered I/O + compute pipeline.
-///
-/// Port of run_full_forward from main.m:1199-1425.
+/// Full-model forward pass with double-buffered I/O + compute pipeline.
 use metal::*;
 use std::os::fd::RawFd;
 
@@ -91,7 +89,7 @@ fn execute_io_plan(tasks: &mut [PreadTask], num_tasks: usize) -> f64 {
 ///   - h (hidden state) accumulates: h = h + moe_output per layer (residual)
 pub fn run_full_forward(
     ctx: &MetalContext,
-    layer_fds: &[RawFd],
+    expert_fds: &[RawFd],
     k: usize,
     config: &ModelConfig,
     _use_fast: i32,
@@ -154,7 +152,7 @@ pub fn run_full_forward(
     let mut io_total = 0.0;
     let mut compute_total = 0.0;
 
-    let mut plan0 = build_io_plan(&layer_experts[0], &expert_bufs_a, layer_fds[0], expert_size);
+    let mut plan0 = build_io_plan(&layer_experts[0], &expert_bufs_a, expert_fds[0], expert_size);
     let io_layer0 = execute_io_plan(&mut plan0, k);
     io_total += io_layer0;
     if verbose {
@@ -186,7 +184,7 @@ pub fn run_full_forward(
             let next_experts: Vec<(usize, usize)> = (0..k).map(|ki| {
                 (layer_experts[layer + 1][ki], next_bufs[ki].contents() as usize)
             }).collect();
-            let next_fd = layer_fds[layer + 1];
+            let next_fd = expert_fds[layer + 1];
             let expert_size = expert_size;
 
             prefetch_handle = Some(std::thread::spawn(move || {

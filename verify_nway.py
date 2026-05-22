@@ -16,20 +16,19 @@ TOKENS = [248045, 8678, 198, 2523, 513, 264, 10631, 17313, 13, 593,
 
 def run_rust(mode):
     """Run Rust engine with given pipeline mode, return last-position logits."""
-    from moe_infer import Context, Cache
+    from moe_infer import Model, Engine, Cache
 
     t0 = __import__('time').time()
 
-    ctx = Context()
-    ctx.load_model(MLX_DIR, pipeline_mode=mode)
-    cache = ctx.new_cache()
+    model = Model(MLX_DIR)
+    engine = Engine(model, pipeline_mode=mode)
+    cache = Cache(model)
 
     ids_arr = np.array(TOKENS, dtype=np.int64)
-    logits_all = ctx.forward(ids_arr, cache)
+    logits_all = engine.forward(ids_arr, cache)
 
     elapsed = __import__('time').time() - t0
     logits = np.array(logits_all[-1], dtype=np.float32)
-    ctx.unload_model()
 
     tqdm.write(f"[nway] Rust {mode:<12}: {elapsed*1000:5.0f} ms  "
                f"min={logits.min():.4f} max={logits.max():.4f} "

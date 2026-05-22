@@ -14,79 +14,48 @@ The `FusedWoods` pipeline mode is named after Dan Woods, author of the original 
 
 ## Quick Start
 
-### 1. Download and convert the model
+### 1. Convert the model
 
 ```bash
-# Download from HuggingFace
-pip install huggingface_hub
-hf download mlx-community/Qwen3.5-35B-A3B-4bit \
-  --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-
-# Convert to MoE-Infer format
-python helpers/extract_weights.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --output hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-
-python helpers/repack_experts_4bit.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-
-python helpers/gen_model_config.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+python helpers/convert.py --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
-### 2. Build and install Python bindings
+### 2. Build and install Python bindings and Run inference
 
 ```bash
-uv pip install moe_infer_rs
+maturin develop --release -m moe_infer_rs/Cargo.toml
+python chat.py
 ```
 
-### 3. Run inference
-
-```python
-from moe_infer import Context, Cache
-import numpy as np
-
-ctx = Context()
-ctx.load_model("hub/models--mlx-community--Qwen3.5-35B-A3B-4bit",
-               pipeline_mode="FusedWoods")
-cache = ctx.new_cache()
-
-# Forward pass
-input_ids = np.array([248045, 8678, 198], dtype=np.int64)
-logits = ctx.forward(input_ids, cache)
-
-# Generate
-new_ids = ctx.generate(input_ids, cache,
-    max_tokens=256, temperature=0.7, top_k=50, top_p=0.9)
-
-# Streaming
-for token_id, logits in ctx.stream_generate(input_ids, cache, max_tokens=256):
-    print(token_id)
-```
 
 ## Python API
 
 ```python
-from moe_infer import Context, Cache
+from moe_infer import Model, Engine, Cache
 ```
 
-### Context
+### Model
 
 | Method | Description |
 |--------|-------------|
-| `ctx.load_model(path, pipeline_mode="FusedWoods")` | Load a model. Modes: `Cpu`, `Gpu`, `FusedExp`, `FusedWoods` |
-| `ctx.unload_model()` | Free Metal resources and close expert files |
-| `ctx.new_cache()` | Create a new KV cache + linear attention state |
-| `ctx.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
-| `ctx.generate(input_ids, cache, max_tokens, temperature, top_k, top_p, min_p, eos_token_ids)` | Autoregressive generation, returns `[n_tokens]` int64 token ids |
-| `ctx.stream_generate(input_ids, cache, ...)` | Like generate but yields `(token_id, logits)` tuples |
-| `ctx.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec` |
+| `model = Model(model_path)` | Load model weights, config, and expert file handles (data only) |
+
+### Engine
+
+| Method | Description |
+|--------|-------------|
+| `engine = Engine(model, pipeline_mode="FusedExp")` | Initialize Metal GPU resources and load the model |
+| `engine.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
+| `engine.generate(input_ids, cache, max_tokens, temperature, top_k, top_p, min_p, eos_token_ids)` | Autoregressive generation, returns `[n_tokens]` int64 token ids |
+| `engine.stream_generate(input_ids, cache, ...)` | Like generate but yields `(token_id, logits)` tuples incrementally |
+| `engine.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec` |
 
 ### Cache
 
 | Method | Description |
 |--------|-------------|
-| `cache.reset()` | Reset position, KV caches, and linear attention states for a new conversation |
+| `cache = Cache(model)` | Create KV caches + linear attention state for the given model |
+| `cache.reset()` | Reset position, KV caches, and linear attention states |
 | `cache.pos` | Current sequence position (read-only) |
 
 ### Pipeline Modes
@@ -103,9 +72,9 @@ from moe_infer import Context, Cache
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_tokens` | 256 | Maximum new tokens to generate |
-| `temperature` | 1.0 | < 0.01 for greedy, > 0 for sampling |
-| `top_k` | 50 | Keep top-k logits (0 = disabled) |
-| `top_p` | 0.9 | Nucleus sampling threshold |
+| `temperature` | 0.0 | < 0.01 for greedy, > 0 for sampling |
+| `top_k` | 0 | Keep top-k logits (0 = disabled) |
+| `top_p` | 1.0 | Nucleus sampling threshold |
 | `min_p` | 0.0 | Minimum probability relative to max |
 | `eos_token_ids` | [248046, 248044] | Stop tokens |
 
@@ -151,9 +120,9 @@ model_dir/
 ```
 
 Helper scripts in `helpers/` convert from HuggingFace/MLX format:
+- `convert.py` — One-step conversion: config, weights, and expert repacking
 - `extract_weights.py` — Non-expert weights → `model_weights.bin` + `model_weights.json`
 - `repack_experts_4bit.py` — MLX 4-bit experts → `packed_experts/` per-layer files
-- `gen_model_config.py` — HF `config.json` → `model_config.json`
 
 ## Performance
 
@@ -178,24 +147,22 @@ moe_infer_rs/           Rust engine + Python bindings
     pipeline_cpu.rs     Cpu pipeline mode
     pipeline_fusedwoods.rs  FusedWoods pipeline mode (CMD1+CMD2+CMD3)
     pipeline_fusedexp.rs FusedExp pipeline mode
-    python_bindings.rs  PyO3 bindings (Context, Cache)
+    python_bindings.rs  PyO3 bindings (Model, Engine, Cache)
     metal_context.rs    Metal device init, pipeline creation
     kernels.rs          GPU kernel dispatch
     weights.rs          Mmap'd weight file + tensor lookup
     config.rs           JSON model config
     quant.rs            bf16↔f32, CPU dequant matvec, SwiGLU, RMS norm
-    tokenizer.rs        BPE tokenizer
-    error.rs            Error types
     lib.rs              Module declarations
   shaders/
     shaders.metal       Metal compute shaders (embedded at compile time)
   Cargo.toml
 
 helpers/                Model conversion scripts
+  convert.py            One-step convert: config + weights + experts
   extract_weights.py    Non-expert weights → model_weights.bin
   repack_experts_4bit.py MLX experts → packed_experts/
   gen_model_config.py   Config generation
-  export_tokenizer.py   Tokenizer export (C path)
 
 verify_nway.py          Multi-engine logit verification
 ```

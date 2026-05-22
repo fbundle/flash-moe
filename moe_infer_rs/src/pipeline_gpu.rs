@@ -1,7 +1,4 @@
-/// GPU-accelerated MoE forward and linear attention (GatedDeltaNet).
-///
-/// Port of moe_forward, linear_attention_forward, and fused_layer_forward_debug
-/// from moe_infer/core_src/layer_forward.h and attention.h.
+/// GPU-accelerated per-layer operations: MoE, linear attention, full attention.
 use std::os::fd::RawFd;
 use std::ffi::c_void;
 

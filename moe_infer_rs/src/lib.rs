@@ -1,9 +1,10 @@
 pub mod config;
 pub mod constants;
+pub mod engine;
 pub mod error;
 pub mod expert;
-pub mod full_forward;
-pub mod gpu_forward;
+pub mod pipeline_full;
+pub mod pipeline_gpu;
 pub mod kernels;
 pub mod metal_context;
 pub mod moe;
@@ -23,8 +24,8 @@ pub use config::{load_model_config, ExpertLayout, ModelConfig};
 pub use constants::*;
 pub use error::MoEError;
 pub use expert::{run_expert_forward, run_expert_forward_fast, ExpertTiming};
-pub use full_forward::{run_full_forward, FullForwardTiming};
-pub use gpu_forward::{moe_layer_forward, linear_attention_forward, full_attention_forward};
+pub use pipeline_full::{run_full_forward, FullForwardTiming};
+pub use pipeline_gpu::{moe_layer_forward, linear_attention_forward, full_attention_forward};
 pub use pipeline_common::{LinearAttnState, FullAttnCache, FullAttnCmd2State, DeferredExperts, PipelineMode, LinearAttnFusedWoodsState};
 pub use metal_context::{MetalContext, GpuWeightCtx, ExpertIOState, ExpertCache, metal_buf_shared};
 pub use moe::{run_moe_forward, run_moe_forward_fused, MoETiming};
@@ -36,7 +37,8 @@ pub use weights::WeightFile;
 #[pyo3::pymodule]
 fn moe_infer(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     use pyo3::prelude::*;
+    m.add_class::<python_bindings::Model>()?;
+    m.add_class::<python_bindings::Engine>()?;
     m.add_class::<python_bindings::Cache>()?;
-    m.add_class::<python_bindings::Context>()?;
     Ok(())
 }

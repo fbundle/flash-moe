@@ -1,11 +1,18 @@
 /// Shared types, constants, and CPU helpers used across pipeline modules.
+use std::os::fd::RawFd;
+
 use metal::{Buffer, CommandBuffer};
+
+use crate::config::ModelConfig;
+use crate::metal_context::{ExpertIOState, GpuWeightCtx, MetalContext};
 use crate::quant::bf16_to_f32;
+use crate::weights::WeightFile;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
 pub(crate) const MAX_SEQ: usize = 4096;
 pub const RMS_NORM_EPS: f32 = 1e-6;
+pub const FULL_ATTN_INTERVAL: usize = 4;
 pub const GROUP_SIZE: usize = 64;
 pub const LINEAR_KEY_DIM: usize = 128;
 pub const LINEAR_VALUE_DIM: usize = 128;
@@ -20,6 +27,22 @@ pub enum PipelineMode {
     FusedExp,
     FusedWoods,
 }
+
+// ─── Execution context (borrowed view of Engine for pipeline fns) ────────
+
+/// Borrowed execution context bundling model data + GPU state for inner fns.
+pub struct ExecCtx<'a> {
+    pub wf: &'a WeightFile,
+    pub ctx: &'a MetalContext,
+    pub gpu_wf: &'a GpuWeightCtx,
+    pub config: &'a ModelConfig,
+    pub expert_fds: &'a [RawFd],
+    pub pipeline_mode: PipelineMode,
+    pub expert_io: Option<&'a mut ExpertIOState>,
+}
+
+/// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
+pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
 
 // ─── CPU helper functions ────────────────────────────────────────────────
 

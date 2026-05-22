@@ -3,14 +3,14 @@
 from typing import Iterator
 import numpy as np
 from transformers import AutoTokenizer
-from moe_infer import Model, Cache, Context # type: ignore
+from moe_infer import Model, Engine, Cache  # type: ignore
 
 class Conversation:
     def __init__(self, tokenizer_path: str, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.model = Model(model_path)
         
-        self.context = Context(self.model, pipeline_mode="FusedWoods")
+        self.engine = Engine(self.model, pipeline_mode="FusedExp")
         self.cache = Cache(self.model)
         
         self.messages = []
@@ -26,7 +26,7 @@ class Conversation:
 
         completion = ""
         completion_ids = []
-        for token, logits in self.context.stream_generate(input_ids, self.cache):
+        for token, logits in self.engine.stream_generate(input_ids, self.cache):
             completion_ids.append(token)
             
             new_completion = self.tokenizer.decode(completion_ids)
@@ -44,6 +44,6 @@ while True:
         print(e, end="", flush=True)
     
     print()
-    print(c.context.telemetry())
+    print(c.engine.telemetry())
 
 

@@ -27,19 +27,18 @@ def write_tokens_binary(tokens: list[int], path: str):
 
 
 def bench_rust(mode: str, tokens: list[int]) -> tuple[float, float, float]:
-    from moe_infer import Context, Cache
+    from moe_infer import Model, Engine, Cache
 
-    ctx = Context()
-    ctx.load_model(MODEL_DIR, pipeline_mode=mode)
-    cache = ctx.new_cache()
+    model = Model(MODEL_DIR)
+    engine = Engine(model, pipeline_mode=mode)
+    cache = Cache(model)
     ids = np.array(tokens, dtype=np.int64)
 
     t0 = time.perf_counter()
-    logits_all = ctx.forward(ids, cache)
+    logits_all = engine.forward(ids, cache)
     elapsed = (time.perf_counter() - t0) * 1000.0
 
     logits_last = np.array(logits_all[-1], dtype=np.float32)
-    ctx.unload_model()
     return elapsed, float(logits_last.min()), float(logits_last.max())
 
 

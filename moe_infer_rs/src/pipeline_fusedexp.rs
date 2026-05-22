@@ -10,11 +10,20 @@
 /// CMD_{N-1}: post_expert(N-2) + pre_expert(N-1)
 /// CMD_N: post_expert(N-1)  [+ GPU-side input_norm for next token]
 /// ```
+use std::os::fd::RawFd;
+
 use metal::{Buffer, ComputeCommandEncoderRef};
+
 use crate::kernels;
 use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
+use crate::pipeline_common::{
+    cpu_normalize_weights, cpu_softmax, cpu_topk,
+    DeferredExperts, ExecCtx, FullAttnCache, FullAttnCmd2State, LinearAttnState,
+    SignalCheckFn, CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, RMS_NORM_EPS,
+};
+use crate::pipeline_gpu::{full_attention_forward, moe_layer_forward};
+use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
-use crate::pipeline_common::{LinearAttnState, CONV_KERNEL_SIZE};
 
 /// Encode post_expert for a previously-routed layer into a command encoder.
 ///
@@ -345,4 +354,315 @@ pub fn update_conv_state(state: &mut LinearAttnState, qkv_dim: usize) {
     let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
     state.conv_state.copy_within(qkv_dim.., 0);
     state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
+}
+
+// ─── FusedExp pipeline orchestrator ──────────────────────────────────────────
+
+/// Run a group of consecutive linear layers using the FusedExp pipelined
+/// N+1 command buffer approach.
+///
+/// Full attention layers break the pipeline and are handled with the existing
+/// CMD2 fusion approach. Consecutive linear layers are pipelined.
+pub fn process_token_fusedexp_pipelined(
+    exec: &mut ExecCtx<'_>,
+    hidden: &mut [f32],
+    pos: usize,
+    kv: &mut [Option<FullAttnCache>],
+    lin: &mut [Option<LinearAttnState>],
+    check_signal: SignalCheckFn<'_>,
+    capture_per_layer: bool,
+    layer_outputs: &mut Vec<Vec<f32>>,
+) -> Result<(), String> {
+    let hd = exec.config.hidden_dim;
+    let num_layers = exec.config.num_layers;
+    let num_experts = exec.config.num_experts;
+    let moe_inter = exec.config.moe_intermediate;
+    let shared_inter = exec.config.shared_intermediate;
+    let k = exec.config.num_experts_per_tok;
+    let expert_size = exec.config.expert_size_4bit;
+    let layout = &exec.config.expert_layout_4bit;
+    let qkv_dim = exec.config.linear_conv_dim;
+    let total_key = exec.config.linear_total_key;
+    let total_val = exec.config.linear_total_value;
+    let num_k_heads = exec.config.linear_num_k_heads;
+    let num_v_heads = exec.config.linear_num_v_heads;
+    let key_dim = total_key / num_k_heads;
+    let val_dim = total_val / num_v_heads;
+    let inv_scale = 1.0 / (key_dim as f32).sqrt();
+    let k_heads_per_v = num_v_heads / num_k_heads;
+
+    let upload_first_layer =
+        |ctx: &MetalContext, wf: &WeightFile, hidden: &[f32], layer_idx: usize| {
+            let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(hidden.as_ptr(), buf_moe.contents() as *mut f32, hd);
+            }
+            let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
+            let buf_in = ctx.buf_input.as_ref().unwrap();
+            if let Some(nw_u16) = wf.get_tensor_u16(&norm_name) {
+                let nw: Vec<f32> = nw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+                let sum_sq: f32 = hidden[..hd].iter().map(|v| v * v).sum();
+                let inv_rms = 1.0 / (sum_sq / hd as f32 + RMS_NORM_EPS).sqrt();
+                unsafe {
+                    let dst = buf_in.contents() as *mut f32;
+                    for i in 0..hd {
+                        *dst.add(i) = hidden[i] * inv_rms * nw[i];
+                    }
+                }
+            } else {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        hidden.as_ptr(), buf_in.contents() as *mut f32, hd);
+                }
+            }
+        };
+
+    let route_and_pread = |ctx: &MetalContext,
+                           expert_io: &mut crate::metal_context::ExpertIOState,
+                           layer_idx: usize,
+                           layer_fd: RawFd|
+        -> (Vec<usize>, Vec<f32>, f32)
+    {
+        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap();
+        let mut gate_scores = vec![0.0f32; num_experts];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
+        }
+        let shared_gate_score =
+            unsafe { *(ctx.buf_shared_gate_score.as_ref().unwrap().contents() as *const f32) };
+
+        cpu_softmax(&mut gate_scores);
+        let mut expert_indices = vec![0usize; k];
+        let mut expert_weights = vec![0.0f32; k];
+        cpu_topk(&gate_scores, k, &mut expert_indices, &mut expert_weights);
+        cpu_normalize_weights(&mut expert_weights);
+
+        let actual_k = k.min(MAX_K);
+        let mut miss_ei = [0usize; MAX_K];
+        let mut miss_k_slot = [0usize; MAX_K];
+        let mut miss_count = 0;
+        for ki in 0..actual_k {
+            let eidx = expert_indices[ki];
+            if let Some(buf) = expert_io.cache.lookup(layer_idx, eidx) {
+                expert_io.expert_data[ki] = buf;
+            } else {
+                miss_ei[miss_count] = eidx;
+                miss_k_slot[miss_count] = ki;
+                miss_count += 1;
+            }
+        }
+        for m in 0..miss_count {
+            let ki = miss_k_slot[m];
+            let eidx = miss_ei[m];
+            let buf = expert_io.cache.insert_get_buf(layer_idx, eidx);
+            expert_io.expert_data[ki] = buf;
+        }
+        if miss_count > 0 {
+            let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> =
+                Vec::with_capacity(miss_count);
+            for m in 0..miss_count {
+                let ki = miss_k_slot[m];
+                let eidx = miss_ei[m];
+                let ptr = expert_io.expert_data[ki].contents() as usize;
+                pread_tasks.push((
+                    layer_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+            }
+            rayon::scope(|s| {
+                for (fd, dst, sz, off) in pread_tasks {
+                    s.spawn(move |_| {
+                        unsafe { libc::pread(fd, dst as *mut std::ffi::c_void, sz, off); }
+                    });
+                }
+            });
+        }
+        (expert_indices, expert_weights, shared_gate_score)
+    };
+
+    let mut layer = 0;
+    let mut pending_deferred: Option<DeferredExperts> = None;
+    while layer < num_layers {
+        if check_signal() {
+            return Err("interrupted".into());
+        }
+        let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+
+        if is_full {
+            if let Some(ref mut def) = pending_deferred.take() {
+                def.complete(hidden, hd);
+                if capture_per_layer {
+                    layer_outputs.push(hidden.to_vec());
+                }
+            }
+            let mut attn_state: Option<FullAttnCmd2State> = None;
+            if let Some(ref mut kv_entry) = kv[layer] {
+                attn_state = full_attention_forward(
+                    exec.wf, layer, hidden, kv_entry, pos, exec.config,
+                    Some(exec.gpu_wf), Some(exec.ctx), exec.pipeline_mode,
+                );
+            }
+            let r = moe_layer_forward(
+                exec.wf, layer, hidden, exec.expert_fds[layer],
+                Some(exec.ctx), Some(exec.gpu_wf), exec.config,
+                exec.pipeline_mode, attn_state, None, exec.expert_io.as_mut().map(|x| &mut **x),
+            );
+            pending_deferred = r.unwrap_or(None);
+            layer += 1;
+            continue;
+        }
+
+        let group_start = layer;
+        while layer < num_layers && (layer + 1) % FULL_ATTN_INTERVAL != 0 {
+            layer += 1;
+        }
+        let group_layers: Vec<usize> = (group_start..layer).collect();
+        let m_layers = group_layers.len();
+        if m_layers == 0 { continue; }
+
+        let first_layer = group_layers[0];
+        let last_layer = group_layers[m_layers - 1];
+
+        if let Some(ref mut def) = pending_deferred.take() {
+            def.complete(hidden, hd);
+            if capture_per_layer {
+                layer_outputs.push(hidden.to_vec());
+            }
+        }
+
+        upload_first_layer(exec.ctx, exec.wf, hidden, first_layer);
+
+        // CMD 0: pre_expert(first_layer)
+        {
+            let li = first_layer - (first_layer + 1) / FULL_ATTN_INTERVAL;
+            let cmd = exec.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            encode_pre_expert(
+                exec.wf, exec.gpu_wf, exec.ctx, &enc, first_layer, li,
+                hd, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
+                key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if let Some(ref mut s) = lin[first_layer] {
+                update_conv_state(s, qkv_dim);
+            }
+        }
+
+        let (expert_indices_0, expert_weights_0, shared_gate_score_0) =
+            route_and_pread(
+                exec.ctx, exec.expert_io.as_mut().unwrap(),
+                first_layer, exec.expert_fds[first_layer]);
+
+        let mut _prev_expert_indices = expert_indices_0;
+        let mut prev_expert_weights = expert_weights_0;
+        let mut prev_shared_gate_score = shared_gate_score_0;
+
+        for gi in 1..m_layers {
+            let prev_layer = group_layers[gi - 1];
+            let curr_layer = group_layers[gi];
+            let curr_li = curr_layer - (curr_layer + 1) / FULL_ATTN_INTERVAL;
+
+            let next_norm = exec.wf.get_tensor_ptr(
+                &format!("model.layers.{}.input_layernorm.weight", curr_layer));
+            let next_norm_info = next_norm
+                .map(|p| (p as *const std::ffi::c_void, exec.gpu_wf.base as usize));
+
+            let cmd = exec.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+
+            {
+                let io = exec.expert_io.as_ref().unwrap();
+                encode_post_expert(
+                    exec.wf, exec.gpu_wf, exec.ctx, &enc, prev_layer,
+                    &prev_expert_weights, prev_shared_gate_score,
+                    &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
+                    &io.expert_out, &io.shared_act, &io.shared_down, &io.combine_params,
+                    next_norm_info,
+                    hd, moe_inter, shared_inter, k, layout,
+                );
+            }
+
+            encode_pre_expert(
+                exec.wf, exec.gpu_wf, exec.ctx, &enc, curr_layer, curr_li,
+                hd, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
+                key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
+            );
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if let Some(ref mut s) = lin[curr_layer] {
+                update_conv_state(s, qkv_dim);
+            }
+
+            if capture_per_layer {
+                let mut h = vec![0.0f32; hd];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        exec.ctx.buf_moe_hidden.as_ref().unwrap().contents() as *const f32,
+                        h.as_mut_ptr(), hd);
+                }
+                layer_outputs.push(h);
+            }
+
+            {
+                let (indices, weights, gate_score) = route_and_pread(
+                    exec.ctx, exec.expert_io.as_mut().unwrap(),
+                    curr_layer, exec.expert_fds[curr_layer]);
+                _prev_expert_indices = indices;
+                prev_expert_weights = weights;
+                prev_shared_gate_score = gate_score;
+            }
+        }
+
+        // Last CMD: post_expert(last_layer)
+        {
+            let next_norm_info = if last_layer + 1 < num_layers {
+                exec.wf.get_tensor_ptr(
+                    &format!("model.layers.{}.input_layernorm.weight", last_layer + 1))
+                    .map(|p| (p as *const std::ffi::c_void, exec.gpu_wf.base as usize))
+            } else {
+                None
+            };
+
+            let cmd = exec.ctx.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            {
+                let io = exec.expert_io.as_ref().unwrap();
+                encode_post_expert(
+                    exec.wf, exec.gpu_wf, exec.ctx, &enc, last_layer,
+                    &prev_expert_weights, prev_shared_gate_score,
+                    &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
+                    &io.expert_out, &io.shared_act, &io.shared_down, &io.combine_params,
+                    next_norm_info,
+                    hd, moe_inter, shared_inter, k, layout,
+                );
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    exec.ctx.buf_moe_hidden.as_ref().unwrap().contents() as *const f32,
+                    hidden.as_mut_ptr(), hd);
+            }
+
+            if capture_per_layer {
+                layer_outputs.push(hidden.to_vec());
+            }
+        }
+    }
+
+    if let Some(ref mut def) = pending_deferred.take() {
+        def.complete(hidden, hd);
+        if capture_per_layer {
+            layer_outputs.push(hidden.to_vec());
+        }
+    }
+
+    Ok(())
 }
