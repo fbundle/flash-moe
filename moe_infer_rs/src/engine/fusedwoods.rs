@@ -16,7 +16,7 @@ use crate::metal_context::{metal_buf_shared, ExpertBuffer, WeightBuffer, MetalCo
 use crate::model::Model;
 use crate::model::config::ModelConfig;
 use crate::model::weights::WeightFile;
-use crate::engine::{ExecCtxGpu, SignalCheckFn};
+use crate::engine::SignalCheckFn;
 use crate::math::{
     apply_rope, bf16_to_f32, conv1d_step, dequant_matvec_4bit,
     embed_lookup, final_norm, normalize_weights, rms_norm, rms_norm_bare,
@@ -1525,9 +1525,20 @@ fn gpu_lm_head(
     }
 }
 
+// ─── GPU execution context (local) ───────────────────────────────────────
+
+struct ExecCtxGpu<'a> {
+    wf: &'a WeightFile,
+    ctx: &'a MetalContext,
+    gpu_wf: &'a WeightBuffer,
+    config: &'a ModelConfig,
+    expert_fds: &'a [RawFd],
+    expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+}
+
 // ─── General-purpose token processing ────────────────────────────────────
 
-pub fn process_token_inner(
+fn process_token_inner(
     exec: &mut ExecCtxGpu<'_>,
     hidden: &mut [f32],
     pos: usize,

@@ -1,10 +1,11 @@
 /// Thin PyO3 bindings for the MoE-Infer inference engine.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use rand::Rng;
 
 use crate::cache::Cache as CoreCache;
@@ -12,9 +13,17 @@ use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
 use crate::engine::fusedexp::EngineFusedExp;
 use crate::engine::fusedwoods::EngineFusedWoods;
-use crate::engine::{Engine as EngineTrait, SignalCheckFn};
+use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry as set_telemetry};
 use crate::math::softmax;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
+
+// ─── Module-level functions ──────────────────────────────────────────────────
+
+/// Enable or disable engine-level telemetry recording globally.
+#[pyfunction]
+pub fn record_telemetry(on: bool) {
+    set_telemetry(on);
+}
 
 // ─── Model (thin wrapper) ───────────────────────────────────────────────────
 
@@ -144,6 +153,7 @@ pub struct Engine {
     expert_gpu_buffer: Option<ExpertBuffer>,
     mode: String,
     pub telemetry: Telemetry,
+    engine_telemetry: BTreeMap<String, TelemetryValue>,
 }
 
 impl EngineTrait for Engine {
@@ -153,10 +163,12 @@ impl EngineTrait for Engine {
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
-        match self.mode.as_str() {
+        let result = match self.mode.as_str() {
             "Cpu" | "CpuOnly" => {
                 let mut engine = EngineCPU { model: &self.model };
-                engine.forward(input_ids, cache, check_signal)
+                let logits = engine.forward(input_ids, cache, check_signal);
+                self.engine_telemetry = engine.telemetry();
+                logits
             }
             "FusedExp" => {
                 let mut engine = EngineFusedExp {
@@ -164,8 +176,11 @@ impl EngineTrait for Engine {
                     ctx: &self.ctx,
                     gpu_wf: &self.gpu_wf,
                     expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
+                    timing: BTreeMap::new(),
                 };
-                engine.forward(input_ids, cache, check_signal)
+                let logits = engine.forward(input_ids, cache, check_signal);
+                self.engine_telemetry = engine.telemetry();
+                logits
             }
             "FusedWoods" => {
                 let mut engine = EngineFusedWoods {
@@ -174,10 +189,13 @@ impl EngineTrait for Engine {
                     gpu_wf: &self.gpu_wf,
                     expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
                 };
-                engine.forward(input_ids, cache, check_signal)
+                let logits = engine.forward(input_ids, cache, check_signal);
+                self.engine_telemetry = engine.telemetry();
+                logits
             }
-            _ => Err(format!("Unknown pipeline mode: {}", self.mode)),
-        }
+            _ => return Err(format!("Unknown pipeline mode: {}", self.mode)),
+        };
+        result
     }
 }
 
@@ -227,6 +245,7 @@ impl Engine {
             expert_gpu_buffer,
             mode: pipeline_mode.to_string(),
             telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0 },
+            engine_telemetry: BTreeMap::new(),
         })
     }
 
@@ -304,6 +323,15 @@ impl Engine {
             } else { 0.0 }
         } else { 0.0 };
         dict.set_item("tokens_per_sec", tps)?;
+        for (k, v) in &self.engine_telemetry {
+            match v {
+                TelemetryValue::Scalar(val) => { dict.set_item(k, *val)?; }
+                TelemetryValue::List(vals) => {
+                    let py_list = PyList::new(py, vals.iter().map(|&x| x))?;
+                    dict.set_item(k, py_list)?;
+                }
+            }
+        }
         Ok(dict.into_pyobject(py).unwrap().into_any().into())
     }
 

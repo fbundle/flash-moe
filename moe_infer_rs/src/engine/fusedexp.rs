@@ -10,8 +10,10 @@
 /// CMD_{N-1}: post_expert(N-2) + pre_expert(N-1)
 /// CMD_N: post_expert(N-1)  [+ GPU-side input_norm for next token]
 /// ```
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::fd::RawFd;
+use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
 
@@ -21,7 +23,7 @@ use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ
 use crate::cache::{Cache, LinearAttnState};
 use crate::engine::Engine;
 use crate::model::Model;
-use crate::engine::SignalCheckFn;
+use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::config::{ExpertLayout, ModelConfig};
 use crate::model::weights::WeightFile;
 use crate::math::{
@@ -76,6 +78,28 @@ impl DeferredExperts {
     }
 }
 
+// ─── Timing helpers ──────────────────────────────────────────────────────
+
+fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
+    if !crate::engine::record_telemetry() { return; }
+    match tm.entry(key.into()) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if let TelemetryValue::Scalar(ref mut v) = e.get_mut() { *v += dt; }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => { e.insert(TelemetryValue::Scalar(dt)); }
+    }
+}
+
+fn timing_push(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
+    if !crate::engine::record_telemetry() { return; }
+    match tm.entry(key.into()) {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if let TelemetryValue::List(ref mut v) = e.get_mut() { v.push(dt); }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => { e.insert(TelemetryValue::List(vec![dt])); }
+    }
+}
+
 // ─── Execution context ─────────────────────────────────────────────────────
 
 struct ExecCtx<'a> {
@@ -84,6 +108,7 @@ struct ExecCtx<'a> {
     ctx: &'a MetalContext,
     gpu_wf: &'a WeightBuffer,
     expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    timing: BTreeMap<String, TelemetryValue>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -223,6 +248,7 @@ impl<'a> ExecCtx<'a> {
             wf, layer, hidden, self.model.expert_fds[layer],
             self.ctx, self.gpu_wf, config,
             Some(attn), self.expert_gpu_buffer.as_deref_mut(),
+            &mut self.timing,
         )
     }
 
@@ -292,6 +318,7 @@ impl<'a> ExecCtx<'a> {
             self.ctx, self.expert_gpu_buffer.as_mut().unwrap(),
             first_layer, self.model.expert_fds[first_layer],
             num_experts, k, expert_size,
+            &mut self.timing,
         );
 
         // CMD 1..N-1: fused post_expert(prev) + pre_expert(curr)
@@ -334,6 +361,7 @@ impl<'a> ExecCtx<'a> {
                 self.ctx, self.expert_gpu_buffer.as_mut().unwrap(),
                 curr_layer, self.model.expert_fds[curr_layer],
                 num_experts, k, expert_size,
+                &mut self.timing,
             );
             prev_weights = weights;
             prev_gate_score = gate_score;
@@ -394,6 +422,7 @@ fn moe_layer_forward(
     config: &ModelConfig,
     attn_state: Option<FullAttnGpuOut>,
     mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
+    timing: &mut BTreeMap<String, TelemetryValue>,
 ) -> Option<DeferredExperts> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -660,6 +689,7 @@ fn moe_layer_forward(
         }
 
         if miss_count > 0 {
+            let t_io = Instant::now();
             let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
             for m in 0..miss_count {
                 let ki = miss_k_slot[m];
@@ -674,11 +704,14 @@ fn moe_layer_forward(
                     });
                 }
             });
+            let dt = t_io.elapsed().as_secs_f64() * 1000.0;
+            timing_add(timing, "engine.expert_io_ms", dt);
         }
         for m in 0..miss_count {
             valid[miss_k_slot[m]] = true;
         }
     } else {
+        let t_io = Instant::now();
         for ki in 0..actual_k {
             let eidx = expert_indices[ki];
             let buf = metal_buf_shared(&ctx.device, expert_size);
@@ -690,6 +723,8 @@ fn moe_layer_forward(
             if nread == expert_size as isize { valid[ki] = true; }
             fallback_expert_bufs.push(buf);
         }
+        let dt = t_io.elapsed().as_secs_f64() * 1000.0;
+        timing_add(timing, "engine.expert_io_ms", dt);
     }
 
     let any_valid = valid.iter().take(actual_k).any(|&v| v);
@@ -942,6 +977,7 @@ fn route_and_pread(
     num_experts: usize,
     k: usize,
     expert_size: usize,
+    timing: &mut BTreeMap<String, TelemetryValue>,
 ) -> (Vec<usize>, Vec<f32>, f32) {
     let gate_buf = ctx.buf_gate_scores.as_ref().unwrap();
     let mut gate_scores = vec![0.0f32; num_experts];
@@ -979,6 +1015,7 @@ fn route_and_pread(
         expert_gpu_buffer.expert_data[ki] = buf;
     }
     if miss_count > 0 {
+        let t_io = Instant::now();
         let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
         for m in 0..miss_count {
             let ki = miss_k_slot[m];
@@ -994,6 +1031,8 @@ fn route_and_pread(
                 });
             }
         });
+        let dt = t_io.elapsed().as_secs_f64() * 1000.0;
+        timing_add(timing, "engine.expert_io_ms", dt);
     }
     (expert_indices, expert_weights, shared_gate_score)
 }
@@ -1302,6 +1341,7 @@ pub struct EngineFusedExp<'a> {
     pub ctx: &'a MetalContext,
     pub gpu_wf: &'a WeightBuffer,
     pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    pub timing: BTreeMap<String, TelemetryValue>,
 }
 
 impl<'a> Engine for EngineFusedExp<'a> {
@@ -1311,6 +1351,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
+        let t0 = Instant::now();
         let n = input_ids.len();
         let hd = self.model.config.hidden_dim;
         let vs = self.model.config.vocab_size;
@@ -1327,6 +1368,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
             ctx: self.ctx,
             gpu_wf: self.gpu_wf,
             expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
+            timing: BTreeMap::new(),
         };
 
         let mut embed = vec![0.0f32; n * hd];
@@ -1351,7 +1393,9 @@ impl<'a> Engine for EngineFusedExp<'a> {
                     if let Some(ref mut def) = pending.take() {
                         def.complete(&mut hidden, hd);
                     }
+                    let t0 = Instant::now();
                     pending = exec.full_attention_layer(layer, &mut hidden, pos);
+                    timing_push(&mut exec.timing, "engine.full_attention_layer", t0.elapsed().as_secs_f64() * 1000.0);
                     layer += 1;
                 } else {
                     if let Some(ref mut def) = pending.take() {
@@ -1361,7 +1405,9 @@ impl<'a> Engine for EngineFusedExp<'a> {
                     while layer < num_layers && (layer + 1) % FULL_ATTN_INTERVAL != 0 {
                         layer += 1;
                     }
+                    let t0 = Instant::now();
                     exec.linear_group(group_start, layer - group_start, &mut hidden);
+                    timing_push(&mut exec.timing, "engine.linear_group", t0.elapsed().as_secs_f64() * 1000.0);
                 }
             }
 
@@ -1373,6 +1419,12 @@ impl<'a> Engine for EngineFusedExp<'a> {
             exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vs..(ti + 1) * vs]);
         }
 
+        timing_add(&mut exec.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
+        self.timing = exec.timing.clone();
         Ok(logits)
+    }
+
+    fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
+        self.timing.clone()
     }
 }
