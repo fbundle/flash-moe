@@ -15,23 +15,28 @@ class Conversation:
         
         self.messages = []
     
-    def chat(self, message: str) -> Iterator[str]:
+    def chat(self, message: str) -> str:
         self.messages.append({
             "role": "user",
             "content": message,
         })
 
-        input_ids = np.array(self.tokenizer.apply_chat_template(self.messages, add_generation_prompt=True, enable_thinking=False).input_ids)
-        input_ids = input_ids[self.cache.pos:] # get new ids
+        input_ids = np.array(self.tokenizer.apply_chat_template(self.messages, add_generation_prompt=True, enable_thinking=False).input_ids, dtype=np.int64)
 
         completion = ""
         completion_ids = []
         for token, logits in self.engine.stream_generate(input_ids, self.cache):
             completion_ids.append(token)
-            
+
             new_completion = self.tokenizer.decode(completion_ids)
-            yield new_completion[len(completion):]
+
+            addon_completion = new_completion[len(completion):]
+            print(addon_completion, end="", flush=True)
             completion = new_completion
+
+        self.messages.append({"role": "assistant", "content": completion})
+
+        return completion
 
 hf_path = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 path = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
@@ -40,8 +45,7 @@ c = Conversation(hf_path, path)
 
 while True:
     message = input("> ")
-    for e in c.chat("hello"):
-        print(e, end="", flush=True)
+    _ = c.chat("hello")
     
     print()
     print(c.engine.telemetry())
