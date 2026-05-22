@@ -61,18 +61,32 @@ def run_mlx():
 def compare(label1, logits1, label2, logits2, eps=1e-3):
     """Compare two logit arrays."""
     min_len = min(len(logits1), len(logits2))
-    a = logits1[:min_len]
-    b = logits2[:min_len]
+    a = logits1[:min_len].astype(np.float64)
+    b = logits2[:min_len].astype(np.float64)
     diff = np.abs(a - b)
     max_diff = diff.max()
     mean_diff = diff.mean()
     idx_max = diff.argmax()
+
+    # Relative diff: |a-b| / max(|a|, |b|, 1e-8)
+    denom = np.maximum(np.maximum(np.abs(a), np.abs(b)), 1e-8)
+    rel_diff = diff / denom
+    max_rel = rel_diff.max()
+    idx_rel = rel_diff.argmax()
+
+    # Cosine similarity
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+    cos_sim = float(np.dot(a, b) / max(a_norm * b_norm, 1e-12))
+
     matching = (diff < eps).sum()
     pct = 100.0 * matching / len(diff)
 
     print(f"\n  {label1} vs {label2}:")
     print(f"    max_diff={max_diff:.6f} at idx {idx_max} ({label1}={a[idx_max]:.6f}, {label2}={b[idx_max]:.6f})")
     print(f"    mean_diff={mean_diff:.6f}")
+    print(f"    max_rel_diff={max_rel:.6f} at idx {idx_rel} ({label1}={a[idx_rel]:.6f}, {label2}={b[idx_rel]:.6f})")
+    print(f"    cosine_sim={cos_sim:.8f}")
     print(f"    within {eps}: {matching}/{len(diff)} ({pct:.2f}%)")
     return max_diff
 
@@ -85,7 +99,7 @@ def main():
     print("=" * 60)
 
     results = {}
-    for mode in ["Fused3", "FusedExp"]:
+    for mode in ["Cpu", "Gpu", "Fused3", "FusedExp"]:
         results[mode] = run_rust(mode)
 
     results["mlx-lm"] = run_mlx()
@@ -94,7 +108,7 @@ def main():
     print("Pairwise comparisons")
     print("=" * 60)
 
-    engines = ["Fused3", "FusedExp", "mlx-lm"]
+    engines = ["Cpu", "Gpu", "Fused3", "FusedExp", "mlx-lm"]
     max_diffs = {}
     for i, e1 in enumerate(engines):
         for e2 in engines[i+1:]:
@@ -108,11 +122,17 @@ def main():
         status = "PASS" if md < 1e-3 else ("CLOSE" if md < 1e-1 else "FAIL")
         print(f"  {pair}: max_diff={md:.6f} [{status}]")
 
-    # Cross-check: Fused3 and FusedExp should match within epsilon
-    if max_diffs.get("Fused3_vs_FusedExp", 1.0) < 1e-3:
-        print("\n[verify] Fused3 and FusedExp match — pipeline changes are numerically correct.")
+    # Cpu and Gpu must match (pure CPU vs GPU non-fused — same algorithms)
+    if max_diffs.get("Cpu_vs_Gpu", 1.0) < 1e-3:
+        print("\n[verify] Cpu and Gpu match — baseline is solid.")
     else:
-        print("\n[verify] WARNING: Fused3 and FusedExp diverge — Fix #1 may need adjustment.")
+        print("\n[verify] WARNING: Cpu vs Gpu diverge — baseline is broken!")
+
+    # Cpu must match mlx-lm
+    if max_diffs.get("Cpu_vs_mlx-lm", 1.0) < 1e-2:
+        print("[verify] Cpu matches mlx-lm — numerical correctness confirmed.")
+    else:
+        print("[verify] WARNING: Cpu vs mlx-lm diverge — shared code has bugs!")
 
 
 if __name__ == "__main__":

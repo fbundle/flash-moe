@@ -270,7 +270,74 @@ We compared C bench, Rust Fused3, and MLX-LM on the stripped model (BOS token, g
 | C vs MLX-LM | 0.109 | 3.36% |
 | Rust vs MLX-LM | 0.109 | 3.36% |
 
-**C and Rust are numerically identical.** Both diverge from MLX-LM by ~0.02 mean / ~0.11 max. This means the C→Rust port is faithful, but the C engine has a pre-existing discrepancy from the MLX-LM reference. The root cause is still under investigation — likely candidates are dequantization precision, norm epsilon handling, or SSM state initialization.
+**C and Rust are numerically identical.** Both diverge from MLX-LM by ~0.02 mean / ~0.11 max. This means the C→Rust port is faithful, but the C engine has a pre-existing discrepancy from the MLX-LM reference.
+
+## Rust Cpu vs MLX-LM: Divergence Investigation
+
+### Bug Found: RoPE Element Pairing (2026-05-22)
+
+**Root cause**: `apply_rope()` in `moe_infer_rs/src/gpu_forward.rs` used traditional consecutive element pairing instead of NeoX-style non-consecutive pairing. MLX uses `nn.RoPE(dims, traditional=False)` which implements NeoX-style: elements at `(i, i + dims/2)` are rotated as a pair.
+
+#### Before (broken)
+
+```rust
+// Traditional: pairs (0,1), (2,3), (4,5), ...
+for d in (0..rotary_dim).step_by(2) {
+    let theta = pos * rope_theta.powf(-2.0 * d / rotary_dim);
+    let (q0, q1) = (qh[d], qh[d + 1]);
+    qh[d] = q0 * cos - q1 * sin;
+    qh[d + 1] = q0 * sin + q1 * cos;
+}
+```
+
+#### After (fixed)
+
+```rust
+// NeoX-style (traditional=False): pairs (0, half), (1, half+1), ...
+let half = rotary_dim / 2;
+for i in 0..half {
+    let theta = pos * rope_theta.powf(-2.0 * i / rotary_dim);
+    let (q0, q1) = (qh[i], qh[i + half]);
+    qh[i] = q0 * cos - q1 * sin;
+    qh[i + half] = q0 * sin + q1 * cos;
+}
+```
+
+### Impact on 29-Token Batch Verification
+
+Verification is run with 29 tokens through the stripped 4-layer model. Per-layer hidden states are captured from both Rust Cpu and MLX (via class-level `DecoderLayer.__call__` monkey-patch) and compared.
+
+#### Before RoPE Fix
+
+| Metric | Layer 0 | Layer 1 | Layer 2 | Layer 3 | Logits |
+|--------|---------|---------|---------|---------|--------|
+| max_diff | 0.006 | 0.12 | 0.80 | 2.03 | 0.835 |
+| cos_sim | 0.99999 | 0.99997 | 0.9980 | 0.985 | 0.99823 |
+| pass 1e-4? | NO | NO | NO | NO | NO |
+
+#### After RoPE Fix
+
+| Metric | Layer 0 | Layer 1 | Layer 2 | Layer 3 | Logits |
+|--------|---------|---------|---------|---------|--------|
+| max_diff | 1.9e-03 | 1.6e-03 | 2.7e-03 | 2.2e-03 | 0.113 |
+| cos_sim | 0.99999 | 0.99999 | 0.99999 | 1.00000 | 0.99996 |
+| pass 1e-4? | NO | NO | NO | NO | **NO** |
+
+**Verdict: FAIL.** Verification is binary — either it matches or it doesn't. Despite the dramatic improvement (7.4x reduction in logit max_diff, cos_sim now 0.99996), Cpu still does not match MLX-LM within the 1e-4 threshold. The divergence is reduced but not eliminated.
+
+### Remaining Divergence After RoPE Fix
+
+1. **Linear attention layers (0–2)**: max_diff ~1.6e-03 to ~2.7e-03. These layers use GatedDeltaNet SSM — the SSM state accumulates error over 29 tokens from 4-bit dequant precision differences, conv1d precision, and floating-point order differences in SSM recurrence.
+
+2. **Full attention layer (3)**: max_diff ~2.2e-03. Attention softmax and value aggregation are sensitive to element ordering.
+
+3. **Logits show 0.113 max_diff but 0.99996 cos_sim**: The large max_diff concentrated at a single token index (1269) suggests a systematic bias in one output dimension rather than random noise. This position is sensitive to accumulated per-layer differences across all 29 tokens.
+
+4. **Candidates for residual divergence**:
+   - 4-bit dequant order: float32 vs float64 accumulation order in `nibble * scale + bias`
+   - RMS norm epsilon: 1e-6 in Rust, possibly different in MLX
+   - SSM recurrence: `g = exp(-exp(A_log) * softplus(a + dt_bias))` — small errors compound over 29 steps
+   - Attention softmax: numerical order differences in exp-sum-reciprocal chain
 
 ## Performance Benchmark (2026-05-22)
 
@@ -294,6 +361,7 @@ Result: Rust went from 0.76x to 0.96x of C throughput after expert I/O optimizat
 
 ## Next Steps
 
-1. **GPU KV cache** — store K/V caches persistently on GPU instead of uploading per layer
-2. **GPU RoPE kernel** — port C `apply_rope` shader (stretch goal; C engine also does RoPE on CPU)
-3. **GPU SSM state** — linear attention SSM state currently uploaded/downloaded per layer in non-fused path
+1. **Fix remaining Cpu vs MLX-LM divergence** — RoPE is fixed but residual differences remain in 4-bit dequant precision, SSM recurrence, and attention softmax. Track down the remaining 0.113 logit max_diff.
+2. **GPU KV cache** — store K/V caches persistently on GPU instead of uploading per layer
+3. **GPU RoPE kernel** — port C `apply_rope` shader (stretch goal; C engine also does RoPE on CPU)
+4. **GPU SSM state** — linear attention SSM state currently uploaded/downloaded per layer in non-fused path

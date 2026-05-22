@@ -9,194 +9,15 @@ use metal::{Buffer, MTLSize};
 use crate::config::ModelConfig;
 use crate::error::MoEError;
 use crate::kernels;
-
-const MAX_SEQ: usize = 4096;
 use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext, MAX_K};
+use crate::pipeline_common::{
+    cpu_conv1d_step, cpu_normalize_weights, cpu_rms_norm_bare, cpu_rms_norm_gated,
+    cpu_sigmoid, cpu_silu, cpu_softmax, cpu_topk,
+    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState,
+    PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
+};
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
 use crate::weights::WeightFile;
-
-const RMS_NORM_EPS: f32 = 1e-6;
-const GROUP_SIZE: usize = 64;
-pub const LINEAR_KEY_DIM: usize = 128;
-pub const LINEAR_VALUE_DIM: usize = 128;
-const CONV_KERNEL_SIZE: usize = 4;
-
-/// Pipeline execution mode — controls how GPU command buffers are batched.
-///
-/// The C engine uses 3 command buffers per layer, split by CPU-side routing
-/// which must happen between the gate projection and expert dispatch:
-///
-///   CMD1: attention projs → conv1d → SSM
-///   CMD2: o_proj → residual → norm → routing gate
-///   CPU:  softmax + top-K + expert I/O  (inherently serial)
-///   CMD3: expert forward → combine → residual → norm
-///
-/// Since the CPU routing step is unavoidable, the minimum is 2 CMDs (pre-routing
-/// and post-routing). The 3-CMD approach isolates attention from the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineMode {
-    /// CPU-only path: all matvecs, activations, and routing on CPU (no Metal).
-    CpuOnly,
-    /// GPU path: individual Metal dispatches per operation (no command-buffer fusion).
-    Gpu,
-    /// Fused experiment: what we currently have — fused CMD1 (linear attention qkv/z/b/a),
-    /// but MoE experts are dispatched individually (no CMD3 batching, no GPU combine).
-    FusedExp,
-    /// 3-CMD fused: CMD1 (attention) + CMD2 (o_proj/routing) + CMD3 (async experts + GPU combine).
-    /// Matches the original C engine architecture: 2 sync points for all 40 layers.
-    Fused3,
-}
-
-// ─── CPU helper functions ──────────────────────────────────────────────────
-
-fn cpu_sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-fn cpu_silu(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v = *v / (1.0 + (-*v).exp());
-    }
-}
-
-fn cpu_softmax(x: &mut [f32]) {
-    let max_val = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        *v = (*v - max_val).exp();
-        sum += *v;
-    }
-    let inv = 1.0 / sum;
-    for v in x.iter_mut() {
-        *v *= inv;
-    }
-}
-
-fn cpu_topk(scores: &[f32], k: usize, indices: &mut [usize], values: &mut [f32]) {
-    // Min-heap of K smallest
-    for (i, &score) in scores.iter().enumerate() {
-        if i < k {
-            // Insert into heap
-            let mut pos = i;
-            while pos > 0 && values[(pos - 1) / 2] > score {
-                values[pos] = values[(pos - 1) / 2];
-                indices[pos] = indices[(pos - 1) / 2];
-                pos = (pos - 1) / 2;
-            }
-            values[pos] = score;
-            indices[pos] = i;
-        } else if score > values[0] {
-            values[0] = score;
-            indices[0] = i;
-            let mut pos = 0;
-            loop {
-                let left = 2 * pos + 1;
-                let right = 2 * pos + 2;
-                let mut smallest = pos;
-                if left < k && values[left] < values[smallest] { smallest = left; }
-                if right < k && values[right] < values[smallest] { smallest = right; }
-                if smallest == pos { break; }
-                values.swap(pos, smallest);
-                indices.swap(pos, smallest);
-                pos = smallest;
-            }
-        }
-    }
-}
-
-fn cpu_normalize_weights(weights: &mut [f32]) {
-    let sum: f32 = weights.iter().sum();
-    if sum > 0.0 {
-        let inv = 1.0 / sum;
-        for w in weights.iter_mut() { *w *= inv; }
-    }
-}
-
-fn cpu_rms_norm_bare(x: &[f32], out: &mut [f32], dim: usize, eps: f32) {
-    let sum_sq: f32 = x[..dim].iter().map(|v| v * v).sum();
-    let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
-    for i in 0..dim {
-        out[i] = x[i] * inv_rms;
-    }
-}
-
-fn cpu_rms_norm_gated(
-    x: &[f32], z: &[f32], w_bf16: &[u16],
-    out: &mut [f32], dim: usize, eps: f32,
-) {
-    let sum_sq: f32 = x[..dim].iter().map(|v| v * v).sum();
-    let inv_rms = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
-    for i in 0..dim {
-        let w = bf16_to_f32(w_bf16[i]);
-        let silu_z = z[i] / (1.0 + (-z[i]).exp());
-        out[i] = x[i] * inv_rms * w * silu_z;
-    }
-}
-
-fn cpu_conv1d_step(
-    conv_state: &[f32],   // [(kernel_size-1) * channels]
-    new_input: &[f32],    // [channels]
-    weight_bf16: &[u16],  // [channels * kernel_size]
-    out: &mut [f32],      // [channels]
-    channels: usize,
-    kernel_size: usize,
-) {
-    for c in 0..channels {
-        let mut acc = 0.0f32;
-        for k in 0..kernel_size - 1 {
-            let w = bf16_to_f32(weight_bf16[c * kernel_size + k]);
-            acc += conv_state[k * channels + c] * w;
-        }
-        let w = bf16_to_f32(weight_bf16[c * kernel_size + (kernel_size - 1)]);
-        acc += new_input[c] * w;
-        out[c] = acc;
-    }
-    cpu_silu(&mut out[..channels]);
-}
-
-// ─── Full attention KV cache ──────────────────────────────────────────────
-
-/// CPU-side KV cache for a full-attention layer.
-pub struct FullAttnCache {
-    pub k_cache: Vec<f32>,
-    pub v_cache: Vec<f32>,
-    pub len: usize,
-}
-
-impl FullAttnCache {
-    pub fn new(max_seq: usize, kv_dim: usize) -> Self {
-        FullAttnCache {
-            k_cache: vec![0.0f32; max_seq * kv_dim],
-            v_cache: vec![0.0f32; max_seq * kv_dim],
-            len: 0,
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.len = 0;
-    }
-}
-
-// ─── Linear attention state ────────────────────────────────────────────────
-
-pub struct LinearAttnState {
-    /// Conv1d state: [(kernel_size-1) * qkv_dim] ring buffer (CPU)
-    pub conv_state: Vec<f32>,
-    /// SSM state: [num_v_heads * value_dim * key_dim] — the S matrix per v-head
-    pub ssm_state: Vec<f32>,
-    /// GPU persistent SSM state buffer (created lazily)
-    pub ssm_state_gpu: Option<Buffer>,
-}
-
-impl LinearAttnState {
-    pub fn new(num_v_heads: usize, key_dim: usize, value_dim: usize, qkv_dim: usize) -> Self {
-        LinearAttnState {
-            conv_state: vec![0.0f32; (CONV_KERNEL_SIZE - 1) * qkv_dim],
-            ssm_state: vec![0.0f32; num_v_heads * value_dim * key_dim],
-            ssm_state_gpu: None,
-        }
-    }
-}
 
 // ─── RoPE ─────────────────────────────────────────────────────────────────
 
@@ -205,66 +26,34 @@ fn apply_rope(
     num_q_heads: usize, num_kv_heads: usize,
     head_dim: usize, rotary_dim: usize, rope_theta: f64,
 ) {
+    // NeoX-style (traditional=False): pairs (i, i + rotary_dim/2)
     let pos_f = pos as f32;
+    let half = rotary_dim / 2;
     for h in 0..num_q_heads {
         let qh = &mut q[h * head_dim..];
-        for d in (0..rotary_dim).step_by(2) {
-            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (d as f64) / rotary_dim as f64);
+        for i in 0..half {
+            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (i as f64) / rotary_dim as f64);
             let cos = theta.cos() as f32;
             let sin = theta.sin() as f32;
-            let (q0, q1) = (qh[d], qh[d + 1]);
-            qh[d] = q0 * cos - q1 * sin;
-            qh[d + 1] = q0 * sin + q1 * cos;
+            let (q0, q1) = (qh[i], qh[i + half]);
+            qh[i] = q0 * cos - q1 * sin;
+            qh[i + half] = q0 * sin + q1 * cos;
         }
     }
     for h in 0..num_kv_heads {
         let kh = &mut k[h * head_dim..];
-        for d in (0..rotary_dim).step_by(2) {
-            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (d as f64) / rotary_dim as f64);
+        for i in 0..half {
+            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (i as f64) / rotary_dim as f64);
             let cos = theta.cos() as f32;
             let sin = theta.sin() as f32;
-            let (k0, k1) = (kh[d], kh[d + 1]);
-            kh[d] = k0 * cos - k1 * sin;
-            kh[d + 1] = k0 * sin + k1 * cos;
+            let (k0, k1) = (kh[i], kh[i + half]);
+            kh[i] = k0 * cos - k1 * sin;
+            kh[i + half] = k0 * sin + k1 * cos;
         }
     }
 }
 
 // ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ──
-
-/// GPU-resident attention state for fusing batched attention + o_proj + gate
-/// into a single CMD2 (matching the C engine architecture).
-pub struct FullAttnCmd2State {
-    pub q_buf: Buffer,
-    pub q_gate_buf: Buffer,
-    pub kc_buf: Buffer,
-    pub vc_buf: Buffer,
-    pub scores_buf: Buffer,
-    pub out_buf: Buffer,
-    pub hidden_buf: Buffer,
-    pub seq_len: u32,
-    pub seq_stride: u32,
-    pub num_attn_heads: u32,
-    pub head_dim: u32,
-    pub kv_dim: u32,
-    pub heads_per_kv: u32,
-    pub scale: f32,
-    pub q_dim: u32,
-    pub o_prefix: String,
-}
-
-/// GPU/CPU state from linear attention CMD1 for Fused3 (matching C engine exactly).
-///
-/// C does gated_rms_norm on GPU in CMD1 (encoder L5 → batch_out[6]), then
-/// out_proj + residual + norm + gate in CMD2. This struct carries the GPU
-/// gated attention output and pre-attention hidden state into moe_layer_forward's CMD2.
-pub struct LinearAttnFused3State {
-    pub gated_buf: Buffer,        // GPU buffer with gated_rms_norm output (total_value floats)
-    pub h_mid: Vec<f32>,          // pre-attention hidden (hidden_dim floats)
-    pub total_value: usize,
-    pub o_prefix: String,
-    pub post_norm_name: String,
-}
 
 // ─── Full attention forward ───────────────────────────────────────────────
 
@@ -380,7 +169,7 @@ pub fn full_attention_forward(
     // o_proj output (filled by GPU fused path or CPU fallback below)
     let mut o_out = vec![0.0f32; hidden_dim];
 
-    let use_gpu_attn = mode != PipelineMode::CpuOnly
+    let use_gpu_attn = mode != PipelineMode::Cpu
         && ctx.is_some()
         && gpu_wf.is_some()
         && ctx.unwrap().attn_scores_batched.is_some()
@@ -444,7 +233,7 @@ pub fn full_attention_forward(
 
         // o_proj
         let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
-        if mode != PipelineMode::CpuOnly {
+        if mode != PipelineMode::Cpu {
             if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
                 let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
                 unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
@@ -471,83 +260,6 @@ pub fn full_attention_forward(
 
 // ─── Deferred expert results (CMD3 async dispatch) ─────────────────────────
 
-/// Holds a committed but not-yet-completed CMD3 (expert forward + GPU combine).
-///
-/// In Fused3 mode, CMD3 is committed without `wait_until_completed()`, then
-/// results are collected at the start of the *next* layer — overlapping GPU work.
-pub struct DeferredExperts {
-    /// Committed command buffer (CMD3). Wait on next layer.
-    cmd_buf: Option<metal::CommandBuffer>,
-    /// moe_combine_residual output — final hidden state for this layer.
-    out_buf: Option<metal::Buffer>,
-    /// All intermediate GPU buffers kept alive until CMD completes.
-    _keep_alive: Vec<metal::Buffer>,
-    /// CMD3 wrote input_norm to buf_input → next layer can skip CPU rms_norm.
-    pub gpu_combined: bool,
-}
-
-impl DeferredExperts {
-    pub fn new() -> Self {
-        DeferredExperts {
-            cmd_buf: None,
-            out_buf: None,
-            _keep_alive: Vec::new(),
-            gpu_combined: false,
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.cmd_buf.is_some()
-    }
-
-    /// Complete deferred CMD3: wait for GPU, copy result into hidden.
-    /// When gpu_combined, CMD1(N+1) was submitted before this wait, so the
-    /// GPU queue serialized CMD3(N) → CMD1(N+1). The wait is nearly free.
-    pub fn complete(&mut self, hidden: &mut [f32], hidden_dim: usize) {
-        if let Some(ref cmd_buf) = self.cmd_buf {
-            cmd_buf.wait_until_completed();
-        }
-        if let Some(ref out_buf) = self.out_buf {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    out_buf.contents() as *const f32,
-                    hidden.as_mut_ptr(),
-                    hidden_dim,
-                );
-            }
-        }
-        self.cmd_buf = None;
-        self.out_buf = None;
-        self._keep_alive.clear();
-    }
-
-    /// Complete after CMD1 wait — CMD3 is already done (GPU-queue serialized).
-    /// Only used on FAST PATH (gpu_combined).
-    pub fn complete_fast(&mut self, hidden: &mut [f32], hidden_dim: usize) {
-        // CMD3 already completed by the GPU queue (serialized before CMD1 of next layer)
-        // Just drain the command buffer reference and copy result
-        if let Some(ref out_buf) = self.out_buf {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    out_buf.contents() as *const f32,
-                    hidden.as_mut_ptr(),
-                    hidden_dim,
-                );
-            }
-        }
-        self.cmd_buf = None;
-        self.out_buf = None;
-        self._keep_alive.clear();
-    }
-
-    /// Discard deferred results without CPU readback.
-    pub fn discard(&mut self) {
-        self.cmd_buf = None;
-        self.out_buf = None;
-        self._keep_alive.clear();
-    }
-}
-
 // ─── Linear attention forward (GatedDeltaNet) ─────────────────────────────
 
 /// Full linear attention forward (GatedDeltaNet) for single-token incremental inference.
@@ -573,7 +285,7 @@ pub fn linear_attention_forward(
     mode: PipelineMode,
     prev_gpu_combined: bool,
 ) -> Option<LinearAttnFused3State> {
-    let use_gpu = mode != PipelineMode::CpuOnly
+    let use_gpu = mode != PipelineMode::Cpu
         && gpu_wf.is_some()
         && ctx.is_some();
 
@@ -603,8 +315,6 @@ pub fn linear_attention_forward(
     let value_dim = total_value / num_v_heads;
     let inv_scale = 1.0 / (key_dim as f32).sqrt();
     let k_heads_per_v = num_v_heads / num_k_heads;
-
-    let debug_this_layer = layer_idx == 0;
 
     let mut gated_out = vec![0.0f32; total_value];
 
@@ -911,14 +621,6 @@ pub fn linear_attention_forward(
 
     {
         // ── Non-fused or CPU path ──
-        if debug_this_layer {
-            let rms_normed: f32 = (normed.iter().map(|&x| x*x).sum::<f32>() / normed.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] normed_rms={:.6} normed_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_normed, normed[0], normed[1], normed[2], normed[3], normed[4]);
-            let rms_hidden: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] hidden_in_rms={:.6} hidden_in_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_hidden, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
-            // Dump full hidden array as comma-separated values for Python consumption
-            eprintln!("[RUST-CPU-L0-HIDDEN] {}", hidden.iter().map(|x| format!("{:.8}", x)).collect::<Vec<_>>().join(","));
-        }
         // CPU: attention projections
         if let (Some(qw), Some(qs), Some(qb)) = (
             wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
@@ -1018,22 +720,6 @@ pub fn linear_attention_forward(
             }
             unsafe { std::ptr::copy_nonoverlapping(ssm_gpu.contents() as *const f32, state.ssm_state.as_mut_ptr(), ssm_size); }
         } else {
-        // RMS norm q and k (bare, no weights) then scale
-        if debug_this_layer {
-            let rms_qkv: f32 = (qkv.iter().map(|&x| x*x).sum::<f32>() / qkv.len() as f32).sqrt();
-            let rms_z: f32 = (z.iter().map(|&x| x*x).sum::<f32>() / z.len() as f32).sqrt();
-            let rms_b: f32 = (beta.iter().map(|&x| x*x).sum::<f32>() / beta.len() as f32).sqrt();
-            let rms_a: f32 = (alpha.iter().map(|&x| x*x).sum::<f32>() / alpha.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] qkv_rms={:.6} z_rms={:.6} beta_rms={:.6} alpha_rms={:.6}", rms_qkv, rms_z, rms_b, rms_a);
-            eprintln!("[RUST-CPU-L0] qkv_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]);
-            eprintln!("[RUST-CPU-L0] z_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", z[0], z[1], z[2], z[3], z[4]);
-            let rms_conv: f32 = (conv_out.iter().map(|&x| x*x).sum::<f32>() / conv_out.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] conv_out_rms={:.6} conv_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_conv, conv_out[0], conv_out[1], conv_out[2], conv_out[3], conv_out[4]);
-            let rms_q: f32 = (lin_q.iter().map(|&x| x*x).sum::<f32>() / lin_q.len() as f32).sqrt();
-            let rms_k: f32 = (lin_k.iter().map(|&x| x*x).sum::<f32>() / lin_k.len() as f32).sqrt();
-            let rms_v: f32 = (lin_v.iter().map(|&x| x*x).sum::<f32>() / lin_v.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] lin_q_rms={:.6} lin_k_rms={:.6} lin_v_rms={:.6}", rms_q, rms_k, rms_v);
-        }
         let mut q_normed = vec![0.0f32; total_key];
         let mut k_normed = vec![0.0f32; total_key];
         for h in 0..num_k_heads {
@@ -1048,13 +734,6 @@ pub fn linear_attention_forward(
             let kh_out = &mut k_normed[h * key_dim..(h + 1) * key_dim];
             cpu_rms_norm_bare(kh, kh_out, key_dim, 1e-6);
             for d in kh_out.iter_mut() { *d *= inv_scale; }
-        }
-
-        if debug_this_layer {
-            let rms_qn: f32 = (q_normed.iter().map(|&x| x*x).sum::<f32>() / q_normed.len() as f32).sqrt();
-            let rms_kn: f32 = (k_normed.iter().map(|&x| x*x).sum::<f32>() / k_normed.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] q_normed_rms={:.6} qn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_qn, q_normed[0], q_normed[1], q_normed[2], q_normed[3], q_normed[4]);
-            eprintln!("[RUST-CPU-L0] k_normed_rms={:.6} kn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_kn, k_normed[0], k_normed[1], k_normed[2], k_normed[3], k_normed[4]);
         }
 
         let a_log = wf.get_tensor_f32(&format!("{}.A_log", prefix));
@@ -1092,10 +771,6 @@ pub fn linear_attention_forward(
         }
 
         // RMSNormGated
-        if debug_this_layer {
-            let rms_out: f32 = (out_values.iter().map(|&x| x*x).sum::<f32>() / out_values.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] ssm_out_rms={:.6} ssm_out_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_out, out_values[0], out_values[1], out_values[2], out_values[3], out_values[4]);
-        }
         if let Some(gnw) = wf.get_tensor_u16(&format!("{}.norm.weight", prefix)) {
             for vh in 0..num_v_heads {
                 let oh = &out_values[vh * value_dim..(vh + 1) * value_dim];
@@ -1105,10 +780,6 @@ pub fn linear_attention_forward(
             }
         } else {
             gated_out.copy_from_slice(&out_values);
-        }
-        if debug_this_layer {
-            let rms_gated: f32 = (gated_out.iter().map(|&x| x*x).sum::<f32>() / gated_out.len() as f32).sqrt();
-            eprintln!("[RUST-CPU-L0] gated_out_rms={:.6} gated_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_gated, gated_out[0], gated_out[1], gated_out[2], gated_out[3], gated_out[4]);
         }
     }
     }
@@ -1126,17 +797,8 @@ pub fn linear_attention_forward(
     ) {
         cpu_dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
     }
-    // Residual add
-    if debug_this_layer {
-        let rms_attn: f32 = (attn_out.iter().map(|&x| x*x).sum::<f32>() / attn_out.len() as f32).sqrt();
-        eprintln!("[RUST-CPU-L0] attn_out_rms={:.6} attn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_attn, attn_out[0], attn_out[1], attn_out[2], attn_out[3], attn_out[4]);
-    }
     for i in 0..hidden_dim {
         hidden[i] = residual[i] + attn_out[i];
-    }
-    if debug_this_layer {
-        let rms_out: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
-        eprintln!("[RUST-CPU-L0] hidden_out_rms={:.6} hidden_out_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_out, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
     None
 }
@@ -1172,7 +834,7 @@ pub fn moe_layer_forward(
     let layout = &config.expert_layout_4bit;
     let k = config.num_experts_per_tok;
 
-    let use_gpu = mode != PipelineMode::CpuOnly
+    let use_gpu = mode != PipelineMode::Cpu
         && ctx.is_some()
         && gpu_wf.is_some();
 
@@ -1745,7 +1407,10 @@ pub fn moe_layer_forward(
             }
 
             // GPU-side input_norm for next layer (matches C Enc C2 + Enc C3)
-            let gpu_combined = layer_idx + 1 < config.num_layers
+            // Only safe in fused modes where CMD1 reads directly from buf_input,
+            // guaranteeing GPU queue serialization of CMD3-then-CMD1.
+            let gpu_combined = (mode == PipelineMode::Fused3 || mode == PipelineMode::FusedExp)
+                && layer_idx + 1 < config.num_layers
                 && ctx.rms_norm_apply_bf16.is_some()
                 && wf.get_tensor_ptr(&format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).is_some();
             if gpu_combined {

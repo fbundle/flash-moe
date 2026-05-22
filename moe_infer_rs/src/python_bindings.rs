@@ -10,12 +10,11 @@ use std::time::Instant;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 use crate::config::{load_model_config, ModelConfig};
-use crate::gpu_forward::{
-    full_attention_forward, linear_attention_forward, moe_layer_forward, DeferredExperts,
-    FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState, PipelineMode,
-};
+use crate::gpu_forward::{full_attention_forward, linear_attention_forward, moe_layer_forward};
+use crate::pipeline_common::{DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState, PipelineMode};
 use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext};
 use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
@@ -164,9 +163,15 @@ fn lm_head(
     }
 }
 
-fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
-    kv: &mut [Option<FullAttnCache>], lin: &mut [Option<LinearAttnState>],
+fn process_token_inner(
+    m: &mut ModelState,
+    hidden: &mut [f32],
+    pos: usize,
+    kv: &mut [Option<FullAttnCache>],
+    lin: &mut [Option<LinearAttnState>],
     py: Python<'_>,
+    capture_per_layer: bool,
+    layer_outputs: &mut Vec<Vec<f32>>,
 ) -> PyResult<()> {
     let mut deferred: Option<DeferredExperts> = None;
     let mode = m.pipeline_mode;
@@ -175,14 +180,6 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
         if layer % 4 == 0 {
             py.check_signals()?;
         }
-        // Print BEFORE finalize (matches C's [C-LAYER] measurement point at line 4006)
-        {
-            let rms_pre: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
-            let prev_layer = if layer > 0 { (layer - 1) as i32 } else { -1i32 };
-            eprintln!("[RUST-PRE] prev_layer={} hidden_rms={:.6} hidden[..5]=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
-                prev_layer, rms_pre, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
-        }
-
         // FAST PATH: previous CMD3 wrote input_norm to buf_input. Skip CPU rms_norm
         // and submit CMD1 immediately — GPU queue serializes CMD3(N-1) then CMD1(N).
         let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
@@ -192,22 +189,34 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
                 def.complete(hidden, m.config.hidden_dim);
             }
         }
-        {
-            let prev_layer = if layer > 0 { (layer - 1) as i32 } else { -1i32 };
-            let rms: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
-            eprintln!("[RUST-LAYER] prev_layer={} hidden_rms={:.6} hidden[..5]=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
-                prev_layer, rms, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
-        }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         let mut attn_state: Option<FullAttnCmd2State> = None;
         let mut lin_state: Option<LinearAttnFused3State> = None;
         let mut h_mid_saved: Option<Vec<f32>> = None;
         if is_full {
+            // FAST PATH: complete previous layer's MoE before full attention.
+            // CMD1 for linear layers calls complete_fast() after CMD1; full attention
+            // must do it before the forward so the correct hidden (MoE output) is used
+            // for input_norm and residual_add.
+            if prev_gpu_combined {
+                if let Some(ref mut def) = deferred.take() {
+                    def.complete_fast(hidden, m.config.hidden_dim);
+                }
+                h_mid_saved = Some(hidden.to_vec());
+            }
             if let Some(ref mut kv) = kv[layer] {
                 attn_state = full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx), mode);
             }
         } else if let Some(ref mut s) = lin[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
+            // FusedExp: CMD1 does out_proj + residual_add internally, so it needs
+            // the correct hidden for both input_norm and residual. Complete the
+            // deferred before CMD1 to get the correct MoE output from prev layer.
+            if prev_gpu_combined && mode == PipelineMode::FusedExp {
+                if let Some(ref mut def) = deferred.take() {
+                    def.complete_fast(hidden, m.config.hidden_dim);
+                }
+            }
             // In Fused3, h_mid must be saved before linear_attention_forward because
             // it doesn't modify hidden (matching C: CMD2 handles residual_add).
             // FAST PATH: hidden is stale (CMD3(N-1) not yet completed), so defer
@@ -224,8 +233,6 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
             );
 
             if prev_gpu_combined {
-                // CMD1 completed → GPU queue guarantees CMD3(N-1) finished first.
-                // Read hidden from CMD3(N-1)'s combine output (buf_moe_hidden).
                 if let Some(ref mut def) = deferred.take() {
                     def.complete_fast(hidden, m.config.hidden_dim);
                 }
@@ -246,12 +253,25 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
             m.expert_io.as_mut(),
         );
         deferred = r.unwrap_or(None);
+        // Capture hidden state after this decoder layer completes.
+        // The MoE output is already in hidden (via complete() for GPU path or
+        // via the final combine in CPU path). This matches MLX layer.__call__ output.
+        if capture_per_layer {
+            layer_outputs.push(hidden.to_vec());
+        }
     }
     // Complete last layer's deferred
     if let Some(ref mut def) = deferred {
         def.complete(hidden, m.config.hidden_dim);
     }
     Ok(())
+}
+
+fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
+    kv: &mut [Option<FullAttnCache>], lin: &mut [Option<LinearAttnState>],
+    py: Python<'_>,
+) -> PyResult<()> {
+    process_token_inner(m, hidden, pos, kv, lin, py, false, &mut Vec::new())
 }
 
 // ─── Sampling ───────────────────────────────────────────────────────────────
@@ -369,12 +389,12 @@ impl Context {
     #[pyo3(signature = (model_path, pipeline_mode="FusedExp"))]
     fn load_model(&mut self, model_path: &str, pipeline_mode: &str) -> PyResult<()> {
         let mode = match pipeline_mode {
-            "CpuOnly" => PipelineMode::CpuOnly,
+            "Cpu" | "CpuOnly" => PipelineMode::Cpu,
             "Gpu" => PipelineMode::Gpu,
             "FusedExp" => PipelineMode::FusedExp,
             "Fused3" => PipelineMode::Fused3,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown pipeline_mode: {}. Use CpuOnly|Gpu|FusedExp", pipeline_mode)
+                format!("Unknown pipeline_mode: {}. Use Cpu|Gpu|FusedExp|Fused3", pipeline_mode)
             )),
         };
         let ms = ModelState::load(model_path, mode)?;
@@ -448,6 +468,75 @@ impl Context {
         let arr = unsafe { PyArray2::<f32>::from_owned_array(py,
             numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap()) };
         Ok(arr.into_py(py))
+    }
+
+    /// forward_debug(input_ids: [n]int64, cache: Cache) -> (logits: [n, d]float32, layers: [[d]float32])
+    ///
+    /// Like forward() but also returns the hidden state after each decoder layer
+    /// for the LAST token in the batch. Useful for comparing against MLX per-layer outputs.
+    fn forward_debug(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>, cache: &mut Cache) -> PyResult<(PyObject, PyObject)> {
+        let t0 = Instant::now();
+        let m = self.model.as_mut().ok_or_else(||
+            pyo3::exceptions::PyRuntimeError::new_err("No model loaded"))?;
+        let ids = input_ids.readonly();
+        let ids = ids.as_slice()?;
+        let n = ids.len();
+        let start = cache.pos;
+        let new_tokens = &ids[start..];
+        let n_new = new_tokens.len();
+        let (hd, vs) = (m.config.hidden_dim, m.config.vocab_size);
+        let num_layers = m.config.num_layers;
+
+        let mut logits = vec![0.0f32; n * vs];
+        if n_new == 0 {
+            let arr = unsafe { PyArray2::<f32>::from_owned_array(py,
+                numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap()) };
+            let empty_list = PyList::empty(py);
+            return Ok((arr.into_py(py), empty_list.into_py(py)));
+        }
+
+        let mut embed = vec![0.0f32; n_new * hd];
+        for (i, &id) in new_tokens.iter().enumerate() {
+            embed_lookup(&m.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
+        }
+
+        let mut hidden = vec![0.0f32; hd];
+        // Per-layer hidden states for ALL tokens (n_new * num_layers * hd)
+        let mut all_layer_outputs: Vec<Vec<f32>> = Vec::new();
+
+        for (ti, _) in new_tokens.iter().enumerate() {
+            hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
+            let mut layer_outputs = Vec::new();
+            process_token_inner(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin, py, true, &mut layer_outputs)?;
+            cache.pos += 1;
+            // Append layer outputs BEFORE final_norm (hidden at this point is the MoE output)
+            all_layer_outputs.push(hidden.to_vec());  // For convenience, also save the pre-norm hidden
+            all_layer_outputs.extend(layer_outputs);
+            final_norm(&m.wf, &mut hidden, hd);
+            lm_head(&m.wf, &hidden, &mut logits[(start + ti) * vs..(start + ti + 1) * vs], &m.gpu_wf, &m.ctx);
+        }
+
+        self.telemetry.prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        self.telemetry.total_ms = 0.0;
+        self.telemetry.tokens_generated = 0;
+
+        // Build Python list of per-layer states for the LAST token only
+        // all_layer_outputs layout: for each token: [final_hidden, layer_0, layer_1, ..., layer_N-1]
+        // We want the last token's per-layer outputs (layer_0 through layer_N-1)
+        let per_token_entries = 1 + num_layers;  // final_hidden + per-layer outputs
+        let last_token_start = (n_new - 1) * per_token_entries;
+        let py_list = PyList::empty(py);
+        // Skip the "final_hidden" entry (index last_token_start), use per-layer outputs
+        for li in 0..num_layers {
+            let layer_hidden = &all_layer_outputs[last_token_start + 1 + li];
+            let arr = unsafe { PyArray1::<f32>::from_owned_array(py,
+                numpy::ndarray::Array1::from_vec(layer_hidden.clone())) };
+            py_list.append(arr)?;
+        }
+
+        let arr = unsafe { PyArray2::<f32>::from_owned_array(py,
+            numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap()) };
+        Ok((arr.into_py(py), py_list.into_py(py)))
     }
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=1.0,
