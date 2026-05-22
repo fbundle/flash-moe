@@ -177,32 +177,30 @@ impl Engine {
 
     // ─── Forward ──────────────────────────────────────────────────────────
 
-    /// Run forward pass for a batch of token IDs. Returns logits for all positions.
-    /// Skips already-processed tokens based on cache.pos.
+    /// Run forward pass for input token IDs. Returns logits for all positions.
+    /// All tokens in input_ids are processed as new tokens from cache.pos.
+    /// Callers must trim the prefix (input_ids[cache.pos:]) before calling.
     pub fn forward(
         &mut self, input_ids: &[i64], cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
         let t0 = Instant::now();
         let n = input_ids.len();
-        let start = if cache.pos < n { cache.pos } else { 0 };
-        let new_tokens = &input_ids[start..];
-        let n_new = new_tokens.len();
         let hd = self.model.config.hidden_dim;
         let vs = self.model.config.vocab_size;
 
         let mut logits = vec![0.0f32; n * vs];
-        if n_new == 0 {
+        if n == 0 {
             return Ok(logits);
         }
 
-        let mut embed = vec![0.0f32; n_new * hd];
-        for (i, &id) in new_tokens.iter().enumerate() {
+        let mut embed = vec![0.0f32; n * hd];
+        for (i, &id) in input_ids.iter().enumerate() {
             embed_lookup(&self.model.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
         }
 
         let mut hidden = vec![0.0f32; hd];
-        for (ti, _) in new_tokens.iter().enumerate() {
+        for (ti, _) in input_ids.iter().enumerate() {
             hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
             let mut exec = self.exec_ctx();
             process_token_inner(
@@ -213,7 +211,7 @@ impl Engine {
             cache.pos += 1;
             final_norm(exec.wf, &mut hidden, hd);
             lm_head(exec.wf, &hidden,
-                &mut logits[(start + ti) * vs..(start + ti + 1) * vs],
+                &mut logits[ti * vs..(ti + 1) * vs],
                 exec.gpu_wf, exec.ctx);
         }
 

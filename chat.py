@@ -31,6 +31,7 @@ class Conversation:
 
         completion = ""
         completion_ids = []
+
         for token, logits in self.engine.stream_generate(input_ids, self.cache):
             completion_ids.append(token)
 
@@ -53,7 +54,7 @@ c = Conversation(hf_path, path)
 
 while True:
     message = input("> ")
-    _ = c.chat("hello")
+    _ = c.chat(message)
     
     print()
     print(c.engine.telemetry())

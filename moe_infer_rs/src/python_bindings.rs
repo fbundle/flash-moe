@@ -93,11 +93,14 @@ impl Engine {
     ) -> PyResult<PyObject> {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
-        let n = ids.len();
+        // Trim already-processed prefix — caller passes full template, we only process new tokens.
+        let start = if cache.inner.pos < ids.len() { cache.inner.pos } else { 0 };
+        let new_ids = &ids[start..];
+        let n = new_ids.len();
         let hd = self.inner.model.config.hidden_dim;
         let vs = self.inner.model.config.vocab_size;
 
-        let logits = self.inner.forward(ids, &mut cache.inner, &mut || py.check_signals().is_err())
+        let logits = self.inner.forward(new_ids, &mut cache.inner, &mut || py.check_signals().is_err())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
@@ -112,30 +115,27 @@ impl Engine {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
         let n = ids.len();
-        let start = if cache.inner.pos < n { cache.inner.pos } else { 0 };
-        let new_tokens = &ids[start..];
-        let n_new = new_tokens.len();
         let hd = self.inner.model.config.hidden_dim;
         let vs = self.inner.model.config.vocab_size;
         let num_layers = self.inner.model.config.num_layers;
 
         let mut logits = vec![0.0f32; n * vs];
-        if n_new == 0 {
+        if n == 0 {
             let arr = PyArray2::<f32>::from_owned_array(py,
                 numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
             return Ok((arr.into_py(py), PyList::empty(py).into_py(py)));
         }
 
-        let mut embed = vec![0.0f32; n_new * hd];
+        let mut embed = vec![0.0f32; n * hd];
         let wf_ref = &self.inner.model.wf;
-        for (i, &id) in new_tokens.iter().enumerate() {
+        for (i, &id) in ids.iter().enumerate() {
             engine::embed_lookup(wf_ref, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
         }
 
         let mut hidden = vec![0.0f32; hd];
         let mut all_layer_outputs: Vec<Vec<f32>> = Vec::new();
 
-        for (ti, _) in new_tokens.iter().enumerate() {
+        for (ti, _) in ids.iter().enumerate() {
             hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
             let mut layer_outputs = Vec::new();
             let mut exec = self.inner.exec_ctx();
@@ -150,7 +150,7 @@ impl Engine {
             all_layer_outputs.extend(layer_outputs);
             engine::final_norm(exec.wf, &mut hidden, hd);
             engine::lm_head(exec.wf, &hidden,
-                &mut logits[(start + ti) * vs..(start + ti + 1) * vs],
+                &mut logits[ti * vs..(ti + 1) * vs],
                 exec.gpu_wf, exec.ctx);
         }
 
@@ -159,7 +159,7 @@ impl Engine {
         self.inner.telemetry.tokens_generated = 0;
 
         let per_token_entries = 1 + num_layers;
-        let last_token_start = (n_new - 1) * per_token_entries;
+        let last_token_start = (n - 1) * per_token_entries;
         let py_list = PyList::empty(py);
         for li in 0..num_layers {
             let layer_hidden = &all_layer_outputs[last_token_start + 1 + li];
@@ -182,13 +182,16 @@ impl Engine {
     ) -> PyResult<PyObject> {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
+        // Trim already-processed prefix.
+        let start = if cache.inner.pos < ids.len() { cache.inner.pos } else { 0 };
+        let new_ids = &ids[start..];
         let eos: HashSet<usize> = match eos_token_ids {
             Some(a) => a.readonly().to_vec()?.into_iter().map(|x| x as usize).collect(),
             None => [248046usize, 248044].into(),
         };
 
         let (tokens, _logits_last) = self.inner.generate(
-            ids, &mut cache.inner,
+            new_ids, &mut cache.inner,
             max_tokens, temperature, top_k, top_p, min_p,
             &eos, &mut || py.check_signals().is_err(),
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
