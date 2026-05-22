@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use super::softmax;
+use crate::math::softmax;
 
 pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
     let n = logits.len();

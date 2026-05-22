@@ -8,11 +8,13 @@ use crate::constants::FULL_ATTN_INTERVAL;
 use crate::engine::Engine;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 use crate::model::Model;
-use crate::math::{embed_lookup, final_norm, ExecCtxGpu, FullAttnCmd2State, SignalCheckFn};
-use crate::math::full_attention::mixed_full_attention_forward;
-use crate::math::linear_attention::{self, LinearAttnFusedWoodsState};
-use crate::math::lm_head::gpu_lm_head;
-use crate::math::moe::{DeferredExperts, moe_layer_forward};
+use crate::engine::{ExecCtxGpu, SignalCheckFn};
+use crate::math::{embed_lookup, final_norm};
+use crate::math_full_attention::FullAttnCmd2State;
+use crate::math_full_attention::mixed_full_attention_forward;
+use crate::math_linear_attention::{self, LinearAttnFusedWoodsState};
+use crate::math_lm_head::gpu_lm_head;
+use crate::math_moe::{DeferredExperts, moe_layer_forward};
 
 // ─── General-purpose token processing ──────────────────────────────────────────
 
@@ -59,7 +61,7 @@ pub fn process_token_inner(
             if use_fusedwoods && !prev_gpu_combined {
                 h_mid_saved = Some(hidden.to_vec());
             }
-            lin_state = linear_attention::gpu_linear_attention(
+            lin_state = math_linear_attention::gpu_linear_attention(
                 exec.wf, layer, hidden, s,
                 hd,
                 exec.config.linear_num_k_heads, exec.config.linear_num_v_heads,

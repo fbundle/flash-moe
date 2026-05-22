@@ -7,12 +7,12 @@ use crate::constants::{GROUP_SIZE, RMS_NORM_EPS};
 use crate::error::MoEError;
 use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, ExpertBuffer, WeightBuffer, MetalContext, MAX_K};
-use crate::model_config::ModelConfig;
-use crate::model_weights::WeightFile;
+use crate::model::config::ModelConfig;
+use crate::model::weights::WeightFile;
 
-use super::{FullAttnCmd2State,
-    bf16_to_f32, dequant_matvec_4bit, softmax, topk, normalize_weights, rms_norm, sigmoid};
-use super::linear_attention::LinearAttnFusedWoodsState;
+use crate::math_full_attention::FullAttnCmd2State;
+use crate::math::{bf16_to_f32, dequant_matvec_4bit, softmax, topk, normalize_weights, rms_norm, sigmoid};
+use crate::math_linear_attention::LinearAttnFusedWoodsState;
 
 // ─── Deferred expert results (CMD3 async dispatch) ───────────────────────
 

@@ -6,19 +6,16 @@ use std::time::Instant;
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use crate::cache::Cache as CoreCache;
-use crate::engine::Engine as EngineTrait;
 use crate::model::Model as CoreModel;
-use crate::engine_cpu::EngineCPU;
-use crate::engine_fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
-use crate::engine_fusedwoods::EngineFusedWoods;
+use crate::engine::cpu::EngineCPU;
+use crate::engine::fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
+use crate::engine::fusedwoods::EngineFusedWoods;
 use crate::generate::{SampleParams, Telemetry};
-use crate::math::{
-    embed_lookup, final_norm,
-    ExecCtxGpu, SignalCheckFn,
-};
-use crate::math::lm_head::gpu_lm_head;
-use crate::engine_fusedwoods::process_token_inner;
-use crate::math::sample::sample;
+use crate::engine::{Engine as EngineTrait, ExecCtxGpu, SignalCheckFn};
+use crate::math::{embed_lookup, final_norm};
+use crate::math_lm_head::gpu_lm_head;
+use crate::engine::fusedwoods::process_token_inner;
+use crate::math_sample::sample;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Engine name (selects which engine impl to use) ───────────────────────────

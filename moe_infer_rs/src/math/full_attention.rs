@@ -1,10 +1,33 @@
+use metal::Buffer;
+
 use crate::constants::{GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS};
 use crate::cache::FullAttnCache;
 use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext};
-use crate::model_config::ModelConfig;
-use crate::model_weights::WeightFile;
+use crate::model::config::ModelConfig;
+use crate::model::weights::WeightFile;
 
-use super::{FullAttnCmd2State, bf16_to_f32, dequant_matvec_4bit, rms_norm};
+use crate::math::{bf16_to_f32, dequant_matvec_4bit, rms_norm};
+
+// ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ──
+
+pub struct FullAttnCmd2State {
+    pub q_buf: Buffer,
+    pub q_gate_buf: Buffer,
+    pub kc_buf: Buffer,
+    pub vc_buf: Buffer,
+    pub scores_buf: Buffer,
+    pub out_buf: Buffer,
+    pub hidden_buf: Buffer,
+    pub seq_len: u32,
+    pub seq_stride: u32,
+    pub num_attn_heads: u32,
+    pub head_dim: u32,
+    pub kv_dim: u32,
+    pub heads_per_kv: u32,
+    pub scale: f32,
+    pub q_dim: u32,
+    pub o_prefix: String,
+}
 
 // ─── RoPE ─────────────────────────────────────────────────────────────────
 

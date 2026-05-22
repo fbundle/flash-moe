@@ -6,7 +6,7 @@ use crate::cache::LinearAttnState;
 use crate::constants::{CONV_KERNEL_SIZE, GROUP_SIZE, RMS_NORM_EPS};
 use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext};
-use crate::model_weights::WeightFile;
+use crate::model::weights::WeightFile;
 
 use crate::math::{bf16_to_f32, conv1d_step, dequant_matvec_4bit, rms_norm, rms_norm_bare, rms_norm_gated, sigmoid};
 

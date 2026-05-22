@@ -1,7 +1,7 @@
 use crate::constants::GROUP_SIZE;
 use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext};
-use crate::model_weights::WeightFile;
-use super::dequant_matvec_4bit;
+use crate::model::weights::WeightFile;
+use crate::math::dequant_matvec_4bit;
 
 /// GPU lm_head matvec.
 pub fn gpu_lm_head(

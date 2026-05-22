@@ -1,12 +1,6 @@
 /// Shared types, constants, and CPU helpers used across engine modules.
-use std::os::fd::RawFd;
-
-use metal::Buffer;
-
 use crate::constants::RMS_NORM_EPS;
-use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
-use crate::model_config::ModelConfig;
-use crate::model_weights::WeightFile;
+use crate::model::weights::WeightFile;
 
 // ─── bf16 / f32 conversion ───────────────────────────────────────────────
 
@@ -66,21 +60,6 @@ pub fn rms_norm(x: &[f32], weight: &[f32], out: &mut [f32], dim: usize, eps: f32
         out[i] = x[i] * rms * weight[i];
     }
 }
-
-// ─── Execution context (borrowed view of Engine for pipeline fns) ────────
-
-/// GPU execution context — includes Metal device, GPU weight buffers, and expert I/O.
-pub struct ExecCtxGpu<'a> {
-    pub wf: &'a WeightFile,
-    pub ctx: &'a MetalContext,
-    pub gpu_wf: &'a WeightBuffer,
-    pub config: &'a ModelConfig,
-    pub expert_fds: &'a [RawFd],
-    pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
-}
-
-/// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
-pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
 
 // ─── CPU helper functions ────────────────────────────────────────────────
 
@@ -186,34 +165,6 @@ pub fn conv1d_step(
     }
     silu(&mut out[..channels]);
 }
-
-// ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ─
-
-pub struct FullAttnCmd2State {
-    pub q_buf: Buffer,
-    pub q_gate_buf: Buffer,
-    pub kc_buf: Buffer,
-    pub vc_buf: Buffer,
-    pub scores_buf: Buffer,
-    pub out_buf: Buffer,
-    pub hidden_buf: Buffer,
-    pub seq_len: u32,
-    pub seq_stride: u32,
-    pub num_attn_heads: u32,
-    pub head_dim: u32,
-    pub kv_dim: u32,
-    pub heads_per_kv: u32,
-    pub scale: f32,
-    pub q_dim: u32,
-    pub o_prefix: String,
-}
-
-
-pub mod full_attention;
-pub mod linear_attention;
-pub mod lm_head;
-pub mod moe;
-pub mod sample;
 
 // ─── Token embedding lookup ────────────────────────────────────────────────
 

@@ -1,8 +1,11 @@
+pub mod config;
+pub mod weights;
+
 use std::os::fd::{IntoRawFd, RawFd};
 use std::path::PathBuf;
 
-use crate::model_config::{load_model_config, ModelConfig};
-use crate::model_weights::WeightFile;
+use self::config::{load_model_config, ModelConfig};
+use self::weights::WeightFile;
 
 pub struct Model {
     pub config: ModelConfig,

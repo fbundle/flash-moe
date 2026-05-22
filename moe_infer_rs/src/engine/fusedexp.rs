@@ -21,16 +21,16 @@ use crate::cache::{Cache, FullAttnCache, LinearAttnState};
 use crate::engine::Engine;
 use crate::model::Model;
 use crate::metal_context::ExpertBuffer;
+use crate::engine::{ExecCtxGpu, SignalCheckFn};
 use crate::math::{
     bf16_to_f32, normalize_weights, softmax, topk,
     embed_lookup, final_norm,
-    ExecCtxGpu, FullAttnCmd2State,
-    SignalCheckFn,
 };
-use crate::math::full_attention::gpu_full_attention_forward;
-use crate::math::moe::{DeferredExperts, moe_layer_forward};
-use crate::math::lm_head::gpu_lm_head;
-use crate::model_weights::WeightFile;
+use crate::math_full_attention::FullAttnCmd2State;
+use crate::math_full_attention::gpu_full_attention_forward;
+use crate::math_moe::{DeferredExperts, moe_layer_forward};
+use crate::math_lm_head::gpu_lm_head;
+use crate::model::weights::WeightFile;
 
 /// Encode post_expert for a previously-routed layer into a command encoder.
 ///
@@ -65,7 +65,7 @@ pub fn encode_post_expert(
     moe_inter: usize,
     shared_inter: usize,
     num_experts_per_tok: usize,
-    layout: &crate::model_config::ExpertLayout,
+    layout: &crate::model::config::ExpertLayout,
 ) {
     let hidden_u32 = hidden_dim as u32;
     let inter_u32 = moe_inter as u32;

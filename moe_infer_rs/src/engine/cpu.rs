@@ -2,15 +2,15 @@ use crate::cache::Cache;
 use crate::constants::{FULL_ATTN_INTERVAL, RMS_NORM_EPS};
 use crate::engine::Engine;
 use crate::model::Model;
-use crate::math::linear_attention;
+use crate::math_linear_attention;
+use crate::engine::SignalCheckFn;
 use crate::math::{
     bf16_to_f32, embed_lookup, final_norm,
     rms_norm,
-    SignalCheckFn,
 };
-use crate::math::full_attention::full_attention_forward;
-use crate::math::moe::moe_layer_forward;
-use crate::math::lm_head::lm_head;
+use crate::math_full_attention::full_attention_forward;
+use crate::math_moe::moe_layer_forward;
+use crate::math_lm_head::lm_head;
 
 /// CPU-only engine: no GPU resources required.
 pub struct EngineCPU<'a> {
@@ -82,7 +82,7 @@ impl<'a> Engine for EngineCPU<'a> {
                     }
                 } else {
                     if let Some(ref mut state) = cache.lin[layer] {
-                        linear_attention::linear_attention(
+                        math_linear_attention::linear_attention(
                             &self.model.wf, layer, &mut hidden, &normed, &residual, state,
                             num_k_heads, num_v_heads, total_key, total_value, qkv_dim,
                             hd, key_dim, value_dim, inv_scale, k_heads_per_v,

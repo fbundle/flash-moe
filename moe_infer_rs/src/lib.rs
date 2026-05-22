@@ -1,16 +1,18 @@
-#[path = "model/model.rs"] mod model;
-#[path = "model/model_config.rs"] mod model_config;
-#[path = "model/model_weights.rs"] mod model_weights;
+#[path = "math/util.rs"] mod math;
+#[path = "math/full_attention.rs"] mod math_full_attention;
+#[path = "math/linear_attention.rs"] mod math_linear_attention;
+#[path = "math/lm_head.rs"] mod math_lm_head;
+#[path = "math/moe.rs"] mod math_moe;
+#[path = "math/sample.rs"] mod math_sample;
+
+pub mod engine;
+pub mod model;
+
 mod cache;
 mod constants;
-#[path = "engine/engine.rs"] pub mod engine;
-#[path = "engine/engine_cpu.rs"] mod engine_cpu;
-#[path = "engine/engine_fusedexp.rs"] mod engine_fusedexp;
-#[path = "engine/engine_fusedwoods.rs"] mod engine_fusedwoods;
 mod error;
 mod metal_kernels;
 mod metal_context;
-#[path = "math/math.rs"] mod math;
 mod generate;
 mod timer;
 

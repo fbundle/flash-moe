@@ -6,7 +6,7 @@ use objc::rc::autoreleasepool;
 use std::collections::HashMap;
 use crate::error::MoEError;
 use crate::metal_kernels;
-use crate::model_weights::WeightFile;
+use crate::model::weights::WeightFile;
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
 

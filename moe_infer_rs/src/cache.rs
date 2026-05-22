@@ -1,7 +1,7 @@
 use metal::Buffer;
 
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, MAX_SEQ};
-use crate::model_config::ModelConfig;
+use crate::model::config::ModelConfig;
 
 // ─── Cache (data only) ──────────────────────────────────────────────────────
 
