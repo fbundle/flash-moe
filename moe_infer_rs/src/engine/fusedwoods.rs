@@ -3,6 +3,7 @@
 /// CMD1: attention projections + conv1d + SSM + gated_rms_norm (no out_proj/residual)
 /// CMD2: out_proj + residual_add + rms_norm + gate + shared (1 fused encoder)
 /// CMD3: experts + combine + GPU-side input_norm (async, deferred commit)
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use metal::{Buffer, CommandBuffer, MTLSize};
@@ -23,6 +24,20 @@ use crate::math::{
     embed_lookup, final_norm, normalize_weights, rms_norm, rms_norm_bare,
     rms_norm_gated, sigmoid, softmax, topk,
 };
+
+// ─── Norm weight cache ────────────────────────────────────────────────────
+
+fn get_norm_f32<'a>(
+    cache: &'a mut HashMap<String, Vec<f32>>,
+    wf: &WeightFile,
+    name: &str,
+) -> &'a [f32] {
+    cache.entry(name.to_string()).or_insert_with(|| {
+        wf.get_tensor_u16(name)
+            .map(|nw| nw.iter().map(|&v| bf16_to_f32(v)).collect())
+            .unwrap_or_default()
+    })
+}
 
 // ─── FullAttnGpuOut (local copy) ──────────────────────────────────────────
 
@@ -56,6 +71,7 @@ fn mixed_full_attention_forward(
     config: &ModelConfig,
     gpu_wf: Option<&WeightBuffer>,
     ctx: Option<&MetalContext>,
+    norm_cache: &mut HashMap<String, Vec<f32>>,
 ) -> Option<FullAttnGpuOut> {
     let hidden_dim = config.hidden_dim;
     let num_attn_heads = config.num_attn_heads;
@@ -70,11 +86,10 @@ fn mixed_full_attention_forward(
 
     // Input RMS norm
     let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
-    let nw = wf.get_tensor_u16(&norm_name);
     let mut normed = vec![0.0f32; hidden_dim];
-    if let Some(nw) = nw {
-        let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
-        rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
+    let nw_f32 = get_norm_f32(norm_cache, wf, &norm_name);
+    if !nw_f32.is_empty() {
+        rms_norm(hidden, nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
     } else {
         normed.copy_from_slice(hidden);
     }
@@ -282,18 +297,18 @@ fn gpu_linear_attention(
     use_fused_cmd1: bool,
     use_fusedwoods_cmd1: bool,
     prev_gpu_combined: bool,
+    norm_cache: &mut HashMap<String, Vec<f32>>,
 ) -> Option<LinearAttnGpuOut> {
     let use_gpu = gpu_wf.is_some() && ctx.is_some();
 
     let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
-    let nw = wf.get_tensor_u16(&norm_name);
     let mut normed = vec![0.0f32; hidden_dim];
     let mut residual = vec![0.0f32; hidden_dim];
     residual.copy_from_slice(hidden);
 
-    if let Some(nw) = nw {
-        let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
-        rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
+    let nw_f32 = get_norm_f32(norm_cache, wf, &norm_name);
+    if !nw_f32.is_empty() {
+        rms_norm(hidden, nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
     } else {
         normed.copy_from_slice(hidden);
     }
@@ -813,6 +828,7 @@ fn moe_layer_forward(
     lin_attn: Option<LinearAttnGpuOut>,
     mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
     gpu_combined: bool,
+    norm_cache: &mut HashMap<String, Vec<f32>>,
 ) -> Option<DeferredExperts> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -1080,10 +1096,9 @@ fn moe_layer_forward(
         hmid_gpu_override = Some(temp_buf);
     } else {
         // ── Non-fused path: post-norm on CPU, router CMD separately ──
-        let pnw = wf.get_tensor_u16(&post_norm_name);
-        if let Some(pnw) = pnw {
-            let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
-            rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
+        let pnw_f32 = get_norm_f32(norm_cache, wf, &post_norm_name);
+        if !pnw_f32.is_empty() {
+            rms_norm(hidden, pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
         } else {
             h_post.copy_from_slice(hidden);
         }
@@ -1505,6 +1520,7 @@ struct ExecCtxGpu<'a> {
     config: &'a ModelConfig,
     expert_files: &'a [ExpertFile],
     expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    norm_cache: &'a mut HashMap<String, Vec<f32>>,
 }
 
 // ─── General-purpose token processing ────────────────────────────────────
@@ -1545,7 +1561,7 @@ fn process_token_inner(
             if let Some(ref mut kv) = kv[layer] {
                 attn_state = mixed_full_attention_forward(
                     exec.wf, layer, hidden, kv, pos, exec.config,
-                    Some(exec.gpu_wf), Some(exec.ctx));
+                    Some(exec.gpu_wf), Some(exec.ctx), exec.norm_cache);
             }
         } else if let Some(ref mut s) = lin[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
@@ -1559,7 +1575,7 @@ fn process_token_inner(
                 exec.config.linear_total_key, exec.config.linear_total_value,
                 exec.config.linear_conv_dim,
                 Some(exec.gpu_wf), Some(exec.ctx), li,
-                false, use_fusedwoods, prev_gpu_combined,
+                false, use_fusedwoods, prev_gpu_combined, exec.norm_cache,
             );
             if prev_gpu_combined {
                 if let Some(ref mut def) = deferred.take() {
@@ -1579,7 +1595,7 @@ fn process_token_inner(
             Some(exec.ctx), Some(exec.gpu_wf), exec.config,
             attn_state, lin_state,
             exec.expert_gpu_buffer.as_mut().map(|x| &mut **x),
-            use_fusedwoods,
+            use_fusedwoods, exec.norm_cache,
         );
         deferred = r;
         if capture_per_layer {
@@ -1599,6 +1615,7 @@ pub struct EngineFusedWoods<'a> {
     pub ctx: &'a MetalContext,
     pub gpu_wf: &'a WeightBuffer,
     pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    pub norm_cache: HashMap<String, Vec<f32>>,
 }
 
 impl<'a> EngineFusedWoods<'a> {
@@ -1610,6 +1627,7 @@ impl<'a> EngineFusedWoods<'a> {
             config: &self.model.config,
             expert_files: &self.model.expert_files,
             expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
+            norm_cache: &mut self.norm_cache,
         }
     }
 }

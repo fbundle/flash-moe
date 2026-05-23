@@ -24,6 +24,44 @@ def _get_response_extractor(model_name: str):
     return _RESPONSE_EXTRACTORS["raw"]
 
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    x = x - x.max()
+    e = np.exp(x)
+    return e / e.sum()
+
+
+def _sample(logits: np.ndarray, temperature: float,
+            top_k: int, top_p: float, min_p: float) -> int:
+    """Sample a token from logits. Modifies logits in-place."""
+    n = len(logits)
+    if abs(temperature - 1.0) > 1e-7:
+        logits /= max(temperature, 1e-8)
+    if temperature < 0.01:
+        return int(np.argmax(logits))
+    probs = _softmax(logits)
+
+    if top_k > 0 and top_k < n:
+        indices = np.argpartition(probs, -top_k)[-top_k:]
+        mask = np.ones(n, dtype=bool)
+        mask[indices] = False
+        probs[mask] = 0.0
+    if top_p < 1.0:
+        sorted_idx = np.argsort(probs)[::-1]
+        cumsum = np.cumsum(probs[sorted_idx])
+        cutoff_idx = np.searchsorted(cumsum, top_p)
+        if cutoff_idx < n:
+            probs[sorted_idx[cutoff_idx + 1:]] = 0.0
+    if min_p > 0.0:
+        threshold = probs.max() * min_p
+        probs[probs < threshold] = 0.0
+
+    total = probs.sum()
+    if total <= 0:
+        return 0
+    probs /= total
+    return int(np.random.choice(n, p=probs))
+
+
 class Conversation:
     def __init__(self, tokenizer_path: str, model_path: str,
                  response_extractor, **kwargs):
@@ -34,7 +72,12 @@ class Conversation:
         self.extract_response = response_extractor
         self.messages: list[dict] = []
 
-    def chat(self, message: str) -> str:
+    def chat(self, message: str,
+             max_tokens: int = 256, temperature: float = 0.0,
+             top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0,
+             eos_token_ids: list[int] | None = None) -> str:
+        if eos_token_ids is None:
+            eos_token_ids = [248046, 248044]
         self.messages.append({"role": "user", "content": message})
 
         input_ids = np.array(
@@ -45,17 +88,23 @@ class Conversation:
             dtype=np.int64,
         )[self.cache.pos:]
 
-        completion = ""
+        logits = self.engine.forward(input_ids, self.cache)
+        last_logits = np.asarray(logits[-1])
+
         completion_ids: list[int] = []
 
-        for token, logits in self.engine.stream_generate(input_ids, self.cache):
+        for _ in range(max_tokens):
+            token = _sample(last_logits, temperature, top_k, top_p, min_p)
+            if token in eos_token_ids:
+                break
             completion_ids.append(token)
-            new_completion = self.tokenizer.decode(completion_ids)
-            addon = new_completion[len(completion):]
-            print(addon, end="", flush=True)
-            completion = new_completion
+            print(self.tokenizer.decode([token]), end="", flush=True)
+            logits = self.engine.forward(
+                np.array([token], dtype=np.int64), self.cache)
+            last_logits = np.asarray(logits[0])
 
-        response = self.extract_response(completion)
+        print()
+        response = self.extract_response(self.tokenizer.decode(completion_ids))
         self.messages.append({"role": "assistant", "content": response})
         return response
 

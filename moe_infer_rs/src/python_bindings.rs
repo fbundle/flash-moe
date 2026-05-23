@@ -1,12 +1,10 @@
 /// Thin PyO3 bindings for the MoE-Infer inference engine.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use rand::Rng;
 
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
@@ -15,7 +13,6 @@ use crate::engine::fusedexp::EngineFusedExp;
 use crate::engine::fusedwoods::EngineFusedWoods;
 use crate::error::MoEError;
 use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
-use crate::math::softmax;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
@@ -81,76 +78,6 @@ pub struct Telemetry {
     pub engine: BTreeMap<String, TelemetryValue>,
 }
 
-// ─── Sampling ──────────────────────────────────────────────────────────────
-
-pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
-    let n = logits.len();
-    if (temperature - 1.0).abs() > 1e-7 {
-        let inv = 1.0 / temperature.max(1e-8);
-        for v in logits.iter_mut() { *v *= inv; }
-    }
-    if temperature < 0.01 {
-        return logits.iter().enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i).unwrap_or(0);
-    }
-    softmax(logits);
-
-    // One sorted copy shared by top-k and top-p to avoid redundant allocations.
-    let needs_cutoff = (top_k > 0 && top_k < n) || top_p < 1.0;
-    let sorted = if needs_cutoff {
-        let mut s: Vec<f32> = logits.to_vec();
-        s.sort_unstable_by(|a, b| b.total_cmp(a));
-        s
-    } else {
-        Vec::new()
-    };
-
-    if top_k > 0 && top_k < n {
-        let t = sorted[top_k - 1];
-        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
-    }
-    if top_p < 1.0 {
-        let total: f32 = sorted.iter().sum();
-        let mut cum = 0.0;
-        let mut cut = 0.0;
-        for &v in &sorted {
-            cum += v;
-            if total > 0.0 && cum / total >= top_p { cut = v; break; }
-        }
-        for x in logits.iter_mut() { if *x < cut { *x = 0.0; } }
-    }
-    if min_p > 0.0 {
-        let max_p = logits.iter().fold(0.0f32, |a, &b| a.max(b));
-        let t = max_p * min_p;
-        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
-    }
-
-    let sum: f32 = logits.iter().sum();
-    if sum <= 0.0 { return 0; }
-    let inv = 1.0 / sum;
-    let r: f32 = rand::thread_rng().gen();
-    let mut cum = 0.0;
-    for (i, &v) in logits.iter().enumerate() {
-        cum += v * inv;
-        if r <= cum { return i; }
-    }
-    n - 1
-}
-
-fn pick_token(logits: &[f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
-    if temperature < 0.01 {
-        logits.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    } else {
-        let mut copy = logits.to_vec();
-        sample(&mut copy, temperature, top_k, top_p, min_p)
-    }
-}
-
 // ─── Engine (owns GPU resources, implements Engine trait) ──────────────────
 
 #[pyclass(unsendable)]
@@ -197,6 +124,7 @@ impl EngineTrait for Engine {
                     ctx: &self.ctx,
                     gpu_wf: &self.gpu_wf,
                     expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
+                    norm_cache: std::collections::HashMap::new(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
                 self.telemetry.engine = engine.telemetry();
@@ -286,47 +214,6 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
-    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
-                        top_k=0, top_p=1.0, min_p=0.0, eos_token_ids=None))]
-    fn stream_generate(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
-        cache: &mut Cache,
-        max_tokens: usize, temperature: f32, top_k: usize, top_p: f32, min_p: f32,
-        eos_token_ids: Option<&Bound<PyArray1<i64>>>,
-    ) -> PyResult<PyObject> {
-        let gen_t0 = Instant::now();
-        let eos: HashSet<usize> = match eos_token_ids {
-            Some(a) => a.readonly().to_vec()?.into_iter().map(|x| x as usize).collect(),
-            None => [248046usize, 248044].into(),
-        };
-
-        let logits_obj = self.forward(py, input_ids, cache)?;
-        let la = logits_obj.downcast_bound::<PyArray2<f32>>(py).map_err(|_|
-            pyo3::exceptions::PyRuntimeError::new_err("expected ndarray"))?;
-        let ls = unsafe { la.as_slice() }.map_err(|e|
-            pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))?;
-
-        let vs = self.model.config.vocab_size;
-        let logits_last = &ls[ls.len() - vs..];
-
-        self.telemetry = Telemetry { prefill_ms: gen_t0.elapsed().as_secs_f64() * 1000.0,
-            total_ms: 0.0, tokens_generated: 0, engine: BTreeMap::new() };
-
-        let first_token = pick_token(logits_last, temperature, top_k, top_p, min_p);
-
-        Ok(StreamGenIterator {
-            engine_ptr: self as *mut Engine as *mut dyn EngineTrait,
-            cache_ptr: cache as *mut Cache as *mut CoreCache,
-            telemetry_ptr: &mut self.telemetry as *mut Telemetry,
-            gen_t0,
-            next_token: first_token,
-            logits: logits_last.to_vec(),
-            remaining: max_tokens.saturating_sub(1),
-            done: false,
-            eos,
-            temperature, top_k, top_p, min_p,
-        }.into_pyobject(py)?.into_any().into())
-    }
-
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
         let t = &self.telemetry;
         let dict = pyo3::types::PyDict::new(py);
@@ -355,65 +242,5 @@ impl Engine {
     fn __repr__(&self) -> String {
         format!("Engine(loaded: {} layers, hidden={})",
             self.model.config.num_layers, self.model.config.hidden_dim)
-    }
-}
-
-// ─── Streaming iterator ─────────────────────────────────────────────────────
-
-#[pyclass(unsendable)]
-pub struct StreamGenIterator {
-    engine_ptr: *mut dyn EngineTrait,
-    cache_ptr: *mut CoreCache,
-    telemetry_ptr: *mut Telemetry,
-    gen_t0: Instant,
-    next_token: usize,
-    logits: Vec<f32>,
-    remaining: usize,
-    done: bool,
-    eos: HashSet<usize>,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    min_p: f32,
-}
-
-#[pymethods]
-impl StreamGenIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
-
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<(i64, PyObject)>> {
-        if self.done {
-            return Ok(None);
-        }
-        let token = self.next_token as i64;
-        let logits = std::mem::take(&mut self.logits);
-        unsafe { &mut *self.telemetry_ptr }.tokens_generated += 1;
-
-        if self.remaining == 0 || self.eos.contains(&self.next_token) {
-            self.done = true;
-            let t = unsafe { &mut *self.telemetry_ptr };
-            t.total_ms = self.gen_t0.elapsed().as_secs_f64() * 1000.0;
-            let obj = PyArray1::<f32>::from_vec(py, logits)
-                .into_pyobject(py)?.into_any().into();
-            return Ok(Some((token, obj)));
-        }
-
-        self.remaining -= 1;
-        let engine = unsafe { &mut *self.engine_ptr };
-        let cache = unsafe { &mut *self.cache_ptr };
-        self.logits = engine
-            .forward(&[token], cache, &mut || py.check_signals().is_err())
-            .unwrap_or_else(|_| {
-                self.done = true;
-                vec![]
-            });
-        if !self.done {
-            self.next_token = pick_token(&self.logits, self.temperature,
-                self.top_k, self.top_p, self.min_p);
-        }
-
-        let obj = PyArray1::<f32>::from_vec(py, logits)
-            .into_pyobject(py)?.into_any().into();
-        Ok(Some((token, obj)))
     }
 }
