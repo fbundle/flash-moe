@@ -48,8 +48,12 @@ impl ExpertFile {
                 let comp_sz = comp_end - comp_off;
                 let file_off = (hdr_bytes + comp_off) as i64;
                 let mut comp = vec![0u8; comp_sz];
-                unsafe {
-                    libc::pread(*fd, comp.as_mut_ptr() as *mut c_void, comp_sz, file_off);
+                let n = unsafe {
+                    libc::pread(*fd, comp.as_mut_ptr() as *mut c_void, comp_sz, file_off)
+                };
+                if n != comp_sz as isize {
+                    return Err(MoEError::Io(io::Error::new(io::ErrorKind::UnexpectedEof,
+                        format!("pread lz4 expert {}: got {} expected {}", expert_idx, n, comp_sz))));
                 }
                 let decomp = lz4_flex::decompress(&comp, *expert_size)
                     .map_err(|e| MoEError::Io(io::Error::new(io::ErrorKind::InvalidData,

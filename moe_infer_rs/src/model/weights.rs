@@ -85,22 +85,20 @@ impl WeightFile {
 
         let mut tensor_map: HashMap<String, TensorInfo> = HashMap::new();
         for (name, info) in tensors_obj {
+            let offset = info["offset"].as_u64()
+                .ok_or_else(|| MoEError::Config(format!("missing offset for tensor '{}'", name)))?;
+            let size = info["size"].as_u64()
+                .ok_or_else(|| MoEError::Config(format!("missing size for tensor '{}'", name)))?;
+            let shape: Vec<usize> = info["shape"]
+                .as_array()
+                .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect())
+                .unwrap_or_default();
             let t = TensorInfo {
                 name: name.clone(),
-                offset: info["offset"].as_u64().unwrap_or(0),
-                size: info["size"].as_u64().unwrap_or(0),
-                ndim: info["shape"]
-                    .as_array()
-                    .map(|a| a.len())
-                    .unwrap_or(0),
-                shape: info["shape"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .map(|v| v.as_u64().unwrap_or(0) as usize)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                offset,
+                size,
+                ndim: shape.len(),
+                shape,
                 dtype: info["dtype"].as_str().unwrap_or("").to_string(),
             };
             tensor_map.insert(name.clone(), t);

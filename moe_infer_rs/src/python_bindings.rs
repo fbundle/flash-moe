@@ -91,7 +91,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, mi
     }
     if temperature < 0.01 {
         return logits.iter().enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i).unwrap_or(0);
     }
     softmax(logits);
@@ -100,7 +100,7 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, mi
     let needs_cutoff = (top_k > 0 && top_k < n) || top_p < 1.0;
     let sorted = if needs_cutoff {
         let mut s: Vec<f32> = logits.to_vec();
-        s.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        s.sort_unstable_by(|a, b| b.total_cmp(a));
         s
     } else {
         Vec::new()
@@ -142,7 +142,7 @@ fn pick_token(logits: &[f32], temperature: f32, top_k: usize, top_p: f32, min_p:
     if temperature < 0.01 {
         logits.iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .unwrap_or(0)
     } else {
@@ -280,8 +280,10 @@ impl Engine {
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
-            numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
-        Ok(arr.into_pyobject(py).unwrap().into_any().into())
+            numpy::ndarray::Array2::from_shape_vec((n, vs), logits)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("shape error: {}", e)))?);
+        Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
@@ -322,7 +324,7 @@ impl Engine {
             done: false,
             eos,
             temperature, top_k, top_p, min_p,
-        }.into_pyobject(py).unwrap().into_any().into())
+        }.into_pyobject(py)?.into_any().into())
     }
 
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -347,7 +349,7 @@ impl Engine {
                 }
             }
         }
-        Ok(dict.into_pyobject(py).unwrap().into_any().into())
+        Ok(dict.into_pyobject(py)?.into_any().into())
     }
 
     fn __repr__(&self) -> String {
@@ -392,7 +394,7 @@ impl StreamGenIterator {
             let t = unsafe { &mut *self.telemetry_ptr };
             t.total_ms = self.gen_t0.elapsed().as_secs_f64() * 1000.0;
             let obj = PyArray1::<f32>::from_vec(py, logits)
-                .into_pyobject(py).unwrap().into_any().into();
+                .into_pyobject(py)?.into_any().into();
             return Ok(Some((token, obj)));
         }
 
@@ -411,7 +413,7 @@ impl StreamGenIterator {
         }
 
         let obj = PyArray1::<f32>::from_vec(py, logits)
-            .into_pyobject(py).unwrap().into_any().into();
+            .into_pyobject(py)?.into_any().into();
         Ok(Some((token, obj)))
     }
 }
