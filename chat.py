@@ -2,6 +2,8 @@
 """Interactive chat demo for MoE-Infer."""
 
 import argparse
+import time
+
 import numpy as np
 from transformers import AutoTokenizer
 from moe_infer import Model, Engine, Cache, record_engine_telemetry  # type: ignore
@@ -71,6 +73,12 @@ class Conversation:
         self.cache = Cache(self.model)
         self.extract_response = response_extractor
         self.messages: list[dict] = []
+        self._last_chat_tlm: dict = {}
+
+    @property
+    def telemetry(self) -> dict:
+        """Return combined chat-level + engine-level telemetry for the last chat."""
+        return {**self._last_chat_tlm, "engine": self.engine.telemetry()}
 
     def chat(self, message: str,
              max_tokens: int = 256, temperature: float = 0.0,
@@ -88,9 +96,11 @@ class Conversation:
             dtype=np.int64,
         )[self.cache.pos:]
 
+        t0 = time.time()
         logits = self.engine.forward(input_ids, self.cache)
-        last_logits = np.asarray(logits[-1])
+        prefill_ms = (time.time() - t0) * 1000.0
 
+        last_logits = np.asarray(logits[-1])
         completion_ids: list[int] = []
 
         for _ in range(max_tokens):
@@ -104,8 +114,20 @@ class Conversation:
             last_logits = np.asarray(logits[0])
 
         print()
+        total_ms = (time.time() - t0) * 1000.0
+        n_tokens = len(completion_ids) + 1
+        gen_ms = total_ms - prefill_ms
+        tps = (n_tokens - 1) / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
+
         response = self.extract_response(self.tokenizer.decode(completion_ids))
         self.messages.append({"role": "assistant", "content": response})
+
+        self._last_chat_tlm = {
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "tokens_generated": n_tokens,
+            "tokens_per_sec": tps,
+        }
         return response
 
 
@@ -133,7 +155,7 @@ def main():
     )
     parser.add_argument(
         "--telemetry", action="store_true",
-        help="Enable per-layer timing telemetry",
+        help="Enable per-layer engine timing telemetry",
     )
     args = parser.parse_args()
 
@@ -151,8 +173,7 @@ def main():
             break
         conv.chat(message)
         print()
-        if args.telemetry:
-            print(conv.engine.telemetry())
+        print(conv.telemetry)
 
 
 if __name__ == "__main__":

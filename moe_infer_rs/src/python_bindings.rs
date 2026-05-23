@@ -69,15 +69,6 @@ impl Cache {
     fn __repr__(&self) -> String { format!("Cache(pos={})", self.inner.pos) }
 }
 
-// ─── Telemetry ──────────────────────────────────────────────────────────────
-
-pub struct Telemetry {
-    pub prefill_ms: f64,
-    pub total_ms: f64,
-    pub tokens_generated: usize,
-    pub engine: BTreeMap<String, TelemetryValue>,
-}
-
 // ─── Engine (owns GPU resources, implements Engine trait) ──────────────────
 
 #[pyclass(unsendable)]
@@ -88,7 +79,8 @@ pub struct Engine {
     expert_gpu_buffer: Option<ExpertBuffer>,
     mode: String,
     k: usize,
-    pub telemetry: Telemetry,
+    /// Engine-level telemetry: only populated when record_engine_telemetry(true).
+    pub telemetry: BTreeMap<String, TelemetryValue>,
 }
 
 impl EngineTrait for Engine {
@@ -102,7 +94,7 @@ impl EngineTrait for Engine {
             "Cpu" | "CpuOnly" => {
                 let mut engine = EngineCPU { model: &self.model };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.telemetry.engine = engine.telemetry();
+                self.telemetry = engine.telemetry();
                 logits
             }
             "FusedExp" => {
@@ -115,7 +107,7 @@ impl EngineTrait for Engine {
                     timing: BTreeMap::new(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.telemetry.engine = engine.telemetry();
+                self.telemetry = engine.telemetry();
                 logits
             }
             "FusedWoods" => {
@@ -127,7 +119,7 @@ impl EngineTrait for Engine {
                     norm_cache: std::collections::HashMap::new(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.telemetry.engine = engine.telemetry();
+                self.telemetry = engine.telemetry();
                 logits
             }
             _ => return Err(MoEError::Config(format!("Unknown pipeline mode: {}", self.mode))),
@@ -188,7 +180,7 @@ impl Engine {
             expert_gpu_buffer,
             mode: pipeline_mode.to_string(),
             k,
-            telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0, engine: BTreeMap::new() },
+            telemetry: BTreeMap::new(),
         })
     }
 
@@ -214,20 +206,10 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
+    /// Engine-level telemetry (only populated when record_engine_telemetry(true)).
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let t = &self.telemetry;
         let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("prefill_ms", t.prefill_ms)?;
-        dict.set_item("total_ms", t.total_ms)?;
-        dict.set_item("tokens_generated", t.tokens_generated)?;
-        let tps = if t.total_ms > 0.0 && t.tokens_generated > 1 {
-            let gen_ms = t.total_ms - t.prefill_ms;
-            if gen_ms > 0.0 {
-                (t.tokens_generated - 1) as f64 / (gen_ms / 1000.0)
-            } else { 0.0 }
-        } else { 0.0 };
-        dict.set_item("tokens_per_sec", tps)?;
-        for (k, v) in &self.telemetry.engine {
+        for (k, v) in &self.telemetry {
             match v {
                 TelemetryValue::Scalar(val) => { dict.set_item(k, *val)?; }
                 TelemetryValue::List(vals) => {
