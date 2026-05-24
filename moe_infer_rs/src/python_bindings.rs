@@ -10,8 +10,11 @@ use pyo3::types::PyList;
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
-use crate::engine::fusedexp::EngineFusedExp;
-use crate::engine::fusedwoods::{EngineFusedWoods, FusedWoodsScratch};
+use crate::engine::qwen35_35b::fusedexp::FusedExp;
+use crate::engine::qwen35_35b::fusedwoods::{FusedWoods, FusedWoodsScratch};
+use crate::engine::qwen35_35b_stripped::fusedexp::FusedExp as FusedExpStripped;
+use crate::engine::qwen35_35b_stripped::fusedwoods::FusedWoods as FusedWoodsStripped;
+use crate::constants::{qwen35_35b, qwen35_35b_stripped};
 use crate::error::MoEError;
 use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
@@ -77,6 +80,8 @@ enum PipelineMode {
     Cpu,
     FusedExp,
     FusedWoods,
+    FusedExpStripped,
+    FusedWoodsStripped,
 }
 
 // ─── Erased engine storage ──────────────────────────────────────────────────
@@ -88,8 +93,10 @@ enum PipelineMode {
 /// - Engine::drop manually drops the correct variant before the owned fields.
 union EngineInner {
     cpu: ManuallyDrop<EngineCPU<'static>>,
-    fused_exp: ManuallyDrop<EngineFusedExp<'static>>,
-    fused_woods: ManuallyDrop<EngineFusedWoods<'static>>,
+    fused_exp: ManuallyDrop<FusedExp<'static>>,
+    fused_woods: ManuallyDrop<FusedWoods<'static>>,
+    fused_exp_stripped: ManuallyDrop<FusedExpStripped<'static>>,
+    fused_woods_stripped: ManuallyDrop<FusedWoodsStripped<'static>>,
 }
 
 // ─── Engine (owns GPU resources, holds the inner engine) ────────────────────
@@ -118,43 +125,54 @@ impl Engine {
             "Cpu" | "CpuOnly" => PipelineMode::Cpu,
             "FusedExp" => PipelineMode::FusedExp,
             "FusedWoods" => PipelineMode::FusedWoods,
+            "FusedExpStripped" => PipelineMode::FusedExpStripped,
+            "FusedWoodsStripped" => PipelineMode::FusedWoodsStripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods", pipeline_mode
+                "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods|FusedExpStripped|FusedWoodsStripped", pipeline_mode
             ))),
         };
-        let config = &model.inner.config;
-        let k = if k == 0 { config.num_experts_per_tok } else { k };
-        if k > config.num_experts_per_tok {
+
+        let is_stripped = matches!(mode, PipelineMode::FusedExpStripped | PipelineMode::FusedWoodsStripped);
+        let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
+             linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
+             hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit) =
+            if is_stripped {
+                (qwen35_35b_stripped::NUM_LAYERS, qwen35_35b_stripped::NUM_EXPERTS, qwen35_35b_stripped::NUM_EXPERTS_PER_TOK,
+                 qwen35_35b_stripped::NUM_LINEAR_LAYERS, qwen35_35b_stripped::LINEAR_CONV_DIM,
+                 qwen35_35b_stripped::LINEAR_NUM_V_HEADS, qwen35_35b_stripped::LINEAR_TOTAL_VALUE,
+                 qwen35_35b_stripped::LINEAR_KEY_DIM, qwen35_35b_stripped::LINEAR_VALUE_DIM,
+                 qwen35_35b_stripped::HIDDEN_DIM, qwen35_35b_stripped::SHARED_INTERMEDIATE,
+                 qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT)
+            } else {
+                (qwen35_35b::NUM_LAYERS, qwen35_35b::NUM_EXPERTS, qwen35_35b::NUM_EXPERTS_PER_TOK,
+                 qwen35_35b::NUM_LINEAR_LAYERS, qwen35_35b::LINEAR_CONV_DIM,
+                 qwen35_35b::LINEAR_NUM_V_HEADS, qwen35_35b::LINEAR_TOTAL_VALUE,
+                 qwen35_35b::LINEAR_KEY_DIM, qwen35_35b::LINEAR_VALUE_DIM,
+                 qwen35_35b::HIDDEN_DIM, qwen35_35b::SHARED_INTERMEDIATE,
+                 qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT)
+            };
+
+        let k = if k == 0 { num_experts_per_tok } else { k };
+        if k > num_experts_per_tok {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "k ({}) must not exceed model's num_experts_per_tok ({})", k, config.num_experts_per_tok
+                "k ({}) must not exceed model's num_experts_per_tok ({})", k, num_experts_per_tok
             )));
         }
         let mut ctx = MetalContext::init()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("metal: {}", e)))?;
-        let key_dim = config.linear_total_key / config.linear_num_k_heads;
-        let value_dim = config.linear_total_value / config.linear_num_v_heads;
         ctx.init_linear_attn_buffers(
-            config.num_linear_layers,
-            config.linear_conv_dim,
-            config.linear_num_v_heads,
-            config.linear_total_value,
-            key_dim,
-            value_dim,
-            config.hidden_dim,
-            config.num_experts,
-            config.shared_intermediate,
+            num_linear_layers, linear_conv_dim, linear_num_v_heads,
+            linear_total_value, linear_key_dim, linear_value_dim,
+            hidden_dim, num_experts, shared_intermediate,
         );
         let expert_gpu_buffer = Some(ctx.init_expert_buffers(
-            config.expert_size_4bit,
-            config.hidden_dim,
-            config.moe_intermediate,
-            config.shared_intermediate,
+            expert_size_4bit, hidden_dim, moe_intermediate, shared_intermediate,
         ));
         let gpu_wf = WeightBuffer::new(&ctx.device, &model.inner.wf);
 
         eprintln!(
             "[engine] {} layers hidden={} experts={} mode={}",
-            config.num_layers, config.hidden_dim, config.num_experts, pipeline_mode
+            num_layers, hidden_dim, num_experts, pipeline_mode
         );
         Ok(Engine {
             model: model.inner.clone(),
@@ -212,7 +230,7 @@ impl Engine {
 // ─── Internal forward impl (lazy-inits the inner engine) ────────────────────
 
 impl Engine {
-    fn init_inner(&mut self) {
+    fn init_inner(&mut self) -> Result<(), MoEError> {
         // SAFETY: Engine is on the PyO3 heap (stable address). We create
         // 'static references to its fields; these remain valid because PyO3
         // never moves pyclass objects after construction.
@@ -230,32 +248,32 @@ impl Engine {
                 let expert_buf: Option<&mut ExpertBuffer> =
                     unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
                         .as_mut().unwrap().as_mut() };
-                let e = EngineFusedExp {
-                    model: model_ref,
-                    ctx: ctx_ref,
-                    gpu_wf: gpu_wf_ref,
-                    expert_gpu_buffer: expert_buf,
-                    k,
-                    timing: BTreeMap::new(),
-                };
+                let e = FusedExp::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf, k)?;
                 EngineInner { fused_exp: ManuallyDrop::new(e) }
             }
             PipelineMode::FusedWoods => {
                 let expert_buf: Option<&mut ExpertBuffer> =
                     unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
                         .as_mut().unwrap().as_mut() };
-                let scratch = FusedWoodsScratch::new(&model_ref.config);
-                let e = EngineFusedWoods {
-                    model: model_ref,
-                    ctx: ctx_ref,
-                    gpu_wf: gpu_wf_ref,
-                    expert_gpu_buffer: expert_buf,
-                    norm_cache: std::collections::HashMap::new(),
-                    scratch,
-                };
+                let e = FusedWoods::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf)?;
                 EngineInner { fused_woods: ManuallyDrop::new(e) }
             }
+            PipelineMode::FusedExpStripped => {
+                let expert_buf: Option<&mut ExpertBuffer> =
+                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
+                        .as_mut().unwrap().as_mut() };
+                let e = FusedExpStripped::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf, k)?;
+                EngineInner { fused_exp_stripped: ManuallyDrop::new(e) }
+            }
+            PipelineMode::FusedWoodsStripped => {
+                let expert_buf: Option<&mut ExpertBuffer> =
+                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
+                        .as_mut().unwrap().as_mut() };
+                let e = FusedWoodsStripped::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf)?;
+                EngineInner { fused_woods_stripped: ManuallyDrop::new(e) }
+            }
         });
+        Ok(())
     }
 
     fn forward_impl(
@@ -265,7 +283,7 @@ impl Engine {
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
         if self.inner.is_none() {
-            self.init_inner();
+            self.init_inner()?;
         }
         let inner = self.inner.as_mut().unwrap();
         // SAFETY: the variant matches self.mode, set in init_inner.
@@ -286,6 +304,16 @@ impl Engine {
                     self.telemetry = inner.fused_woods.telemetry();
                     logits
                 }
+                PipelineMode::FusedExpStripped => {
+                    let logits = inner.fused_exp_stripped.forward(input_ids, cache, check_signal);
+                    self.telemetry = inner.fused_exp_stripped.telemetry();
+                    logits
+                }
+                PipelineMode::FusedWoodsStripped => {
+                    let logits = inner.fused_woods_stripped.forward(input_ids, cache, check_signal);
+                    self.telemetry = inner.fused_woods_stripped.telemetry();
+                    logits
+                }
             }
         }
     }
@@ -302,10 +330,16 @@ impl Drop for Engine {
                         std::ptr::drop_in_place(&mut inner.cpu as *mut ManuallyDrop<EngineCPU>);
                     }
                     PipelineMode::FusedExp => {
-                        std::ptr::drop_in_place(&mut inner.fused_exp as *mut ManuallyDrop<EngineFusedExp>);
+                        std::ptr::drop_in_place(&mut inner.fused_exp as *mut ManuallyDrop<FusedExp>);
                     }
                     PipelineMode::FusedWoods => {
-                        std::ptr::drop_in_place(&mut inner.fused_woods as *mut ManuallyDrop<EngineFusedWoods>);
+                        std::ptr::drop_in_place(&mut inner.fused_woods as *mut ManuallyDrop<FusedWoods>);
+                    }
+                    PipelineMode::FusedExpStripped => {
+                        std::ptr::drop_in_place(&mut inner.fused_exp_stripped as *mut ManuallyDrop<FusedExpStripped>);
+                    }
+                    PipelineMode::FusedWoodsStripped => {
+                        std::ptr::drop_in_place(&mut inner.fused_woods_stripped as *mut ManuallyDrop<FusedWoodsStripped>);
                     }
                 }
             }

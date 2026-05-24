@@ -281,8 +281,10 @@ impl<'a> ExecCtx<'a> {
             }
         }
 
-        // Sigmoid gate on attention output
-        attn_out.mapv_inplace(|x| x / (1.0 + (-x).exp()));
+        // Apply gating: out = attn_out * sigmoid(q_gate)
+        for i in 0..q_dim {
+            attn_out[i] *= sigmoid(q_gate[i]);
+        }
 
         // o_proj: dequant and matvec
         let o_name = format!("{}.o_proj", prefix);
@@ -442,8 +444,14 @@ impl<'a> ExecCtx<'a> {
                 let zh = z.slice(s![vh * value_dim..(vh + 1) * value_dim]);
                 let mut gh = gated_out.slice_mut(s![vh * value_dim..(vh + 1) * value_dim]);
                 let mut gh_slice = vec![0.0f32; value_dim];
+                // norm.weight is either per-head [n_v * value_dim] or shared [value_dim]
+                let gh_nw = if gnw.len() >= (vh + 1) * value_dim {
+                    &gnw[vh * value_dim..(vh + 1) * value_dim]
+                } else {
+                    gnw
+                };
                 rms_norm_gated(
-                    oh.as_slice().unwrap(), zh.as_slice().unwrap(), gnw,
+                    oh.as_slice().unwrap(), zh.as_slice().unwrap(), gh_nw,
                     &mut gh_slice, value_dim, RMS_NORM_EPS,
                 );
                 for i in 0..value_dim { gh[i] = gh_slice[i]; }

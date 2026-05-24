@@ -5,8 +5,8 @@ use crate::cache::Cache;
 use crate::error::MoEError;
 
 pub mod cpu;
-pub mod fusedexp;
-pub mod fusedwoods;
+pub mod qwen35_35b;
+pub mod qwen35_35b_stripped;
 
 /// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
 pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
