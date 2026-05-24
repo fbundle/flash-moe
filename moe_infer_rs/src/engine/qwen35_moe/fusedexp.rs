@@ -688,13 +688,21 @@ fn moe_layer_forward<C: ModelConfig>(
 
         if miss_count > 0 {
             let t_io = Instant::now();
+            // Snapshot pointers as usize (Send + Sync) to avoid &mut conflicts inside rayon::scope.
+            let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
             for m in 0..miss_count {
                 let ki = miss_k_slot[m];
-                let eidx = miss_ei[m];
-                let ptr = io.expert_data[ki].contents() as *mut u8;
-                let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
-                expert_file.read_expert(eidx, dst).unwrap();
+                reads[m] = (miss_ei[m], io.expert_data[ki].contents() as usize);
             }
+            rayon::scope(|s| {
+                for m in 0..miss_count {
+                    let (eidx, ptr_u) = reads[m];
+                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
+                    s.spawn(move |_| {
+                        expert_file.read_expert(eidx, dst).unwrap();
+                    });
+                }
+            });
             let dt = t_io.elapsed().as_secs_f64() * 1000.0;
             timing_add(timing, "engine.expert_io_ms", dt);
         }
@@ -1010,13 +1018,21 @@ fn route_and_pread(
     if miss_count > 0 {
         let t_io = Instant::now();
         let expert_size = expert_file.expert_size();
+        // Snapshot pointers as usize (Send + Sync) to avoid &mut conflicts inside rayon::scope.
+        let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
         for m in 0..miss_count {
             let ki = miss_k_slot[m];
-            let eidx = miss_ei[m];
-            let ptr = expert_gpu_buffer.expert_data[ki].contents() as *mut u8;
-            let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
-            expert_file.read_expert(eidx, dst).unwrap();
+            reads[m] = (miss_ei[m], expert_gpu_buffer.expert_data[ki].contents() as usize);
         }
+        rayon::scope(|s| {
+            for m in 0..miss_count {
+                let (eidx, ptr_u) = reads[m];
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
+                s.spawn(move |_| {
+                    expert_file.read_expert(eidx, dst).unwrap();
+                });
+            }
+        });
         let dt = t_io.elapsed().as_secs_f64() * 1000.0;
         timing_add(timing, "engine.expert_io_ms", dt);
     }

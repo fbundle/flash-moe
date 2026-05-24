@@ -1330,13 +1330,21 @@ fn moe_layer_forward<C: ModelConfig>(
             }
 
             if miss_count > 0 {
+                // Snapshot pointers as usize (Send + Sync) to avoid &mut conflicts inside rayon::scope.
+                let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
                 for m in 0..miss_count {
                     let ki = miss_k_slot[m];
-                    let eidx = miss_ei[m];
-                    let ptr = io.expert_data[ki].contents() as *mut u8;
-                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
-                    expert_file.read_expert(eidx, dst).unwrap();
+                    reads[m] = (miss_ei[m], io.expert_data[ki].contents() as usize);
                 }
+                rayon::scope(|s| {
+                    for m in 0..miss_count {
+                        let (eidx, ptr_u) = reads[m];
+                        let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
+                        s.spawn(move |_| {
+                            expert_file.read_expert(eidx, dst).unwrap();
+                        });
+                    }
+                });
             }
             for m in 0..miss_count {
                 valid[miss_k_slot[m]] = true;

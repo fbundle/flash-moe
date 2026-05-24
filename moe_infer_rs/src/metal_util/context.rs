@@ -11,7 +11,7 @@ use crate::model::weights::WeightFile;
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
 
 pub const MAX_K: usize = 8;
-const CACHE_SIZE: usize = 32;
+const CACHE_SIZE: usize = 512;
 
 /// LRU cache for expert Metal buffers. Maps (layer, expert_id) → pre-allocated buffer.
 /// Cache hits skip pread entirely; misses evict the least-recently-used entry.
