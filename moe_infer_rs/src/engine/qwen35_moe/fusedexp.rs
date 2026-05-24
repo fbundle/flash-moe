@@ -236,7 +236,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         let moe_inter = C::MOE_INTERMEDIATE;
         let shared_inter = C::SHARED_INTERMEDIATE;
         let k = self.engine.k;
-
+        
         let next_norm_info = if layer + 1 < C::NUM_LAYERS {
             self.engine.model.wf.get_tensor_ptr(
                 &format!("model.layers.{}.input_layernorm.weight", layer + 1))
@@ -248,18 +248,19 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         let cmd = self.engine.ctx.queue.new_command_buffer().to_owned();
         let mut keep_alive = Vec::with_capacity(4);
 
+    
+        
+        let io = self.engine.expert_gpu_buffer.as_ref().unwrap();
+
+        // Keep expert out buffers alive
+        let actual_k = k.min(MAX_K);
+        for ki in 0..actual_k {
+            keep_alive.push(io.expert_out[ki].clone());
+        }
+        keep_alive.push(io.shared_act.clone());
+        keep_alive.push(io.shared_down.clone());
         {
             let enc = cmd.new_compute_command_encoder();
-            let io = self.engine.expert_gpu_buffer.as_ref().unwrap();
-
-            // Keep expert out buffers alive
-            let actual_k = k.min(MAX_K);
-            for ki in 0..actual_k {
-                keep_alive.push(io.expert_out[ki].clone());
-            }
-            keep_alive.push(io.shared_act.clone());
-            keep_alive.push(io.shared_down.clone());
-
             encode_post_expert::<C>(
                 &self.engine.model.wf, self.engine.gpu_wf, self.engine.ctx, &enc, layer,
                 &routing.expert_weights, routing.shared_gate_score,
