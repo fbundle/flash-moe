@@ -51,7 +51,7 @@ from moe_infer import Model, Engine, Cache, record_engine_telemetry
 
 | Method | Description |
 |--------|-------------|
-| `engine = Engine(model, pipeline_mode="FusedExp", k=0)` | Initialize Metal GPU resources. `k` selects experts per token (0 = model default, 8) |
+| `engine = Engine(model, pipeline_mode="Fused4bit", k=0)` | Initialize Metal GPU resources. `k` selects experts per token (0 = model default, 8) |
 | `engine.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
 | `engine.upload_cache(cache)` | Sync CPU cache → GPU buffers |
 | `engine.download_cache(cache)` | Sync GPU buffers → CPU cache |
@@ -70,8 +70,8 @@ from moe_infer import Model, Engine, Cache, record_engine_telemetry
 
 | Mode | Description |
 |------|-------------|
-| `FusedExp` | Full model: 40 layers, 256 experts, K=8 |
-| `FusedExpStripped` | Stripped model: 4 layers, 4 experts, K=4 (for verification) |
+| `Fused4bit` | Full model: 40 layers, 256 experts, K=8 |
+| `Fused4bitStripped` | Stripped model: 4 layers, 4 experts, K=4 (for verification) |
 
 ### CPU Engine (Rust only)
 
@@ -136,7 +136,7 @@ cache.json      # Manifest: name → {offset, size, shape, dtype}
 python verify_nway.py
 ```
 
-Compares `Cpu`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the stripped 4-layer model. Outputs an N×N max_diff matrix.
+Compares `Cpu`, `Fused4bit` (Rust), `C` (C bench), and `mlx-lm` on the stripped 4-layer model. Outputs an N×N max_diff matrix.
 
 Expected: all non-mlx engines agree within ULP-level tolerance.
 
@@ -154,7 +154,7 @@ Apple M1 Pro 14 GPUs, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-tok
 
 | Mode | tok/s |
 |------|-------|
-| FusedExp (Rust) | ~10 |
+| Fused4bit (Rust) | ~10 |
 | Cpu (reference) | ~0.15 |
 
 Expert I/O (SSD reads) dominates at ~70% of per-layer time.
@@ -177,7 +177,7 @@ moe_infer_rs/                 Rust engine + Python bindings
       qwen35_moe/
         constants.rs          ModelConfig trait + FullModel/StrippedModel impls
         cpu.rs                CPU reference engine (ndarray, pure f32)
-        fusedexp.rs           FusedExp GPU pipeline (3-CMD, Metal)
+        fused_4bit.rs           Fused4bit GPU pipeline (3-CMD, Metal)
         metal_context.rs      Metal device/pipelines, ExpertCache LRU, scratch bufs
         metal_kernels.rs      Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
         shaders.metal         Metal compute shaders (embedded via include_str!)

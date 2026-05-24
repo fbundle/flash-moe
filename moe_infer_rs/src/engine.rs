@@ -57,8 +57,8 @@ pub trait Engine {
 
 #[derive(Clone, Copy, Debug)]
 pub enum EngineEnum {
-    FusedExp,
-    FusedExpStripped,
+    Fused4bit,
+    Fused4bitStripped,
 }
 
 impl EngineEnum {
@@ -69,7 +69,7 @@ impl EngineEnum {
         model: &Model,
         k: usize,
     ) -> Result<(MetalContext, WeightBuffer, ExpertBuffer), MoEError> {
-        let is_stripped = matches!(self, EngineEnum::FusedExpStripped);
+        let is_stripped = matches!(self, EngineEnum::Fused4bitStripped);
         let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
              linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
              hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
@@ -128,12 +128,12 @@ impl EngineEnum {
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
 
-use qwen35_moe::{FullModel, StrippedModel, FusedExp};
+use qwen35_moe::{FullModel, StrippedModel, Fused4bit};
 
 /// Type-erased engine holding one of the engine variants.
 pub enum DynEngine {
-    FusedExp(FusedExp<'static, FullModel>),
-    FusedExpStripped(FusedExp<'static, StrippedModel>),
+    Fused4bit(Fused4bit<'static, FullModel>),
+    Fused4bitStripped(Fused4bit<'static, StrippedModel>),
 }
 
 impl DynEngine {
@@ -157,36 +157,36 @@ impl DynEngine {
         let weight_buffer_ref: &WeightBuffer = &*(weight_buffer as *const WeightBuffer);
 
         Ok(match engine_type {
-            EngineEnum::FusedExp => {
-                let e = FusedExp::new(
+            EngineEnum::Fused4bit => {
+                let e = Fused4bit::new(
                     model_ref, ctx_ref, weight_buffer_ref,
                     expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
                     k,
                 )?;
-                DynEngine::FusedExp(e)
+                DynEngine::Fused4bit(e)
             }
-            EngineEnum::FusedExpStripped => {
-                let e = FusedExp::new(
+            EngineEnum::Fused4bitStripped => {
+                let e = Fused4bit::new(
                     model_ref, ctx_ref, weight_buffer_ref,
                     expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
                     k,
                 )?;
-                DynEngine::FusedExpStripped(e)
+                DynEngine::Fused4bitStripped(e)
             }
         })
     }
 
     pub fn upload_cache(&self, cache: &Cache) {
         match self {
-            DynEngine::FusedExp(e) => Engine::upload_cache(e, cache),
-            DynEngine::FusedExpStripped(e) => Engine::upload_cache(e, cache),
+            DynEngine::Fused4bit(e) => Engine::upload_cache(e, cache),
+            DynEngine::Fused4bitStripped(e) => Engine::upload_cache(e, cache),
         }
     }
 
     pub fn download_cache(&self, cache: &mut Cache) {
         match self {
-            DynEngine::FusedExp(e) => Engine::download_cache(e, cache),
-            DynEngine::FusedExpStripped(e) => Engine::download_cache(e, cache),
+            DynEngine::Fused4bit(e) => Engine::download_cache(e, cache),
+            DynEngine::Fused4bitStripped(e) => Engine::download_cache(e, cache),
         }
     }
 
@@ -196,15 +196,15 @@ impl DynEngine {
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
         match self {
-            DynEngine::FusedExp(e) => Engine::forward(e, input_ids, check_signal),
-            DynEngine::FusedExpStripped(e) => Engine::forward(e, input_ids, check_signal),
+            DynEngine::Fused4bit(e) => Engine::forward(e, input_ids, check_signal),
+            DynEngine::Fused4bitStripped(e) => Engine::forward(e, input_ids, check_signal),
         }
     }
 
     pub fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
         match self {
-            DynEngine::FusedExp(e) => Engine::telemetry(e),
-            DynEngine::FusedExpStripped(e) => Engine::telemetry(e),
+            DynEngine::Fused4bit(e) => Engine::telemetry(e),
+            DynEngine::Fused4bitStripped(e) => Engine::telemetry(e),
         }
     }
 }

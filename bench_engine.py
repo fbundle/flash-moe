@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark FusedExp engine stages using built-in telemetry with mean/std across runs."""
+"""Benchmark Fused4bit engine stages using built-in telemetry with mean/std across runs."""
 import subprocess, sys, os, time
 import numpy as np
 
@@ -31,12 +31,12 @@ def main():
     moe_infer.record_engine_telemetry(True) # type: ignore
 
     print(f"\nModel: {MODEL_DIR}")
-    print(f"Mode: FusedExp | Runs per config: {N_RUNS}\n")
+    print(f"Mode: Fused4bit | Runs per config: {N_RUNS}\n")
 
     # Warmup
     print(f"Warmup ({WARMUP_TOKENS} tokens)...")
     model = Model(MODEL_DIR)
-    engine = Engine(model, pipeline_mode="FusedExp")
+    engine = Engine(model, pipeline_mode="Fused4bit")
     warm = random_tokens(WARMUP_TOKENS, seed=1)
     warm_ids = np.array(warm, dtype=np.int64)
     warm_cache = Cache(model)

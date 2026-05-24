@@ -188,13 +188,13 @@ Full-attention layers store `k_cache`, `v_cache`, and `len`. Linear-attention la
 
 | Mode | Description |
 |------|-------------|
-| `FusedExp` | Full model: 40 layers, 256 experts, K=8. 3-CMD GPU pipeline with expert dispatch every layer |
-| `FusedExpStripped` | Stripped model: 4 layers, 4 experts, K=4. For verification |
+| `Fused4bit` | Full model: 40 layers, 256 experts, K=8. 3-CMD GPU pipeline with expert dispatch every layer |
+| `Fused4bitStripped` | Stripped model: 4 layers, 4 experts, K=4. For verification |
 | `Cpu` (Rust only) | Pure-CPU reference engine using `ndarray`. Not exposed via Python bindings |
 
 All GPU modes use the 3-CMD pipeline. The stripped variant uses a reduced 4-layer 4-expert model suitable for fast verification iteration.
 
-### FusedExp Command Buffer Layout
+### Fused4bit Command Buffer Layout
 
 **Linear attention layers (30/40)**:
 - CMD1: QKV/Z/B/A projections → Conv1d → Q/K RMS norms → SSM → Gated RMS norm → out_proj → Residual add
@@ -214,7 +214,7 @@ The `CpuEngine<C: ModelConfig>` in `engine/qwen35_moe/cpu.rs` is a pure-CPU refe
 - `pre_expert_linear()`: input_layernorm → QKV/Z/B/A projections → conv1d_step with state update → RMS norm Q/K → decay/beta → gated delta net → gated RMS norm → out_proj → residual add → post_attention_layernorm → gate projections
 - `post_expert()`: dequant_matvec_4bit + swiglu per expert → shared expert swiglu + down → sigmoid-gated residual combine
 
-The CPU engine serves as a numerical reference for verifying the GPU pipeline, and runs at ~0.15 tok/s (vs ~10 tok/s for FusedExp on M1 Pro).
+The CPU engine serves as a numerical reference for verifying the GPU pipeline, and runs at ~0.15 tok/s (vs ~10 tok/s for Fused4bit on M1 Pro).
 
 ## Performance
 
@@ -222,12 +222,12 @@ Benchmarked on M1 Pro (10-core CPU, 14-core GPU), Qwen3.5-35B-A3B-4bit full mode
 
 | Mode | tok/s |
 |------|-------|
-| FusedExp (Rust) | ~10 |
+| Fused4bit (Rust) | ~10 |
 | Cpu (reference) | ~0.15 |
 
 Expert I/O (SSD reads) dominates at ~70% of per-layer time.
 
-### FusedExp per-phase telemetry (full model, 20 tokens, prompt prefill)
+### Fused4bit per-phase telemetry (full model, 20 tokens, prompt prefill)
 
 | Stage | Mean (ms) | Share |
 |-------|-----------|-------|
@@ -258,7 +258,7 @@ All verification uses the stripped model (4 layers, 4 experts) to enable fast it
 
 ### GPU vs CPU
 
-CpuEngine and FusedExp are numerically identical (max_diff < 1e-5, within ULP-level tolerance). The CPU engine uses `ndarray` and f32 throughout, providing a trustworthy reference for the Metal GPU pipeline.
+CpuEngine and Fused4bit are numerically identical (max_diff < 1e-5, within ULP-level tolerance). The CPU engine uses `ndarray` and f32 throughout, providing a trustworthy reference for the Metal GPU pipeline.
 
 #### Performance Differences (GPU vs CPU)
 
@@ -318,7 +318,7 @@ moe_infer_rs/                   Rust engine + Python bindings
       qwen35_moe/
         constants.rs            ModelConfig trait + FullModel/StrippedModel impls
         cpu.rs                  CPU reference engine (ndarray, pure f32)
-        fusedexp.rs             FusedExp GPU pipeline (3-CMD, Metal)
+        fused_4bit.rs             Fused4bit GPU pipeline (3-CMD, Metal)
         metal_context.rs        Metal device/pipelines, ExpertCache LRU, scratch bufs
         metal_kernels.rs        Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
         shaders.metal           Metal compute shaders (embedded via include_str!)
@@ -346,6 +346,6 @@ helpers/                        Model conversion scripts
   quantize_from_hf.py           HF unquantized → MoE-Infer 4-bit format
 
 bench.py                        Multi-engine performance benchmark
-verify_nway.py                  N-way logit comparison (Cpu, FusedExp, C, mlx-lm)
+verify_nway.py                  N-way logit comparison (Cpu, Fused4bit, C, mlx-lm)
 chat.py                         Interactive chat demo
 ```

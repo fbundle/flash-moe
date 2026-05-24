@@ -1,4 +1,4 @@
-/// Qwen3.6-35B-A3B-4bit FusedExp engine — all model dimensions are compile-time constants.
+/// Qwen3.6-35B-A3B-4bit Fused4bit engine — all model dimensions are compile-time constants.
 use super::constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE};
 use std::collections::BTreeMap;
@@ -58,7 +58,7 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 // ─── Execution context ─────────────────────────────────────────────────────
 
 struct ExecCtx<'b, 'a, C: ModelConfig> {
-    engine: &'b mut FusedExp<'a, C>,
+    engine: &'b mut Fused4bit<'a, C>,
     pending: Option<DeferredExperts>,
 }
 
@@ -776,7 +776,7 @@ fn encode_post_expert<C: ModelConfig>(
     if !weight_buffer.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
         shared_down_buf, 0, hidden_dim, shared_inter)
     {
-        eprintln!("[fusedexp] WARNING: shared expert down_proj tensor not found: {}", sd_name);
+        eprintln!("[fused_4bit] WARNING: shared expert down_proj tensor not found: {}", sd_name);
     }
 
     {
@@ -861,9 +861,9 @@ fn gpu_lm_head(
     }
 }
 
-// ─── FusedExp ───────────────────────────────────────────────────────
+// ─── Fused4bit ──────────────────────────────────────────────────────
 
-pub struct FusedExp<'a, C: ModelConfig> {
+pub struct Fused4bit<'a, C: ModelConfig> {
     pub model: &'a Model,
     pub ctx: &'a MetalContext,
     pub weight_buffer: &'a WeightBuffer,
@@ -873,7 +873,7 @@ pub struct FusedExp<'a, C: ModelConfig> {
     _phantom: PhantomData<C>,
 }
 
-impl<'a, C: ModelConfig> FusedExp<'a, C> {
+impl<'a, C: ModelConfig> Fused4bit<'a, C> {
     pub fn new(
         model: &'a Model,
         ctx: &'a MetalContext,
@@ -892,7 +892,7 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
             get("linear_total_key"), get("linear_total_value"),
         ).map_err(MoEError::Config)?;
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
-        Ok(FusedExp {
+        Ok(Fused4bit {
             model, ctx, weight_buffer, expert_buffer, k,
             timing: BTreeMap::new(),
             _phantom: PhantomData,
@@ -900,7 +900,7 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
     }
 }
 
-impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
+impl<'a, C: ModelConfig> Engine for Fused4bit<'a, C> {
     fn upload_cache(&self, cache: &Cache) {
         self.ctx.upload_cache(cache);
     }

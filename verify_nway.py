@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
 MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
 
-RUST_ENGINES = ["FusedExpStripped"]
+RUST_ENGINES = ["Fused4bitStripped"]
 ENGINES = RUST_ENGINES + ["C", "mlx-lm"]
 
 C_DIR = os.path.join(ROOT, "moe_infer_c")

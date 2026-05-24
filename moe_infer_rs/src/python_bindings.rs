@@ -99,13 +99,13 @@ pub struct Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (model, pipeline_mode="FusedExp", k=0))]
+    #[pyo3(signature = (model, pipeline_mode="Fused4bit", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
         let engine_type = match pipeline_mode {
-            "FusedExp" => EngineEnum::FusedExp,
-            "FusedExpStripped" => EngineEnum::FusedExpStripped,
+            "Fused4bit" => EngineEnum::Fused4bit,
+            "Fused4bitStripped" => EngineEnum::Fused4bitStripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use FusedExp|FusedExpStripped", pipeline_mode
+                "Unknown pipeline_mode: {}. Use Fused4bit|Fused4bitStripped", pipeline_mode
             ))),
         };
 

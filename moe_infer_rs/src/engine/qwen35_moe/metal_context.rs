@@ -212,7 +212,7 @@ pub struct MetalContext {
     pub buf_cmd3_sum_sq: Option<Buffer>,
     /// CMD3 moe_combine_residual output — next layer reads hidden from here (FAST PATH)
     pub buf_moe_hidden: Option<Buffer>,
-    // ── Pipelined FusedExp persistent GPU buffers ──
+    // ── Pipelined Fused4bit persistent GPU buffers ──
     /// Gate projection output [num_experts] f32 — read by CPU for routing
     pub buf_gate_scores: Option<Buffer>,
     /// Shared expert gate scalar [1] f32
@@ -306,7 +306,7 @@ impl MetalContext {
         self.buf_cmd3_sum_sq = Some(metal_buf_shared(&self.device, 4));
         self.buf_input = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_moe_hidden = Some(metal_buf_shared(&self.device, hidden_dim * 4));
-        // Pipelined FusedExp buffers
+        // Pipelined Fused4bit buffers
         self.buf_gate_scores = Some(metal_buf_shared(&self.device, num_experts * 4));
         self.buf_shared_gate_score = Some(metal_buf_shared(&self.device, 4));
         self.buf_post_normed = Some(metal_buf_shared(&self.device, hidden_dim * 4));
