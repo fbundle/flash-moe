@@ -10,7 +10,7 @@ C_DIR = os.path.join(ROOT, "moe_infer_c")
 RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
 TOKEN_COUNTS = [20, 50, 100, 200, 500]
-RUST_MODES = ["FusedWoods", "FusedExp"]
+RUST_MODES = ["FusedExp"]
 
 
 def random_tokens(n: int, seed: int = 42) -> list[int]:
@@ -93,7 +93,7 @@ def main():
     )
 
     tqdm.write(f"\nModel: {MODEL_DIR}")
-    tqdm.write(f"Modes: {', '.join(RUST_MODES)} (Rust) + C (FusedWoods)\n")
+    tqdm.write(f"Modes: {', '.join(RUST_MODES)} (Rust) + C\n")
 
     # Results: dict[mode][n_tokens] -> (elapsed_ms, tok_s)
     results: dict[str, dict[int, tuple[float, float]]] = {}

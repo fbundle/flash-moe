@@ -145,8 +145,8 @@ def main():
         help=f"Path to MoE-Infer model directory (default: {default_model})",
     )
     parser.add_argument(
-        "--mode", default="FusedWoods",
-        choices=["Cpu", "FusedExp", "FusedWoods"],
+        "--mode", default="FusedExp",
+        choices=["Cpu", "FusedExp"],
         help="Pipeline mode",
     )
     parser.add_argument(
