@@ -102,7 +102,7 @@ impl Engine {
         let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
              linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
              hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
-             num_full_attn_layers, kv_dim) =
+             num_full_attn_layers, kv_dim, num_attn_heads, head_dim) =
             if is_stripped {
                 (qwen35_35b_stripped::NUM_LAYERS, qwen35_35b_stripped::NUM_EXPERTS, qwen35_35b_stripped::NUM_EXPERTS_PER_TOK,
                  qwen35_35b_stripped::NUM_LINEAR_LAYERS, qwen35_35b_stripped::LINEAR_CONV_DIM,
@@ -111,7 +111,8 @@ impl Engine {
                  qwen35_35b_stripped::HIDDEN_DIM, qwen35_35b_stripped::SHARED_INTERMEDIATE,
                  qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT,
                  qwen35_35b_stripped::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b_stripped::NUM_KV_HEADS * qwen35_35b_stripped::HEAD_DIM)
+                 qwen35_35b_stripped::NUM_KV_HEADS * qwen35_35b_stripped::HEAD_DIM,
+                 qwen35_35b_stripped::NUM_ATTN_HEADS, qwen35_35b_stripped::HEAD_DIM)
             } else {
                 (qwen35_35b::NUM_LAYERS, qwen35_35b::NUM_EXPERTS, qwen35_35b::NUM_EXPERTS_PER_TOK,
                  qwen35_35b::NUM_LINEAR_LAYERS, qwen35_35b::LINEAR_CONV_DIM,
@@ -120,7 +121,8 @@ impl Engine {
                  qwen35_35b::HIDDEN_DIM, qwen35_35b::SHARED_INTERMEDIATE,
                  qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT,
                  qwen35_35b::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b::NUM_KV_HEADS * qwen35_35b::HEAD_DIM)
+                 qwen35_35b::NUM_KV_HEADS * qwen35_35b::HEAD_DIM,
+                 qwen35_35b::NUM_ATTN_HEADS, qwen35_35b::HEAD_DIM)
             };
 
         let k = if k == 0 { num_experts_per_tok } else { k };
@@ -136,6 +138,8 @@ impl Engine {
             linear_total_value, linear_key_dim, linear_value_dim,
             hidden_dim, num_experts, shared_intermediate,
             num_full_attn_layers, kv_dim,
+            num_attn_heads, head_dim,
+            num_attn_heads * 2 * head_dim,
         );
         let expert_gpu_buffer = Some(ctx.init_expert_buffers(
             expert_size_4bit, hidden_dim, moe_intermediate, shared_intermediate,

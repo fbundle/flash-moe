@@ -231,6 +231,24 @@ pub struct MetalContext {
     pub buf_kv_k: Vec<Buffer>,
     /// V cache buffers: [MAX_SEQ * kv_dim] f32 each
     pub buf_kv_v: Vec<Buffer>,
+    // ── Pre-allocated full-attention buffers (match C's buf_attn_*) ──
+    /// Q buffer [num_attn_heads * head_dim] f32
+    pub buf_attn_q: Option<Buffer>,
+    /// Q-gate buffer [num_attn_heads * head_dim] f32
+    pub buf_attn_q_gate: Option<Buffer>,
+    /// Attention scores [num_attn_heads * MAX_SEQ] f32
+    pub buf_attn_scores: Option<Buffer>,
+    /// Attention output [num_attn_heads * head_dim] f32
+    pub buf_attn_out: Option<Buffer>,
+    // ── Pre-allocated QKV projection buffers (match C's cs->x_buf/qbuf/kbuf/vbuf) ──
+    /// Input normed hidden [hidden_dim] f32
+    pub buf_qkv_x: Option<Buffer>,
+    /// Q projection output [q_proj_dim] f32
+    pub buf_qkv_q: Option<Buffer>,
+    /// K projection output [kv_dim] f32
+    pub buf_qkv_k: Option<Buffer>,
+    /// V projection output [kv_dim] f32
+    pub buf_qkv_v: Option<Buffer>,
 }
 
 impl MetalContext {
@@ -250,6 +268,9 @@ impl MetalContext {
         shared_intermediate: usize,
         num_full_attn_layers: usize,
         kv_dim: usize,
+        num_attn_heads: usize,
+        head_dim: usize,
+        q_proj_dim: usize,
     ) {
         self.buf_conv_state.clear();
         self.buf_delta_state.clear();
@@ -297,6 +318,19 @@ impl MetalContext {
             self.buf_kv_k.push(metal_buf_shared(&self.device, kv_buf_size));
             self.buf_kv_v.push(metal_buf_shared(&self.device, kv_buf_size));
         }
+        // Pre-allocated full-attention GPU buffers (match C's buf_attn_*).
+        // Shared across all full-attention layers within a token since processing is sequential.
+        let q_dim = num_attn_heads * head_dim;
+        let attn_scores_size = num_attn_heads * crate::constants::MAX_SEQ * 4;
+        self.buf_attn_q = Some(metal_buf_shared(&self.device, q_dim * 4));
+        self.buf_attn_q_gate = Some(metal_buf_shared(&self.device, q_dim * 4));
+        self.buf_attn_scores = Some(metal_buf_shared(&self.device, attn_scores_size));
+        self.buf_attn_out = Some(metal_buf_shared(&self.device, q_dim * 4));
+        // Pre-allocated QKV projection buffers — reused across all full-attention layers.
+        self.buf_qkv_x = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        self.buf_qkv_q = Some(metal_buf_shared(&self.device, q_proj_dim * 4));
+        self.buf_qkv_k = Some(metal_buf_shared(&self.device, kv_dim * 4));
+        self.buf_qkv_v = Some(metal_buf_shared(&self.device, kv_dim * 4));
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
@@ -434,6 +468,14 @@ impl MetalContext {
                 buf_residual: None,
                 buf_kv_k: Vec::new(),
                 buf_kv_v: Vec::new(),
+                buf_attn_q: None,
+                buf_attn_q_gate: None,
+                buf_attn_scores: None,
+                buf_attn_out: None,
+                buf_qkv_x: None,
+                buf_qkv_q: None,
+                buf_qkv_k: None,
+                buf_qkv_v: None,
             })
         })
     }

@@ -143,11 +143,11 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
         {
             let gw = self.gpu_wf;
             let c = self.ctx;
-            let x_buf = metal_buf_shared(&c.device, hd * 4);
+            let x_buf = c.buf_qkv_x.as_ref().unwrap().clone();
             unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hd); }
-            let qbuf = metal_buf_shared(&c.device, q_proj_dim * 4);
-            let kbuf = metal_buf_shared(&c.device, kv_dim * 4);
-            let vbuf = metal_buf_shared(&c.device, kv_dim * 4);
+            let qbuf = c.buf_qkv_q.as_ref().unwrap().clone();
+            let kbuf = c.buf_qkv_k.as_ref().unwrap().clone();
+            let vbuf = c.buf_qkv_v.as_ref().unwrap().clone();
             let cm = c.queue.new_command_buffer();
             let enc = cm.new_compute_command_encoder();
             let q_name = format!("model.layers.{}.self_attn.q_proj", layer);
@@ -221,11 +221,11 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
             let v_dst = (vc_buf.contents() as *mut f32).add(cache_pos * kv_dim);
             std::ptr::copy_nonoverlapping(v.as_ptr(), v_dst, kv_dim);
         }
-        let q_buf = metal_buf_shared(&c.device, q_dim * 4);
-        let scores_buf = metal_buf_shared(&c.device, num_q * MAX_SEQ * 4);
-        let out_buf = metal_buf_shared(&c.device, q_dim * 4);
-        let q_gate_buf = metal_buf_shared(&c.device, q_dim * 4);
-        let hidden_buf = metal_buf_shared(&c.device, hd * 4);
+        let q_buf = c.buf_attn_q.as_ref().unwrap().clone();
+        let scores_buf = c.buf_attn_scores.as_ref().unwrap().clone();
+        let out_buf = c.buf_attn_out.as_ref().unwrap().clone();
+        let q_gate_buf = c.buf_attn_q_gate.as_ref().unwrap().clone();
+        let hidden_buf = c.buf_residual.as_ref().unwrap().clone();
         unsafe {
             std::ptr::copy_nonoverlapping(q.as_ptr(), q_buf.contents() as *mut f32, q_dim);
             std::ptr::copy_nonoverlapping(q_gate.as_ptr(), q_gate_buf.contents() as *mut f32, q_dim);

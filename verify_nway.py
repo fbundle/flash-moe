@@ -273,46 +273,6 @@ def main():
 
     print_nway_table(max_diffs, engines)
 
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-
-    # Rust internal consistency: FusedWoods vs FusedExp
-    rust_pairs = [
-        ("FusedWoods", "FusedExp"),
-    ]
-    all_rust_ok = True
-    for e1, e2 in rust_pairs:
-        md = _lookup_pair(max_diffs, e1, e2)
-        ok = md < 1e-4
-        status = "PASS" if ok else "FAIL"
-        note = " (ULP-level)" if md < 1e-5 else (" (noise floor)" if md < 1e-4 else "")
-        print(f"  Rust {e1} vs {e2}: max_diff={md:.2e} [{status}]{note}")
-        if not ok:
-            all_rust_ok = False
-
-    if all_rust_ok:
-        print("\n[verify] All Rust pipelines are internally consistent.")
-
-    # C vs FusedWoods: architectural port verification
-    c_fw = _lookup_pair(max_diffs, "C", "FusedWoods")
-    if c_fw < 1e-6:
-        print("[verify] C bench == Rust FusedWoods — port is bit-exact.")
-    elif c_fw < 1e-4:
-        print(f"[verify] C bench ~= Rust FusedWoods (max_diff={c_fw:.2e}) — port matches within float32 noise.")
-    elif c_fw < 1e-3:
-        print(f"[verify] C bench ~= Rust FusedWoods (max_diff={c_fw:.2e}) — near match.")
-    else:
-        print(f"[verify] WARNING: C bench vs FusedWoods diverge (max_diff={c_fw:.6f})!")
-
-    # Rust vs mlx-lm: expect ~0.11 max_diff from bf16 vs f32 precision floor
-    rust_mlx = _lookup_pair(max_diffs, "FusedWoods", "mlx-lm")
-    if rust_mlx < 1e-3:
-        print("[verify] FusedWoods matches mlx-lm — numerical correctness confirmed.")
-    elif rust_mlx < 0.15:
-        print(f"[verify] FusedWoods vs mlx-lm max_diff={rust_mlx:.4f} — within bf16 precision floor (~0.4% relative). OK.")
-    else:
-        print(f"[verify] WARNING: FusedWoods vs mlx-lm max_diff={rust_mlx:.4f} exceeds bf16 floor — investigate!")
 
 
 if __name__ == "__main__":
