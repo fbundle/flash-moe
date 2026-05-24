@@ -3,6 +3,7 @@
 import subprocess, sys, os, struct, tempfile, time
 import numpy as np
 from tqdm import tqdm
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit")
@@ -11,7 +12,6 @@ RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
 TOKEN_COUNTS = [20, 50]
 RUST_MODES = ["FusedWoods", "FusedExp"]
-WARMUP_TOKENS = 32
 
 
 def random_tokens(n: int, seed: int = 42) -> list[int]:
@@ -96,26 +96,21 @@ def main():
     tqdm.write(f"\nModel: {MODEL_DIR}")
     tqdm.write(f"Modes: {', '.join(RUST_MODES)} (Rust) + C (FusedWoods)\n")
 
-    # Warmup
-    tqdm.write(f"Warmup ({WARMUP_TOKENS} tokens)...")
-    warm = random_tokens(WARMUP_TOKENS, seed=1)
-    for mode in RUST_MODES:
-        bench_rust(mode, warm)
-    bench_c(warm)
-
     # Results: dict[mode][n_tokens] -> (elapsed_ms, tok_s)
     results: dict[str, dict[int, tuple[float, float]]] = {}
 
-    all_modes = [f"Rust {m}" for m in RUST_MODES] + ["C"]
+    all_modes = ["C"] + [f"Rust {m}" for m in RUST_MODES]
     for n in tqdm(TOKEN_COUNTS, desc="Token counts", unit="len"):
-        tokens = random_tokens(n, seed=42 + n)
-
         for label in all_modes:
+            tokens = random_tokens(n, seed=int(time.time()))
+
             if label == "C":
                 elapsed, mn, mx = bench_c(tokens)
             else:
                 mode = label.replace("Rust ", "")
                 elapsed, mn, mx = bench_rust(mode, tokens)
+
+            
             tok_s = n / (elapsed / 1000.0)
             results.setdefault(label, {})[n] = (elapsed, tok_s)
             tqdm.write(f"  {label:<18}: {elapsed:6.0f} ms  {tok_s:6.1f} tok/s  "
