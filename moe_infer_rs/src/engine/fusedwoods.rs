@@ -1655,21 +1655,24 @@ fn process_token_inner(
             return Err(MoEError::Metal("interrupted".into()));
         }
         let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
-        if !prev_gpu_combined {
+        // Fast path: previous CMD3 computed combine+residual+norm on GPU.
+        // Wait for CMD3(N-1), then read buf_moe_hidden -> hidden.
+        // The attention function needs the correct hidden for its computations
+        // (QKV projections use input_norm(hidden), residual uses raw hidden).
+        // Matches C: CMD1 wait -> finalize_deferred_experts() -> hidden update.
+        if prev_gpu_combined {
+            // Wait for CMD3(N-1) GPU work to complete, then read output
             if let Some(ref mut def) = deferred.take() {
                 def.complete(hidden, hd);
             }
+        } else if let Some(ref mut def) = deferred.take() {
+            def.complete(hidden, hd);
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         let mut attn_state: Option<FullAttnGpuOut> = None;
         let mut lin_state: Option<LinearAttnGpuOut> = None;
         let mut has_h_mid_saved = false;
         if is_full {
-            if prev_gpu_combined {
-                if let Some(ref mut def) = deferred.take() {
-                    def.complete(hidden, hd);
-                }
-            }
             if let Some(ref mut kv) = kv[layer] {
                 attn_state = mixed_full_attention_forward(
                     exec.wf, layer, hidden, kv, pos, exec.config,
@@ -1691,9 +1694,6 @@ fn process_token_inner(
                 false, use_fusedwoods, prev_gpu_combined, exec.norm_cache, s,
             );
             if prev_gpu_combined {
-                if let Some(ref mut def) = deferred.take() {
-                    def.complete(hidden, hd);
-                }
                 if let Some(ref mut ls) = lin_state {
                     ls.h_mid.copy_from_slice(hidden);
                 }

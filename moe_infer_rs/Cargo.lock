@@ -237,6 +237,7 @@ dependencies = [
  "lz4_flex",
  "memmap2",
  "metal",
+ "ndarray",
  "numpy",
  "objc",
  "pyo3",
