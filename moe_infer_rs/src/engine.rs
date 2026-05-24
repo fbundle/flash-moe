@@ -112,17 +112,17 @@ impl EngineEnum {
             num_attn_heads, head_dim,
             num_attn_heads * 2 * head_dim,
         );
-        let expert_gpu_buffer = ctx.init_expert_buffers(
+        let expert_buffer = ctx.init_expert_buffers(
             expert_size_4bit, hidden_dim, moe_intermediate, shared_intermediate,
         );
-        let gpu_wf = WeightBuffer::new(&ctx.device, &model.weight_file);
+        let weight_buffer = WeightBuffer::new(&ctx.device, &model.weight_file);
 
         eprintln!(
             "[engine] {} layers hidden={} experts={} mode={:?}",
             num_layers, hidden_dim, num_experts, self
         );
 
-        Ok((ctx, gpu_wf, expert_gpu_buffer))
+        Ok((ctx, weight_buffer, expert_buffer))
     }
 }
 
@@ -140,35 +140,35 @@ impl DynEngine {
     /// Create an erased engine.
     ///
     /// # Safety
-    /// `model`, `ctx`, `gpu_wf`, and `expert_gpu_buffer` must remain live and
+    /// `model`, `ctx`, `weight_buffer`, and `expert_buffer` must remain live and
     /// unmoved for as long as the returned `DynEngine` exists. In the PyO3
     /// binding, the `Engine` pyclass is heap-allocated and never moved, so
     /// references to its fields are stable.
     pub unsafe fn new(
         model: &Model,
         ctx: &MetalContext,
-        gpu_wf: &WeightBuffer,
-        expert_gpu_buffer: Option<&mut ExpertBuffer>,
+        weight_buffer: &WeightBuffer,
+        expert_buffer: Option<&mut ExpertBuffer>,
         k: usize,
         engine_type: EngineEnum,
     ) -> Result<Self, MoEError> {
         let model_ref: &Model = &*(model as *const Model);
         let ctx_ref: &MetalContext = &*(ctx as *const MetalContext);
-        let gpu_wf_ref: &WeightBuffer = &*(gpu_wf as *const WeightBuffer);
+        let weight_buffer_ref: &WeightBuffer = &*(weight_buffer as *const WeightBuffer);
 
         Ok(match engine_type {
             EngineEnum::FusedExp => {
                 let e = FusedExp::new(
-                    model_ref, ctx_ref, gpu_wf_ref,
-                    expert_gpu_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
+                    model_ref, ctx_ref, weight_buffer_ref,
+                    expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
                     k,
                 )?;
                 DynEngine::FusedExp(e)
             }
             EngineEnum::FusedExpStripped => {
                 let e = FusedExp::new(
-                    model_ref, ctx_ref, gpu_wf_ref,
-                    expert_gpu_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
+                    model_ref, ctx_ref, weight_buffer_ref,
+                    expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
                     k,
                 )?;
                 DynEngine::FusedExpStripped(e)

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Shared types, constants, and CPU helpers used across engine modules.
 use crate::constants::RMS_NORM_EPS;
 use crate::model::weights::WeightFile;

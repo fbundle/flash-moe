@@ -23,64 +23,6 @@ pub const GROUP_SIZE: usize = 64;
 /// Convolution kernel size for the linear attention conv1d step.
 pub const CONV_KERNEL_SIZE: usize = 4;
 
-// ─── Expert layout helper ───────────────────────────────────────────────
-
-/// Compute the expert 4-bit packed layout constants from model dims.
-#[allow(non_snake_case, dead_code)]
-pub struct ExpertLayout {
-    pub gate_w_off: usize,
-    pub gate_s_off: usize,
-    pub gate_b_off: usize,
-    pub up_w_off: usize,
-    pub up_s_off: usize,
-    pub up_b_off: usize,
-    pub down_w_off: usize,
-    pub down_s_off: usize,
-    pub down_b_off: usize,
-    pub gate_w_size: usize,
-    pub gate_s_size: usize,
-    pub gate_b_size: usize,
-    pub up_w_size: usize,
-    pub up_s_size: usize,
-    pub up_b_size: usize,
-    pub down_w_size: usize,
-    pub down_s_size: usize,
-    pub down_b_size: usize,
-    pub expert_size_4bit: usize,
-}
-
-#[allow(dead_code)]
-pub const fn expert_layout(hd: usize, mi: usize, gs: usize) -> ExpertLayout {
-    let gate_w = mi * hd / 2;
-    let gate_sb = mi * (hd / gs) * 2;
-    let up_w = mi * hd / 2;
-    let up_sb = mi * (hd / gs) * 2;
-    let down_w = hd * mi / 2;
-    let down_sb = hd * (mi / gs) * 2;
-    let gate_w_off = 0;
-    let gate_s_off = gate_w;
-    let gate_b_off = gate_w + gate_sb;
-    let up_w_off = gate_w + 2 * gate_sb;
-    let up_s_off = up_w_off + up_w;
-    let up_b_off = up_s_off + up_sb;
-    let down_w_off = up_b_off + up_sb;
-    let down_s_off = down_w_off + down_w;
-    let down_b_off = down_s_off + down_sb;
-    let expert_size_4bit = down_b_off + down_sb;
-    ExpertLayout {
-        gate_w_off, gate_s_off, gate_b_off,
-        up_w_off, up_s_off, up_b_off,
-        down_w_off, down_s_off, down_b_off,
-        gate_w_size: gate_w, gate_s_size: gate_sb, gate_b_size: gate_sb,
-        up_w_size: up_w, up_s_size: up_sb, up_b_size: up_sb,
-        down_w_size: down_w, down_s_size: down_sb, down_b_size: down_sb,
-        expert_size_4bit,
-    }
-}
-
-#[allow(dead_code)]
-const L: ExpertLayout = expert_layout(2048, 512, 64);
-
 // ─── Backward-compat re-exports ─────────────────────────────────────────
 /// Mirrors the #define constants in moe_infer_c/bench.m.
 /// These modules exist so external code that still references
@@ -110,25 +52,25 @@ pub mod qwen35_35b {
     pub const NUM_FULL_ATTN_LAYERS: usize = 10;
     pub const NUM_LINEAR_LAYERS: usize = 30;
     pub const KV_DIM: usize = 512;
-    pub const EXPERT_SIZE_4BIT: usize = super::L.expert_size_4bit;
-    pub const GATE_W_OFF: usize = super::L.gate_w_off;
-    pub const GATE_S_OFF: usize = super::L.gate_s_off;
-    pub const GATE_B_OFF: usize = super::L.gate_b_off;
-    pub const UP_W_OFF: usize = super::L.up_w_off;
-    pub const UP_S_OFF: usize = super::L.up_s_off;
-    pub const UP_B_OFF: usize = super::L.up_b_off;
-    pub const DOWN_W_OFF: usize = super::L.down_w_off;
-    pub const DOWN_S_OFF: usize = super::L.down_s_off;
-    pub const DOWN_B_OFF: usize = super::L.down_b_off;
-    pub const GATE_W_SIZE: usize = super::L.gate_w_size;
-    pub const GATE_S_SIZE: usize = super::L.gate_s_size;
-    pub const GATE_B_SIZE: usize = super::L.gate_b_size;
-    pub const UP_W_SIZE: usize = super::L.up_w_size;
-    pub const UP_S_SIZE: usize = super::L.up_s_size;
-    pub const UP_B_SIZE: usize = super::L.up_b_size;
-    pub const DOWN_W_SIZE: usize = super::L.down_w_size;
-    pub const DOWN_S_SIZE: usize = super::L.down_s_size;
-    pub const DOWN_B_SIZE: usize = super::L.down_b_size;
+    pub const EXPERT_SIZE_4BIT: usize = <FullModel as ModelConfig>::EXPERT_SIZE_4BIT;
+    pub const GATE_W_OFF: usize = <FullModel as ModelConfig>::GATE_W_OFF;
+    pub const GATE_S_OFF: usize = <FullModel as ModelConfig>::GATE_S_OFF;
+    pub const GATE_B_OFF: usize = <FullModel as ModelConfig>::GATE_B_OFF;
+    pub const UP_W_OFF: usize = <FullModel as ModelConfig>::UP_W_OFF;
+    pub const UP_S_OFF: usize = <FullModel as ModelConfig>::UP_S_OFF;
+    pub const UP_B_OFF: usize = <FullModel as ModelConfig>::UP_B_OFF;
+    pub const DOWN_W_OFF: usize = <FullModel as ModelConfig>::DOWN_W_OFF;
+    pub const DOWN_S_OFF: usize = <FullModel as ModelConfig>::DOWN_S_OFF;
+    pub const DOWN_B_OFF: usize = <FullModel as ModelConfig>::DOWN_B_OFF;
+    pub const GATE_W_SIZE: usize = <FullModel as ModelConfig>::GATE_W_SIZE;
+    pub const GATE_S_SIZE: usize = <FullModel as ModelConfig>::GATE_S_SIZE;
+    pub const GATE_B_SIZE: usize = <FullModel as ModelConfig>::GATE_B_SIZE;
+    pub const UP_W_SIZE: usize = <FullModel as ModelConfig>::UP_W_SIZE;
+    pub const UP_S_SIZE: usize = <FullModel as ModelConfig>::UP_S_SIZE;
+    pub const UP_B_SIZE: usize = <FullModel as ModelConfig>::UP_B_SIZE;
+    pub const DOWN_W_SIZE: usize = <FullModel as ModelConfig>::DOWN_W_SIZE;
+    pub const DOWN_S_SIZE: usize = <FullModel as ModelConfig>::DOWN_S_SIZE;
+    pub const DOWN_B_SIZE: usize = <FullModel as ModelConfig>::DOWN_B_SIZE;
     pub fn validate_config(hidden_dim: usize, num_layers: usize, num_experts: usize,
                            num_experts_per_tok: usize, moe_intermediate: usize,
                            shared_intermediate: usize, num_attn_heads: usize,
@@ -168,25 +110,25 @@ pub mod qwen35_35b_stripped {
     pub const NUM_FULL_ATTN_LAYERS: usize = 1;
     pub const NUM_LINEAR_LAYERS: usize = 3;
     pub const KV_DIM: usize = 512;
-    pub const EXPERT_SIZE_4BIT: usize = super::L.expert_size_4bit;
-    pub const GATE_W_OFF: usize = super::L.gate_w_off;
-    pub const GATE_S_OFF: usize = super::L.gate_s_off;
-    pub const GATE_B_OFF: usize = super::L.gate_b_off;
-    pub const UP_W_OFF: usize = super::L.up_w_off;
-    pub const UP_S_OFF: usize = super::L.up_s_off;
-    pub const UP_B_OFF: usize = super::L.up_b_off;
-    pub const DOWN_W_OFF: usize = super::L.down_w_off;
-    pub const DOWN_S_OFF: usize = super::L.down_s_off;
-    pub const DOWN_B_OFF: usize = super::L.down_b_off;
-    pub const GATE_W_SIZE: usize = super::L.gate_w_size;
-    pub const GATE_S_SIZE: usize = super::L.gate_s_size;
-    pub const GATE_B_SIZE: usize = super::L.gate_b_size;
-    pub const UP_W_SIZE: usize = super::L.up_w_size;
-    pub const UP_S_SIZE: usize = super::L.up_s_size;
-    pub const UP_B_SIZE: usize = super::L.up_b_size;
-    pub const DOWN_W_SIZE: usize = super::L.down_w_size;
-    pub const DOWN_S_SIZE: usize = super::L.down_s_size;
-    pub const DOWN_B_SIZE: usize = super::L.down_b_size;
+    pub const EXPERT_SIZE_4BIT: usize = <StrippedModel as ModelConfig>::EXPERT_SIZE_4BIT;
+    pub const GATE_W_OFF: usize = <StrippedModel as ModelConfig>::GATE_W_OFF;
+    pub const GATE_S_OFF: usize = <StrippedModel as ModelConfig>::GATE_S_OFF;
+    pub const GATE_B_OFF: usize = <StrippedModel as ModelConfig>::GATE_B_OFF;
+    pub const UP_W_OFF: usize = <StrippedModel as ModelConfig>::UP_W_OFF;
+    pub const UP_S_OFF: usize = <StrippedModel as ModelConfig>::UP_S_OFF;
+    pub const UP_B_OFF: usize = <StrippedModel as ModelConfig>::UP_B_OFF;
+    pub const DOWN_W_OFF: usize = <StrippedModel as ModelConfig>::DOWN_W_OFF;
+    pub const DOWN_S_OFF: usize = <StrippedModel as ModelConfig>::DOWN_S_OFF;
+    pub const DOWN_B_OFF: usize = <StrippedModel as ModelConfig>::DOWN_B_OFF;
+    pub const GATE_W_SIZE: usize = <StrippedModel as ModelConfig>::GATE_W_SIZE;
+    pub const GATE_S_SIZE: usize = <StrippedModel as ModelConfig>::GATE_S_SIZE;
+    pub const GATE_B_SIZE: usize = <StrippedModel as ModelConfig>::GATE_B_SIZE;
+    pub const UP_W_SIZE: usize = <StrippedModel as ModelConfig>::UP_W_SIZE;
+    pub const UP_S_SIZE: usize = <StrippedModel as ModelConfig>::UP_S_SIZE;
+    pub const UP_B_SIZE: usize = <StrippedModel as ModelConfig>::UP_B_SIZE;
+    pub const DOWN_W_SIZE: usize = <StrippedModel as ModelConfig>::DOWN_W_SIZE;
+    pub const DOWN_S_SIZE: usize = <StrippedModel as ModelConfig>::DOWN_S_SIZE;
+    pub const DOWN_B_SIZE: usize = <StrippedModel as ModelConfig>::DOWN_B_SIZE;
     pub fn validate_config(hidden_dim: usize, num_layers: usize, num_experts: usize,
                            num_experts_per_tok: usize, moe_intermediate: usize,
                            shared_intermediate: usize, num_attn_heads: usize,

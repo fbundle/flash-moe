@@ -88,8 +88,8 @@ pub struct Engine {
     engine: Option<DynEngine>,
     model: Arc<CoreModel>,
     ctx: MetalContext,
-    gpu_wf: WeightBuffer,
-    expert_gpu_buffer: Option<ExpertBuffer>,
+    weight_buffer: WeightBuffer,
+    expert_buffer: Option<ExpertBuffer>,
     engine_type: EngineEnum,
     k: usize,
     /// Engine-level telemetry: only populated when record_engine_telemetry(true).
@@ -109,15 +109,15 @@ impl Engine {
             ))),
         };
 
-        let (ctx, gpu_wf, expert_gpu_buffer) = engine_type.init_gpu(&model.inner, k)
+        let (ctx, weight_buffer, expert_buffer) = engine_type.init_gpu(&model.inner, k)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(Engine {
             engine: None,
             model: model.inner.clone(),
             ctx,
-            gpu_wf,
-            expert_gpu_buffer: Some(expert_gpu_buffer),
+            weight_buffer,
+            expert_buffer: Some(expert_buffer),
             engine_type,
             k,
             telemetry: BTreeMap::new(),
@@ -193,8 +193,8 @@ impl Engine {
             // SAFETY: Engine is on the PyO3 heap (stable address).
             self.engine = Some(unsafe {
                 DynEngine::new(
-                    &self.model, &self.ctx, &self.gpu_wf,
-                    self.expert_gpu_buffer.as_mut(), self.k, self.engine_type,
+                    &self.model, &self.ctx, &self.weight_buffer,
+                    self.expert_buffer.as_mut(), self.k, self.engine_type,
                 )?
             });
         }
@@ -209,7 +209,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Drop engine before the fields it references (model, ctx, gpu_wf).
+        // Drop engine before the fields it references (model, ctx, weight_buffer).
         let _ = self.engine.take();
     }
 }
