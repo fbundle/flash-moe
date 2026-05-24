@@ -1294,3 +1294,149 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+// ============================================================================
+// Kernel 17: Q head norm + RoPE — split Q/Q-gate, apply per-head RMS norm, rotate
+// ============================================================================
+// Dispatch: num_q_heads threadgroups, head_dim threads each.
+
+kernel void q_head_norm_rope(
+    device const float*    q_proj       [[buffer(0)]],  // [num_q * 2 * head_dim]
+    device const uint16_t* q_norm_w     [[buffer(1)]],  // [head_dim] bf16, shared across heads
+    device float*          q_out        [[buffer(2)]],  // [num_q * head_dim]
+    device float*          q_gate_out   [[buffer(3)]],  // [num_q * head_dim]
+    constant uint&         head_dim     [[buffer(4)]],
+    constant uint&         rotary_dim   [[buffer(5)]],
+    constant float&        rope_theta   [[buffer(6)]],
+    constant uint&         pos          [[buffer(7)]],
+    constant float&        eps          [[buffer(8)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]]
+) {
+    uint src_base = head * 2 * head_dim;
+    uint out_base = head * head_dim;
+
+    float q_val = q_proj[src_base + tid];
+    q_gate_out[out_base + tid] = q_proj[src_base + head_dim + tid];
+
+    // RMS norm reduction
+    threadgroup float partial[256];
+    partial[tid] = q_val * q_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < head_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(partial[0] / float(head_dim) + eps);
+
+    q_val *= inv_rms * bf16_to_f32(q_norm_w[tid]);
+
+    // RoPE
+    if (tid < rotary_dim) {
+        uint rot_half = rotary_dim / 2;
+        float theta;
+        float pair_val;
+        if (tid < rot_half) {
+            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(rotary_dim));
+            pair_val = q_proj[src_base + tid + rot_half]
+                       * inv_rms * bf16_to_f32(q_norm_w[tid + rot_half]);
+        } else {
+            uint pair = tid - rot_half;
+            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(rotary_dim));
+            pair_val = q_proj[src_base + pair]
+                       * inv_rms * bf16_to_f32(q_norm_w[pair]);
+        }
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float my_normed = q_val;
+        if (tid < rot_half) {
+            q_out[out_base + tid] = my_normed * cos_t - pair_val * sin_t;
+        } else {
+            q_out[out_base + tid] = pair_val * sin_t + my_normed * cos_t;
+        }
+    } else {
+        q_out[out_base + tid] = q_val;
+    }
+}
+
+// ============================================================================
+// Kernel 18: K head norm + RoPE — apply per-head RMS norm and rotate K in-place
+// ============================================================================
+// Dispatch: num_kv_heads threadgroups, head_dim threads each.
+
+kernel void k_head_norm_rope(
+    device float*          k_buf        [[buffer(0)]],  // [num_kv * head_dim] in/out
+    device const uint16_t* k_norm_w     [[buffer(1)]],  // [head_dim] bf16, shared across heads
+    constant uint&         head_dim     [[buffer(2)]],
+    constant uint&         rotary_dim   [[buffer(3)]],
+    constant float&        rope_theta   [[buffer(4)]],
+    constant uint&         pos          [[buffer(5)]],
+    constant float&        eps          [[buffer(6)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]]
+) {
+    uint base = head * head_dim;
+    float k_val = k_buf[base + tid];
+
+    // RMS norm reduction
+    threadgroup float partial[256];
+    partial[tid] = k_val * k_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < head_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(partial[0] / float(head_dim) + eps);
+
+    k_val *= inv_rms * bf16_to_f32(k_norm_w[tid]);
+
+    // RoPE
+    if (tid < rotary_dim) {
+        uint rot_half = rotary_dim / 2;
+        float theta;
+        float pair_val;
+        if (tid < rot_half) {
+            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(rotary_dim));
+            pair_val = k_buf[base + tid + rot_half]
+                       * inv_rms * bf16_to_f32(k_norm_w[tid + rot_half]);
+        } else {
+            uint pair = tid - rot_half;
+            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(rotary_dim));
+            pair_val = k_buf[base + pair]
+                       * inv_rms * bf16_to_f32(k_norm_w[pair]);
+        }
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        if (tid < rot_half) {
+            k_buf[base + tid] = k_val * cos_t - pair_val * sin_t;
+        } else {
+            k_buf[base + tid] = pair_val * sin_t + k_val * cos_t;
+        }
+    } else {
+        k_buf[base + tid] = k_val;
+    }
+}
+
+// ============================================================================
+// Kernel 19: KV-cache append — copy K and V into persistent cache at position pos
+// ============================================================================
+// Dispatch: (kv_dim + 255) / 256 threadgroups, 256 threads each.
+
+kernel void kv_cache_append(
+    device const float*  k       [[buffer(0)]],  // [kv_dim]
+    device const float*  v       [[buffer(1)]],  // [kv_dim]
+    device float*        k_cache [[buffer(2)]],  // [MAX_SEQ * kv_dim]
+    device float*        v_cache [[buffer(3)]],  // [MAX_SEQ * kv_dim]
+    constant uint&       pos     [[buffer(4)]],
+    constant uint&       kv_dim  [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= kv_dim) return;
+    uint dst = pos * kv_dim + tid;
+    k_cache[dst] = k[tid];
+    v_cache[dst] = v[tid];
+}

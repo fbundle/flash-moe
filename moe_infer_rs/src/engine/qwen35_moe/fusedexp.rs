@@ -18,7 +18,7 @@ use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::weights::WeightFile;
 use crate::math::{
-    apply_rope, bf16_to_f32,
+    bf16_to_f32,
     embed_lookup, final_norm, normalize_weights,
     softmax, topk,
 };
@@ -102,19 +102,12 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
         }
     }
 
-    /// Full-attn op1: GPU input_norm → QKV → CPU RoPE/KV-cache → GPU attention/gate.
-    /// Hidden stays in `buf_moe_hidden` on GPU throughout.
+    /// Full-attn op1: entirely on GPU — input_norm → QKV → Q/K norms → RoPE → KV-cache → attention → gate.
     fn op1_wait_full(mut self, layer: usize) -> (Self, GateScores) {
-        // Commit any pending op2 from the previous layer (full-attn breaks the pipeline)
-        let pending = self.pending.take();
-        if let Some(def) = pending {
-            if let Some(cmd) = def.cmd_buf {
-                cmd.commit();
-                cmd.wait_until_completed();
-            }
-        }
-
         let wf = &self.engine.model.wf;
+        let gw = self.engine.gpu_wf;
+        let c = self.engine.ctx;
+
         let hd = C::HIDDEN_DIM;
         let num_q = C::NUM_ATTN_HEADS;
         let num_kv = C::NUM_KV_HEADS;
@@ -122,159 +115,140 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
         let q_dim = num_q * head_dim;
         let q_proj_dim = q_dim * 2;
         let kv_dim = num_kv * head_dim;
+        let pos = self.cache.pos;
+        let fa_idx = layer / FULL_ATTN_INTERVAL;
+        let cache_pos = self.cache.kv[layer].as_ref().unwrap().len;
+        let seq_len = cache_pos + 1;
+
+        // Reuse pending op2 buffer from previous layer, or create new
+        let mut pending = self.pending.take();
+        let keep_alive = pending.as_mut()
+            .map(|d| std::mem::take(&mut d._keep_alive))
+            .unwrap_or_default();
+        let cmd = pending
+            .and_then(|d| d.cmd_buf)
+            .unwrap_or_else(|| c.queue.new_command_buffer().to_owned());
+
         let prefix = format!("model.layers.{}.self_attn", layer);
-        let norm_name = format!("model.layers.{}.input_layernorm.weight", layer);
 
-        // GPU: input_norm(buf_moe_hidden) → buf_qkv_x, then QKV projections
+        // Buffer bindings
+        let buf_moe = c.buf_moe_hidden.as_ref().unwrap();
+        let qkv_x = c.buf_qkv_x.as_ref().unwrap();
+        let sum_sq = c.buf_post_sum_sq.as_ref().unwrap();
+        let qbuf = c.buf_qkv_q.as_ref().unwrap();
+        let kbuf = c.buf_qkv_k.as_ref().unwrap();
+        let vbuf = c.buf_qkv_v.as_ref().unwrap();
+        let q_out_buf = c.buf_attn_q.as_ref().unwrap();
+        let q_gate_buf = c.buf_attn_q_gate.as_ref().unwrap();
+        let scores_buf = c.buf_attn_scores.as_ref().unwrap();
+        let out_buf = c.buf_attn_out.as_ref().unwrap();
+        let kc_buf = &c.buf_kv_k[fa_idx];
+        let vc_buf = &c.buf_kv_v[fa_idx];
+        let o_proj_buf = c.buf_out_proj.as_ref().unwrap();
+        let temp_buf = c.buf_temp_residual.as_ref().unwrap();
+        let normed_buf = c.buf_post_normed.as_ref().unwrap();
+        let gate_buf = c.buf_gate_scores.as_ref().unwrap();
+        let sg_buf = c.buf_shared_gate.as_ref().unwrap();
+        let su_buf = c.buf_shared_up.as_ref().unwrap();
+        let sge_buf = c.buf_shared_gate_score.as_ref().unwrap();
+
         {
-            let c = self.engine.ctx;
-            let gw = self.engine.gpu_wf;
-            let pnw_ptr = wf.get_tensor_ptr(&norm_name).unwrap();
-            let pnw_off = (pnw_ptr as usize - gw.base as usize) as u64;
-            let buf_moe = c.buf_moe_hidden.as_ref().unwrap();
-            let qkv_x = c.buf_qkv_x.as_ref().unwrap();
-            let sum_sq = c.buf_post_sum_sq.as_ref().unwrap();
-            let qbuf = c.buf_qkv_q.as_ref().unwrap();
-            let kbuf = c.buf_qkv_k.as_ref().unwrap();
-            let vbuf = c.buf_qkv_v.as_ref().unwrap();
-
-            let cmd = c.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
 
+            // ── input_norm(buf_moe) → qkv_x ──
+            let pnw_ptr = wf.get_tensor_ptr(
+                &format!("model.layers.{}.input_layernorm.weight", layer)).unwrap();
+            let pnw_off = (pnw_ptr as usize - gw.base as usize) as u64;
             enc.set_compute_pipeline_state(&c.rms_norm_sum);
             enc.set_buffer(0, Some(buf_moe), 0);
             enc.set_buffer(1, Some(sum_sq), 0);
             enc.set_bytes(2, 4, &(hd as u32) as *const u32 as *const c_void);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-
-            let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
-            enc.set_compute_pipeline_state(pipe);
-            enc.set_buffer(0, Some(buf_moe), 0);
-            enc.set_buffer(1, Some(&gw.buf), pnw_off);
-            enc.set_buffer(2, Some(sum_sq), 0);
-            enc.set_buffer(3, Some(qkv_x), 0);
-            enc.set_bytes(4, 4, &(hd as u32) as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new(((hd + 255) / 256) as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-
-            let q_name = format!("{}.q_proj", prefix);
-            let k_name = format!("{}.k_proj", prefix);
-            let v_name = format!("{}.v_proj", prefix);
-            gw.encode_matvec_into(wf, c, &enc, &q_name, qkv_x, 0, qbuf, 0, q_proj_dim, hd);
-            gw.encode_matvec_into(wf, c, &enc, &k_name, qkv_x, 0, kbuf, 0, kv_dim, hd);
-            gw.encode_matvec_into(wf, c, &enc, &v_name, qkv_x, 0, vbuf, 0, kv_dim, hd);
-
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
-        }
-
-        // Read back Q_proj, K, V for CPU-side norms / RoPE / KV cache
-        let mut q_proj_out = vec![0.0f32; q_proj_dim];
-        let mut k = vec![0.0f32; kv_dim];
-        let mut v = vec![0.0f32; kv_dim];
-        {
-            let c = self.engine.ctx;
-            unsafe {
-                std::ptr::copy_nonoverlapping(c.buf_qkv_q.as_ref().unwrap().contents() as *const f32, q_proj_out.as_mut_ptr(), q_proj_dim);
-                std::ptr::copy_nonoverlapping(c.buf_qkv_k.as_ref().unwrap().contents() as *const f32, k.as_mut_ptr(), kv_dim);
-                std::ptr::copy_nonoverlapping(c.buf_qkv_v.as_ref().unwrap().contents() as *const f32, v.as_mut_ptr(), kv_dim);
+            {
+                let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(buf_moe), 0);
+                enc.set_buffer(1, Some(&gw.buf), pnw_off);
+                enc.set_buffer(2, Some(sum_sq), 0);
+                enc.set_buffer(3, Some(qkv_x), 0);
+                enc.set_bytes(4, 4, &(hd as u32) as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(((hd + 255) / 256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
-        }
 
-        // Split Q / Q-gate
-        let mut q = vec![0.0f32; q_dim];
-        let mut q_gate = vec![0.0f32; q_dim];
-        for h in 0..num_q {
-            let src = &q_proj_out[h * 2 * head_dim..];
-            q[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[..head_dim]);
-            q_gate[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[head_dim..2 * head_dim]);
-        }
+            // ── QKV projections ──
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.q_proj", prefix), qkv_x, 0, qbuf, 0, q_proj_dim, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.k_proj", prefix), qkv_x, 0, kbuf, 0, kv_dim, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.v_proj", prefix), qkv_x, 0, vbuf, 0, kv_dim, hd);
 
-        // Q/K per-head norms
-        let qn_name = format!("{}.q_norm.weight", prefix);
-        let kn_name = format!("{}.k_norm.weight", prefix);
-        if let Some(qnw) = wf.get_tensor_u16(&qn_name) {
-            for h in 0..num_q {
-                let qh = &mut q[h * head_dim..(h + 1) * head_dim];
-                let ssq: f32 = qh.iter().map(|&x| x * x).sum();
-                let inv = 1.0 / (ssq / head_dim as f32 + RMS_NORM_EPS).sqrt();
-                for i in 0..head_dim.min(qnw.len()) { qh[i] *= inv * bf16_to_f32(qnw[i]); }
+            // ── Q head norm + RoPE (split Q/Q-gate, norm, rotate) ──
+            {
+                let qn_ptr = wf.get_tensor_ptr(
+                    &format!("{}.q_norm.weight", prefix)).expect("q_norm.weight missing");
+                let qn_off = (qn_ptr as usize - gw.base as usize) as u64;
+                let pipe = c.q_head_norm_rope.as_ref().unwrap();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(qbuf), 0);
+                enc.set_buffer(1, Some(&gw.buf), qn_off);
+                enc.set_buffer(2, Some(q_out_buf), 0);
+                enc.set_buffer(3, Some(q_gate_buf), 0);
+                enc.set_bytes(4, 4, &(head_dim as u32) as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &(C::ROTARY_DIM as u32) as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &(C::ROPE_THETA as f32) as *const f32 as *const c_void);
+                enc.set_bytes(7, 4, &(pos as u32) as *const u32 as *const c_void);
+                enc.set_bytes(8, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_q as u64, 1, 1),
+                    MTLSize::new(head_dim as u64, 1, 1),
+                );
             }
-        }
-        if let Some(knw) = wf.get_tensor_u16(&kn_name) {
-            for h in 0..num_kv {
-                let kh = &mut k[h * head_dim..(h + 1) * head_dim];
-                let ssq: f32 = kh.iter().map(|&x| x * x).sum();
-                let inv = 1.0 / (ssq / head_dim as f32 + RMS_NORM_EPS).sqrt();
-                for i in 0..head_dim.min(knw.len()) { kh[i] *= inv * bf16_to_f32(knw[i]); }
+
+            // ── K head norm + RoPE (in-place on kbuf) ──
+            {
+                let kn_ptr = wf.get_tensor_ptr(
+                    &format!("{}.k_norm.weight", prefix)).expect("k_norm.weight missing");
+                let kn_off = (kn_ptr as usize - gw.base as usize) as u64;
+                let pipe = c.k_head_norm_rope.as_ref().unwrap();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(kbuf), 0);
+                enc.set_buffer(1, Some(&gw.buf), kn_off);
+                enc.set_bytes(2, 4, &(head_dim as u32) as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &(C::ROTARY_DIM as u32) as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &(C::ROPE_THETA as f32) as *const f32 as *const c_void);
+                enc.set_bytes(5, 4, &(pos as u32) as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_kv as u64, 1, 1),
+                    MTLSize::new(head_dim as u64, 1, 1),
+                );
             }
-        }
 
-        // RoPE
-        let pos = self.cache.pos;
-        apply_rope(&mut q, &mut k, pos, num_q, num_kv, head_dim,
-            C::ROTARY_DIM, C::ROPE_THETA);
+            // ── KV-cache append ──
+            {
+                let pipe = c.kv_cache_append.as_ref().unwrap();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(kbuf), 0);
+                enc.set_buffer(1, Some(vbuf), 0);
+                enc.set_buffer(2, Some(kc_buf), 0);
+                enc.set_buffer(3, Some(vc_buf), 0);
+                enc.set_bytes(4, 4, &(cache_pos as u32) as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &(kv_dim as u32) as *const u32 as *const c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(((kv_dim + 255) / 256) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
 
-        // Append K, V to cache
-        {
-            let kv_cache = self.cache.kv[layer].as_mut().unwrap();
-            let cache_pos = kv_cache.len;
-            assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
-            kv_cache.k_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&k);
-            kv_cache.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
-            kv_cache.len += 1;
-        }
-
-        // Upload to GPU persistent KV buffers and set up attention buffers
-        let c = self.engine.ctx;
-        let fa_idx = layer / FULL_ATTN_INTERVAL;
-        let kv_cache = self.cache.kv[layer].as_ref().unwrap();
-        let seq_len = kv_cache.len;
-        let cache_pos = seq_len - 1;
-        let kc_buf = c.buf_kv_k[fa_idx].clone();
-        let vc_buf = c.buf_kv_v[fa_idx].clone();
-        unsafe {
-            let k_dst = (kc_buf.contents() as *mut f32).add(cache_pos * kv_dim);
-            std::ptr::copy_nonoverlapping(k.as_ptr(), k_dst, kv_dim);
-            let v_dst = (vc_buf.contents() as *mut f32).add(cache_pos * kv_dim);
-            std::ptr::copy_nonoverlapping(v.as_ptr(), v_dst, kv_dim);
-        }
-        let q_buf = c.buf_attn_q.as_ref().unwrap().clone();
-        let scores_buf = c.buf_attn_scores.as_ref().unwrap().clone();
-        let out_buf = c.buf_attn_out.as_ref().unwrap().clone();
-        let q_gate_buf = c.buf_attn_q_gate.as_ref().unwrap().clone();
-        unsafe {
-            std::ptr::copy_nonoverlapping(q.as_ptr(), q_buf.contents() as *mut f32, q_dim);
-            std::ptr::copy_nonoverlapping(q_gate.as_ptr(), q_gate_buf.contents() as *mut f32, q_dim);
-        }
-
-        // CMD2: attention scores + softmax + values + sigmoid + o_proj + residual + norm + gate
-        let gw = self.engine.gpu_wf;
-        let o_proj_buf = c.buf_out_proj.as_ref().unwrap().clone();
-        let temp_buf = c.buf_temp_residual.as_ref().unwrap().clone();
-        let sum_sq_buf = c.buf_post_sum_sq.as_ref().unwrap().clone();
-        let normed_buf = c.buf_post_normed.as_ref().unwrap().clone();
-        let gate_buf = c.buf_gate_scores.as_ref().unwrap().clone();
-        let sg_buf = c.buf_shared_gate.as_ref().unwrap().clone();
-        let su_buf = c.buf_shared_up.as_ref().unwrap().clone();
-        let sge_buf = c.buf_shared_gate_score.as_ref().unwrap().clone();
-        let buf_moe = c.buf_moe_hidden.as_ref().unwrap().clone();
-
-        let cmd2 = c.queue.new_command_buffer();
-        {
-            let enc = cmd2.new_compute_command_encoder();
-
-            // attn_scores_batched
+            // ── attn_scores_batched ──
             {
                 let pipe = c.attn_scores_batched.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&q_buf), 0);
-                enc.set_buffer(1, Some(&kc_buf), 0);
-                enc.set_buffer(2, Some(&scores_buf), 0);
+                enc.set_buffer(0, Some(q_out_buf), 0);
+                enc.set_buffer(1, Some(kc_buf), 0);
+                enc.set_buffer(2, Some(scores_buf), 0);
                 enc.set_bytes(3, 4, &(head_dim as u32) as *const u32 as *const c_void);
                 enc.set_bytes(4, 4, &(kv_dim as u32) as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &(seq_len as u32) as *const u32 as *const c_void);
@@ -288,11 +262,11 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // attn_softmax_batched
+            // ── attn_softmax_batched ──
             {
                 let pipe = c.attn_softmax_batched.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&scores_buf), 0);
+                enc.set_buffer(0, Some(scores_buf), 0);
                 enc.set_bytes(1, 4, &(seq_len as u32) as *const u32 as *const c_void);
                 enc.set_bytes(2, 4, &(MAX_SEQ as u32) as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(
@@ -300,13 +274,13 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // attn_values_batched
+            // ── attn_values_batched ──
             {
                 let pipe = c.attn_values_batched.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&scores_buf), 0);
-                enc.set_buffer(1, Some(&vc_buf), 0);
-                enc.set_buffer(2, Some(&out_buf), 0);
+                enc.set_buffer(0, Some(scores_buf), 0);
+                enc.set_buffer(1, Some(vc_buf), 0);
+                enc.set_buffer(2, Some(out_buf), 0);
                 enc.set_bytes(3, 4, &(head_dim as u32) as *const u32 as *const c_void);
                 enc.set_bytes(4, 4, &(kv_dim as u32) as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &(seq_len as u32) as *const u32 as *const c_void);
@@ -318,40 +292,39 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // sigmoid_gate
+            // ── sigmoid_gate ──
             {
                 let pipe = c.sigmoid_gate.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&out_buf), 0);
-                enc.set_buffer(1, Some(&q_gate_buf), 0);
+                enc.set_buffer(0, Some(out_buf), 0);
+                enc.set_buffer(1, Some(q_gate_buf), 0);
                 enc.set_bytes(2, 4, &(q_dim as u32) as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(((q_dim as u32 + 255) / 256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // o_proj matvec
-            let o_prefix = format!("{}.o_proj", prefix);
-            gw.encode_matvec_into(wf, c, &enc, &o_prefix, &out_buf, 0, &o_proj_buf, 0, hd, q_dim);
-            // residual_add: o_proj + buf_moe_hidden → temp_buf
+            // ── o_proj matvec ──
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.o_proj", prefix), out_buf, 0, o_proj_buf, 0, hd, q_dim);
+            // ── residual_add: o_proj + buf_moe → temp_buf ──
             {
                 let pipe = c.residual_add.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&o_proj_buf), 0);
-                enc.set_buffer(1, Some(&buf_moe), 0);
-                enc.set_buffer(2, Some(&temp_buf), 0);
+                enc.set_buffer(0, Some(o_proj_buf), 0);
+                enc.set_buffer(1, Some(buf_moe), 0);
+                enc.set_buffer(2, Some(temp_buf), 0);
                 enc.set_bytes(3, 4, &(hd as u32) as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(((hd + 255) / 256) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // post_attention_layernorm
+            // ── post_attention_layernorm ──
             let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer);
             {
                 enc.set_compute_pipeline_state(&c.rms_norm_sum);
-                enc.set_buffer(0, Some(&temp_buf), 0);
-                enc.set_buffer(1, Some(&sum_sq_buf), 0);
+                enc.set_buffer(0, Some(temp_buf), 0);
+                enc.set_buffer(1, Some(sum_sq), 0);
                 enc.set_bytes(2, 4, &(hd as u32) as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
             }
@@ -360,10 +333,10 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
                 let pnw_off = (pnw_ptr as usize - gw.base as usize) as u64;
                 let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
                 enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(&temp_buf), 0);
+                enc.set_buffer(0, Some(temp_buf), 0);
                 enc.set_buffer(1, Some(&gw.buf), pnw_off);
-                enc.set_buffer(2, Some(&sum_sq_buf), 0);
-                enc.set_buffer(3, Some(&normed_buf), 0);
+                enc.set_buffer(2, Some(sum_sq), 0);
+                enc.set_buffer(3, Some(normed_buf), 0);
                 enc.set_bytes(4, 4, &(hd as u32) as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
                 enc.dispatch_thread_groups(
@@ -371,26 +344,32 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
                     MTLSize::new(256, 1, 1),
                 );
             }
-            // Gate + shared expert projections
+            // ── Gate + shared expert projections ──
             let mlp_prefix = format!("model.layers.{}.mlp", layer);
-            let num_experts = C::NUM_EXPERTS;
-            let shared_inter = C::SHARED_INTERMEDIATE;
-            gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", mlp_prefix), &normed_buf, 0, &gate_buf, 0, num_experts, hd);
-            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", mlp_prefix), &normed_buf, 0, &sg_buf, 0, shared_inter, hd);
-            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", mlp_prefix), &normed_buf, 0, &su_buf, 0, shared_inter, hd);
-            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", mlp_prefix), &normed_buf, 0, &sge_buf, 0, 1, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", mlp_prefix), normed_buf, 0, gate_buf, 0, C::NUM_EXPERTS, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", mlp_prefix), normed_buf, 0, sg_buf, 0, C::SHARED_INTERMEDIATE, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", mlp_prefix), normed_buf, 0, su_buf, 0, C::SHARED_INTERMEDIATE, hd);
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", mlp_prefix), normed_buf, 0, sge_buf, 0, 1, hd);
 
             enc.end_encoding();
         }
-        cmd2.commit();
-        cmd2.wait_until_completed();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+        drop(keep_alive);
+
+        // Update CPU-side KV-cache position tracking
+        {
+            let kv_cache = self.cache.kv[layer].as_mut().unwrap();
+            assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
+            kv_cache.len += 1;
+        }
 
         // Read back gate scores
-        let num_experts = C::NUM_EXPERTS;
-        let mut gate_scores = vec![0.0f32; num_experts];
+        let mut gate_scores = vec![0.0f32; C::NUM_EXPERTS];
         let shared_gate_score: f32;
         unsafe {
-            std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
+            std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), C::NUM_EXPERTS);
             shared_gate_score = *(sge_buf.contents() as *const f32);
         }
 

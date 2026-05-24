@@ -7,7 +7,7 @@ forward(input_ids, cache)
         - get hidden
         - copy hidden to GPU
         for layer in layers:
-            ctx, GateScores = ctx.op1_wait(token, layer, first_layer = layer == 0)
+            ctx, GateScores = ctx.op1_wait(token, layer)
             routing = ctx.route_experts(GateScores)
             ctx = ctx.op2(token, layer, routing)
         
@@ -16,26 +16,4 @@ forward(input_ids, cache)
         -- get logits
 
     return all logits
-
-
-
-.op1_wait(token, layer, first_layer)
-    if first_layer:
-        ctx.command_buffer = new
-
-    -- append operations
-
-    # wait 
-    ctx.command_buffer.submit()
-    ctx.command_buffer.wait()
-
-    -- 
-    GateScores = <get from GPU>
-
-.op2(token, layer, routing)
-    -- copy routing to GPU
-    ctx.command_buffer = new
-    -- append new operations
-
-
 

@@ -185,6 +185,9 @@ pub struct MetalContext {
     pub rms_norm_qk: Option<ComputePipelineState>,
     pub compute_decay_beta: Option<ComputePipelineState>,
     pub gated_rms_norm: Option<ComputePipelineState>,
+    pub q_head_norm_rope: Option<ComputePipelineState>,
+    pub k_head_norm_rope: Option<ComputePipelineState>,
+    pub kv_cache_append: Option<ComputePipelineState>,
 
     // ── Persistent GPU buffers for fused forward ──
     /// Per linear-layer conv state: [(kernel_size-1) * qkv_dim] f32
@@ -418,6 +421,9 @@ impl MetalContext {
             let rms_norm_qk = make_pipeline("rms_norm_qk").ok();
             let compute_decay_beta = make_pipeline("compute_decay_beta").ok();
             let gated_rms_norm = make_pipeline("gated_rms_norm").ok();
+            let q_head_norm_rope = make_pipeline("q_head_norm_rope").ok();
+            let k_head_norm_rope = make_pipeline("k_head_norm_rope").ok();
+            let kv_cache_append = make_pipeline("kv_cache_append").ok();
 
             // Validate required pipelines exist
             let matvec_fast = matvec_fast.ok_or_else(|| MoEError::Shader("dequant_matvec_4bit_fast not found".into()))?;
@@ -446,6 +452,9 @@ impl MetalContext {
                 rms_norm_qk,
                 compute_decay_beta,
                 gated_rms_norm,
+                q_head_norm_rope,
+                k_head_norm_rope,
+                kv_cache_append,
                 // Persistent GPU buffers — initialized later via init_linear_attn_buffers()
                 buf_conv_state: Vec::new(),
                 buf_delta_state: Vec::new(),
