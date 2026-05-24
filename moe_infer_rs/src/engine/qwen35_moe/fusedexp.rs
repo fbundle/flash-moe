@@ -75,7 +75,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let buf_in = self.engine.ctx.buf_input.as_ref().unwrap();
             let norm_name = format!("model.layers.{}.input_layernorm.weight", 0);
-            if let Some(nw_u16) = self.engine.model.wf.get_tensor_u16(&norm_name) {
+            if let Some(nw_u16) = self.engine.model.weight_file.get_tensor_u16(&norm_name) {
                 let nw: Vec<f32> = nw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
                 let ssq: f32 = hidden[..hd].iter().map(|v| v * v).sum();
                 let inv_rms = 1.0 / (ssq / hd as f32 + RMS_NORM_EPS).sqrt();
@@ -132,7 +132,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_pre_expert_full(
-                &self.engine.model.wf, self.engine.gpu_wf, self.engine.ctx, &enc,
+                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc,
                 layer, fa_idx, pos,
                 C::HIDDEN_DIM, C::NUM_ATTN_HEADS, C::NUM_KV_HEADS, C::HEAD_DIM,
                 C::ROTARY_DIM, C::ROPE_THETA as f32, C::NUM_EXPERTS, C::SHARED_INTERMEDIATE,
@@ -161,7 +161,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_pre_expert_linear(
-                &self.engine.model.wf, self.engine.gpu_wf, self.engine.ctx, &enc, layer, li,
+                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc, layer, li,
                 hd, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
                 key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
             );
@@ -180,7 +180,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         normalize_weights(&mut expert_weights);
 
         let actual_k = k.min(MAX_K);
-        let io = self.engine.expert_gpu_buffer.as_mut().unwrap();
+        let io = self.engine.expert_buffer.as_mut().unwrap();
         let mut miss_ei = [0usize; MAX_K];
         let mut miss_k_slot = [0usize; MAX_K];
         let mut miss_count = 0;
@@ -238,9 +238,9 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         let k = self.engine.k;
         
         let next_norm_info = if layer + 1 < C::NUM_LAYERS {
-            self.engine.model.wf.get_tensor_ptr(
+            self.engine.model.weight_file.get_tensor_ptr(
                 &format!("model.layers.{}.input_layernorm.weight", layer + 1))
-                .map(|p| (p as *const c_void, self.engine.gpu_wf.base as usize))
+                .map(|p| (p as *const c_void, self.engine.weight_buffer.base as usize))
         } else {
             None
         };
@@ -250,7 +250,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
 
     
         
-        let io = self.engine.expert_gpu_buffer.as_ref().unwrap();
+        let io = self.engine.expert_buffer.as_ref().unwrap();
 
         // Keep expert out buffers alive
         let actual_k = k.min(MAX_K);
@@ -262,7 +262,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_post_expert::<C>(
-                &self.engine.model.wf, self.engine.gpu_wf, self.engine.ctx, &enc, layer,
+                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc, layer,
                 &routing.expert_weights, routing.shared_gate_score,
                 &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
                 &io.expert_out, &io.shared_act, &io.shared_down, &io.combine_params,
@@ -302,8 +302,8 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
     // ── Final norm + LM head ───────────────────────────────────────────────
 
     fn final_norm_and_lm_head(&self, hidden: &mut [f32], logits: &mut [f32]) {
-        final_norm(&self.engine.model.wf, hidden, C::HIDDEN_DIM);
-        gpu_lm_head(&self.engine.model.wf, hidden, logits, self.engine.gpu_wf, self.engine.ctx);
+        final_norm(&self.engine.model.weight_file, hidden, C::HIDDEN_DIM);
+        gpu_lm_head(&self.engine.model.weight_file, hidden, logits, self.engine.weight_buffer, self.engine.ctx);
     }
 }
 
@@ -312,7 +312,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
 
 fn encode_pre_expert_linear(
     wf: &WeightFile,
-    gpu_wf: &WeightBuffer,
+    weight_buffer: &WeightBuffer,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer_idx: usize,
@@ -331,7 +331,7 @@ fn encode_pre_expert_linear(
     shared_inter: usize,
 ) {
     let c = ctx;
-    let gw = gpu_wf;
+    let gw = weight_buffer;
     debug_assert!(linear_idx < c.buf_conv_state.len(),
         "linear_idx {} out of bounds for buf_conv_state (len {})", linear_idx, c.buf_conv_state.len());
     debug_assert!(linear_idx < c.buf_delta_state.len(),
@@ -463,7 +463,7 @@ fn encode_pre_expert_linear(
 
 fn encode_pre_expert_full(
     wf: &WeightFile,
-    gpu_wf: &WeightBuffer,
+    weight_buffer: &WeightBuffer,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer: usize,
@@ -479,7 +479,7 @@ fn encode_pre_expert_full(
     shared_intermediate: usize,
 ) {
     let c = ctx;
-    let gw = gpu_wf;
+    let gw = weight_buffer;
     let hd = hidden_dim;
     let num_q = num_q_heads;
     let num_kv = num_kv_heads;
@@ -709,7 +709,7 @@ fn encode_pre_expert_full(
 
 fn encode_post_expert<C: ModelConfig>(
     wf: &WeightFile,
-    gpu_wf: &WeightBuffer,
+    weight_buffer: &WeightBuffer,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer_idx: usize,
@@ -774,7 +774,7 @@ fn encode_post_expert<C: ModelConfig>(
     }
 
     let sd_name = format!("{}.shared_expert.down_proj", prefix);
-    if !gpu_wf.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
+    if !weight_buffer.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
         shared_down_buf, 0, hidden_dim, shared_inter)
     {
         eprintln!("[fusedexp] WARNING: shared expert down_proj tensor not found: {}", sd_name);
@@ -824,7 +824,7 @@ fn encode_post_expert<C: ModelConfig>(
         let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(buf_moe), 0);
-        enc.set_buffer(1, Some(&gpu_wf.buf), norm_off);
+        enc.set_buffer(1, Some(&weight_buffer.buf), norm_off);
         enc.set_buffer(2, Some(sum_sq), 0);
         enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
         {
@@ -843,7 +843,7 @@ fn encode_post_expert<C: ModelConfig>(
 
 fn gpu_lm_head(
     wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
-    gpu_wf: &WeightBuffer, ctx: &MetalContext,
+    weight_buffer: &WeightBuffer, ctx: &MetalContext,
 ) {
     let x_buf = metal_buf_shared(&ctx.device, hidden.len() * 4);
     unsafe {
@@ -852,7 +852,7 @@ fn gpu_lm_head(
     let out_buf = metal_buf_shared(&ctx.device, logits.len() * 4);
     let cm = ctx.queue.new_command_buffer();
     let enc = cm.new_compute_command_encoder();
-    gpu_wf.encode_matvec_into(wf, ctx, &enc, "lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
+    weight_buffer.encode_matvec_into(wf, ctx, &enc, "lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
     enc.end_encoding();
     cm.commit();
     cm.wait_until_completed();
@@ -867,8 +867,8 @@ fn gpu_lm_head(
 pub struct FusedExp<'a, C: ModelConfig> {
     pub model: &'a Model,
     pub ctx: &'a MetalContext,
-    pub gpu_wf: &'a WeightBuffer,
-    pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    pub weight_buffer: &'a WeightBuffer,
+    pub expert_buffer: Option<&'a mut ExpertBuffer>,
     pub k: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
     _phantom: PhantomData<C>,
@@ -878,8 +878,8 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
     pub fn new(
         model: &'a Model,
         ctx: &'a MetalContext,
-        gpu_wf: &'a WeightBuffer,
-        expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+        weight_buffer: &'a WeightBuffer,
+        expert_buffer: Option<&'a mut ExpertBuffer>,
         k: usize,
     ) -> Result<Self, MoEError> {
         let c = &model.config;
@@ -892,8 +892,9 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
             get("linear_num_v_heads"), get("linear_num_k_heads"),
             get("linear_total_key"), get("linear_total_value"),
         ).map_err(MoEError::Config)?;
+        let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         Ok(FusedExp {
-            model, ctx, gpu_wf, expert_gpu_buffer, k,
+            model, ctx, weight_buffer, expert_buffer, k,
             timing: BTreeMap::new(),
             _phantom: PhantomData,
         })
@@ -935,7 +936,7 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
 
             let mut embed = vec![0.0f32; n * hd];
             for (i, &id) in input_ids.iter().enumerate() {
-                embed_lookup(&exec.engine.model.wf, id as usize, &mut embed[i * hd..(i + 1) * hd], C::HIDDEN_DIM);
+                embed_lookup(&exec.engine.model.weight_file, id as usize, &mut embed[i * hd..(i + 1) * hd], C::HIDDEN_DIM);
             }
 
             for (ti, _) in input_ids.iter().enumerate() {

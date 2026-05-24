@@ -1,6 +1,6 @@
 #[path = "math_util.rs"] mod math;
-pub mod engine;
-pub mod model;
+#[path = "engine.rs"] pub mod engine;
+#[path = "model.rs"] pub mod model;
 
 mod cache;
 mod constants;

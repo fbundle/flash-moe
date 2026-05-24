@@ -1,5 +1,8 @@
+#[path = "model/config.rs"]
 pub mod config;
+#[path = "model/expert.rs"]
 pub mod expert;
+#[path = "model/weights.rs"]
 pub mod weights;
 
 use std::io;
@@ -15,7 +18,7 @@ pub use self::expert::ExpertFile as ExpertFileType;
 
 pub struct Model {
     pub config: ModelConfig,
-    pub wf: WeightFile,
+    pub weight_file: WeightFile,
     pub expert_files: Vec<ExpertFile>,
 }
 
@@ -86,6 +89,6 @@ impl Model {
             num_layers, config.get_usize("hidden_dim").unwrap_or(0),
             config.get_usize("num_experts").unwrap_or(0), lz4_count
         );
-        Ok(Model { config, wf, expert_files })
+        Ok(Model { config, weight_file: wf, expert_files })
     }
 }

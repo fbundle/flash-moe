@@ -8,9 +8,8 @@ use pyo3::types::PyList;
 
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
-use crate::constants::{qwen35_35b, qwen35_35b_stripped};
 use crate::error::MoEError;
-use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, PipelineMode, ErasedEngine};
+use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, EngineEnum, DynEngine};
 use crate::engine::qwen35_moe::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
@@ -65,6 +64,18 @@ impl Cache {
         self.inner.reset();
     }
 
+    fn save(&self, path: &str) -> PyResult<()> {
+        self.inner.save(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        CoreCache::load(path)
+            .map(|c| Cache { inner: c })
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
     fn __repr__(&self) -> String {
         format!("Cache(pos={})", self.inner.pos)
     }
@@ -74,12 +85,12 @@ impl Cache {
 
 #[pyclass(unsendable)]
 pub struct Engine {
-    engine: Option<ErasedEngine>,
+    engine: Option<DynEngine>,
     model: Arc<CoreModel>,
     ctx: MetalContext,
     gpu_wf: WeightBuffer,
     expert_gpu_buffer: Option<ExpertBuffer>,
-    mode: PipelineMode,
+    engine_type: EngineEnum,
     k: usize,
     /// Engine-level telemetry: only populated when record_engine_telemetry(true).
     pub telemetry: BTreeMap<String, TelemetryValue>,
@@ -90,73 +101,24 @@ impl Engine {
     #[new]
     #[pyo3(signature = (model, pipeline_mode="FusedExp", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
-        let mode = match pipeline_mode {
-            "FusedExp" => PipelineMode::FusedExp,
-            "FusedExpStripped" => PipelineMode::FusedExpStripped,
+        let engine_type = match pipeline_mode {
+            "FusedExp" => EngineEnum::FusedExp,
+            "FusedExpStripped" => EngineEnum::FusedExpStripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "Unknown pipeline_mode: {}. Use FusedExp|FusedExpStripped", pipeline_mode
             ))),
         };
 
-        let is_stripped = matches!(mode, PipelineMode::FusedExpStripped);
-        let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
-             linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
-             hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
-             num_full_attn_layers, kv_dim, num_attn_heads, head_dim) =
-            if is_stripped {
-                (qwen35_35b_stripped::NUM_LAYERS, qwen35_35b_stripped::NUM_EXPERTS, qwen35_35b_stripped::NUM_EXPERTS_PER_TOK,
-                 qwen35_35b_stripped::NUM_LINEAR_LAYERS, qwen35_35b_stripped::LINEAR_CONV_DIM,
-                 qwen35_35b_stripped::LINEAR_NUM_V_HEADS, qwen35_35b_stripped::LINEAR_TOTAL_VALUE,
-                 qwen35_35b_stripped::LINEAR_KEY_DIM, qwen35_35b_stripped::LINEAR_VALUE_DIM,
-                 qwen35_35b_stripped::HIDDEN_DIM, qwen35_35b_stripped::SHARED_INTERMEDIATE,
-                 qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT,
-                 qwen35_35b_stripped::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b_stripped::NUM_KV_HEADS * qwen35_35b_stripped::HEAD_DIM,
-                 qwen35_35b_stripped::NUM_ATTN_HEADS, qwen35_35b_stripped::HEAD_DIM)
-            } else {
-                (qwen35_35b::NUM_LAYERS, qwen35_35b::NUM_EXPERTS, qwen35_35b::NUM_EXPERTS_PER_TOK,
-                 qwen35_35b::NUM_LINEAR_LAYERS, qwen35_35b::LINEAR_CONV_DIM,
-                 qwen35_35b::LINEAR_NUM_V_HEADS, qwen35_35b::LINEAR_TOTAL_VALUE,
-                 qwen35_35b::LINEAR_KEY_DIM, qwen35_35b::LINEAR_VALUE_DIM,
-                 qwen35_35b::HIDDEN_DIM, qwen35_35b::SHARED_INTERMEDIATE,
-                 qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT,
-                 qwen35_35b::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b::NUM_KV_HEADS * qwen35_35b::HEAD_DIM,
-                 qwen35_35b::NUM_ATTN_HEADS, qwen35_35b::HEAD_DIM)
-            };
+        let (ctx, gpu_wf, expert_gpu_buffer) = engine_type.init_gpu(&model.inner, k)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        let k = if k == 0 { num_experts_per_tok } else { k };
-        if k > num_experts_per_tok {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "k ({}) must not exceed model's num_experts_per_tok ({})", k, num_experts_per_tok
-            )));
-        }
-        let mut ctx = MetalContext::init()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("metal: {}", e)))?;
-        ctx.init_linear_attn_buffers(
-            num_linear_layers, linear_conv_dim, linear_num_v_heads,
-            linear_total_value, linear_key_dim, linear_value_dim,
-            hidden_dim, num_experts, shared_intermediate,
-            num_full_attn_layers, kv_dim,
-            num_attn_heads, head_dim,
-            num_attn_heads * 2 * head_dim,
-        );
-        let expert_gpu_buffer = Some(ctx.init_expert_buffers(
-            expert_size_4bit, hidden_dim, moe_intermediate, shared_intermediate,
-        ));
-        let gpu_wf = WeightBuffer::new(&ctx.device, &model.inner.wf);
-
-        eprintln!(
-            "[engine] {} layers hidden={} experts={} mode={}",
-            num_layers, hidden_dim, num_experts, pipeline_mode
-        );
         Ok(Engine {
             engine: None,
             model: model.inner.clone(),
             ctx,
             gpu_wf,
-            expert_gpu_buffer,
-            mode,
+            expert_gpu_buffer: Some(expert_gpu_buffer),
+            engine_type,
             k,
             telemetry: BTreeMap::new(),
         })
@@ -230,9 +192,9 @@ impl Engine {
         if self.engine.is_none() {
             // SAFETY: Engine is on the PyO3 heap (stable address).
             self.engine = Some(unsafe {
-                ErasedEngine::new(
+                DynEngine::new(
                     &self.model, &self.ctx, &self.gpu_wf,
-                    self.expert_gpu_buffer.as_mut(), self.k, self.mode,
+                    self.expert_gpu_buffer.as_mut(), self.k, self.engine_type,
                 )?
             });
         }
