@@ -4,7 +4,7 @@ import subprocess, sys, os, time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.5-35B-A3B-4bit")
+MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit")
 RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
 TOKEN_COUNTS = [20, 50, 100]
