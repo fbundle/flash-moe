@@ -57,13 +57,12 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 
 // ─── Execution context ─────────────────────────────────────────────────────
 
-struct ExecCtx<'b, 'a, 'c, C: ModelConfig> {
+struct ExecCtx<'b, 'a, C: ModelConfig> {
     engine: &'b mut FusedExp<'a, C>,
-    cache: &'c mut Cache,
     pending: Option<DeferredExperts>,
 }
 
-impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
+impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
     // ── Initialise GPU hidden buffers from embedding ────────────────────────
 
     fn init_hidden(&mut self, hidden: &[f32]) {
@@ -92,10 +91,10 @@ impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
 
     // ── op1: pre-expert (attention + gate projections) ─────────────────────
 
-    fn op1_wait(&mut self, layer: usize) -> GateScores {
+    fn op1_wait(&mut self, layer: usize, pos: usize) -> GateScores {
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         if is_full {
-            self.op1_wait_full(layer);
+            self.op1_wait_full(layer, pos);
         } else {
             self.op1_wait_linear(layer);
         }
@@ -113,7 +112,7 @@ impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
     }
 
     /// Full-attn op1: entirely on GPU — input_norm → QKV → Q/K norms → RoPE → KV-cache → attention → gate.
-    fn op1_wait_full(&mut self, layer: usize) {
+    fn op1_wait_full(&mut self, layer: usize, pos: usize) {
         let wf = &self.engine.model.wf;
         let gw = self.engine.gpu_wf;
         let c = self.engine.ctx;
@@ -125,10 +124,8 @@ impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
         let q_dim = num_q * head_dim;
         let q_proj_dim = q_dim * 2;
         let kv_dim = num_kv * head_dim;
-        let pos = self.cache.pos;
         let fa_idx = layer / FULL_ATTN_INTERVAL;
-        let cache_pos = self.cache.full(layer).len;
-        let seq_len = cache_pos + 1;
+        let seq_len = pos + 1;
 
         // Reuse pending op2 buffer from previous layer, or create new
         let mut pending = self.pending.take();
@@ -244,7 +241,7 @@ impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
                 enc.set_buffer(1, Some(vbuf), 0);
                 enc.set_buffer(2, Some(kc_buf), 0);
                 enc.set_buffer(3, Some(vc_buf), 0);
-                enc.set_bytes(4, 4, &(cache_pos as u32) as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &(pos as u32) as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &(kv_dim as u32) as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(
                     MTLSize::new(((kv_dim + 255) / 256) as u64, 1, 1),
@@ -368,12 +365,7 @@ impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
         cmd.wait_until_completed();
         drop(keep_alive);
 
-        // Update CPU-side KV-cache position tracking
-        {
-            let kv_cache = self.cache.full_mut(layer);
-            assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
-            kv_cache.len += 1;
-        }
+        assert!(pos < MAX_SEQ, "sequence position {} exceeds MAX_SEQ ({})", pos, MAX_SEQ);
     }
 
     /// Linear-attn op1: uses the pending op2 buffer (or creates a new one)
@@ -924,8 +916,9 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
 
         self.ctx.upload_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
+        let mut pos = cache.pos;
         {
-            let mut exec = ExecCtx { engine: self, cache, pending: None };
+            let mut exec = ExecCtx { engine: self, pending: None };
 
             let mut embed = vec![0.0f32; n * hd];
             for (i, &id) in input_ids.iter().enumerate() {
@@ -940,16 +933,18 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
                     if check_signal() {
                         return Err(MoEError::Metal("interrupted".into()));
                     }
-                    let gate_scores = exec.op1_wait(layer);
+                    let gate_scores = exec.op1_wait(layer, pos);
                     let routing = exec.route_experts(layer, gate_scores);
                     exec.op2(layer, &routing);
                 }
 
                 let mut hidden = exec.hidden_wait();
-                exec.cache.pos += 1;
+                pos += 1;
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vs..(ti + 1) * vs]);
             }
-        } // exec dropped — ends borrows of self + cache
+        } // exec dropped — ends borrow of self
+
+        cache.set_pos(pos);
 
         self.ctx.download_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 

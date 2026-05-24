@@ -73,14 +73,21 @@ impl Cache {
     pub fn lin_mut(&mut self, layer: usize) -> &mut LinearState { self.states[layer].as_linear_mut() }
 
     pub fn reset(&mut self) {
-        self.pos = 0;
+        self.set_pos(0);
         for s in &mut self.states {
-            match s {
-                State::Full(kv) => kv.len = 0,
-                State::Linear(ls) => {
-                    ls.conv_state.fill(0.0);
-                    ls.ssm_state.fill(0.0);
-                }
+            if let State::Linear(ls) = s {
+                ls.conv_state.fill(0.0);
+                ls.ssm_state.fill(0.0);
+            }
+        }
+    }
+
+    /// Set position and sync all full-attention layer lengths.
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+        for s in &mut self.states {
+            if let State::Full(kv) = s {
+                kv.len = pos;
             }
         }
     }
