@@ -9,9 +9,7 @@ use pyo3::types::PyList;
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
-use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, EngineEnum, DynEngine};
-use crate::engine::qwen35_moe::metal_context::{ExpertBuffer, WeightBuffer};
-use crate::engine::qwen35_moe::Qwen35MoEMetalContext;
+use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -86,14 +84,8 @@ impl Cache {
 
 #[pyclass(unsendable)]
 pub struct Engine {
-    engine: Option<DynEngine>,
+    engine: DynEngine,
     model: Arc<CoreModel>,
-    ctx: Qwen35MoEMetalContext,
-    weight_buffer: WeightBuffer,
-    expert_buffer: Option<ExpertBuffer>,
-    engine_type: EngineEnum,
-    k: usize,
-    /// Engine-level telemetry: only populated when record_engine_telemetry(true).
     pub telemetry: BTreeMap<String, TelemetryValue>,
 }
 
@@ -102,18 +94,11 @@ impl Engine {
     #[new]
     #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFused4bit", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
-        let (engine_type, ctx, weight_buffer, expert_buffer) =
-            EngineEnum::resolve_and_init(pipeline_mode, &model.inner, k)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
+        let engine = DynEngine::new(pipeline_mode, model.inner.clone(), k)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Engine {
-            engine: None,
+            engine,
             model: model.inner.clone(),
-            ctx,
-            weight_buffer,
-            expert_buffer: Some(expert_buffer),
-            engine_type,
-            k,
             telemetry: BTreeMap::new(),
         })
     }
@@ -141,15 +126,11 @@ impl Engine {
 
     /// Expose upload/download for callers that manage cache persistence.
     fn upload_cache(&self, cache: &Cache) {
-        if let Some(ref eng) = self.engine {
-            eng.upload_cache(&cache.inner);
-        }
+        self.engine.upload_cache(&cache.inner);
     }
 
     fn download_cache(&self, cache: &mut Cache) {
-        if let Some(ref eng) = self.engine {
-            eng.download_cache(&mut cache.inner);
-        }
+        self.engine.download_cache(&mut cache.inner);
     }
 
     /// Engine-level telemetry (only populated when record_engine_telemetry(true)).
@@ -183,27 +164,10 @@ impl Engine {
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        if self.engine.is_none() {
-            // SAFETY: Engine is on the PyO3 heap (stable address).
-            self.engine = Some(unsafe {
-                DynEngine::new(
-                    &self.model, &self.ctx, &self.weight_buffer,
-                    self.expert_buffer.as_mut(), self.k, self.engine_type,
-                )?
-            });
-        }
-        let eng = self.engine.as_mut().unwrap();
-        eng.upload_cache(cache);
-        let logits = eng.forward(input_ids, check_signal)?;
-        eng.download_cache(cache);
-        self.telemetry = eng.telemetry();
+        self.engine.upload_cache(cache);
+        let logits = self.engine.forward(input_ids, check_signal)?;
+        self.engine.download_cache(cache);
+        self.telemetry = self.engine.telemetry();
         Ok(logits)
-    }
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        // Drop engine before the fields it references (model, ctx, weight_buffer).
-        let _ = self.engine.take();
     }
 }

@@ -10,9 +10,9 @@
 use super::constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::marker::PhantomData;
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -74,8 +74,8 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 
 // ─── Execution context ─────────────────────────────────────────────────────
 
-struct ExecCtx<'b, 'a, C: ModelConfig> {
-    engine: &'b mut Fused4bitExp3<'a, C>,
+struct ExecCtx<'b, C: ModelConfig> {
+    engine: &'b mut Fused4bitExp3<C>,
     /// Deferred op2 from the previous layer — committed with this layer's op1.
     pending: Option<DeferredExperts>,
     /// Spare expert info from the previous layer — loaded while GPU runs op1.
@@ -84,7 +84,7 @@ struct ExecCtx<'b, 'a, C: ModelConfig> {
     spare_thread: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
 }
 
-impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
+impl<'b, C: ModelConfig> ExecCtx<'b, C> {
     // ── Initialise GPU hidden buffers from embedding ────────────────────────
 
     fn init_hidden(&mut self, hidden: &[f32]) {
@@ -154,7 +154,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         drop(keep_alive);
         self.pending = None;
 
-        let c = self.engine.ctx;
+        let c = &self.engine.ctx;
         let mut gate_scores = vec![0.0f32; C::NUM_EXPERTS];
         let shared_gate_score: f32;
         unsafe {
@@ -172,7 +172,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_pre_expert_full(
-                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc,
+                &self.engine.model.weight_file, &self.engine.weight_buffer, &self.engine.ctx, &enc,
                 layer, fa_idx, pos,
                 C::HIDDEN_DIM, C::NUM_ATTN_HEADS, C::NUM_KV_HEADS, C::HEAD_DIM,
                 C::ROTARY_DIM, C::ROPE_THETA as f32, C::NUM_EXPERTS, C::SHARED_INTERMEDIATE,
@@ -201,7 +201,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_pre_expert_linear(
-                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc, layer, linear_idx,
+                &self.engine.model.weight_file, &self.engine.weight_buffer, &self.engine.ctx, &enc, layer, linear_idx,
                 hidden_dim, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
                 key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
             );
@@ -228,7 +228,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         normalize_weights(&mut expert_weights);
 
         let actual_k = k.min(MAX_K);
-        let expert_buf = self.engine.expert_buffer.as_mut().unwrap();
+        let expert_buf = &mut self.engine.expert_buffer;
 
         // ── Primary K: cache lookup + sync SSD read ──
         let mut miss_ei = [0usize; MAX_K];
@@ -324,7 +324,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         let cmd = self.engine.ctx.queue.new_command_buffer().to_owned();
         let mut keep_alive = Vec::with_capacity(4);
 
-        let expert_buf = self.engine.expert_buffer.as_ref().unwrap();
+        let expert_buf = &self.engine.expert_buffer;
 
         let actual_k = k.min(MAX_K);
         for ki in 0..actual_k {
@@ -335,7 +335,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
         {
             let enc = cmd.new_compute_command_encoder();
             encode_post_expert::<C>(
-                &self.engine.model.weight_file, self.engine.weight_buffer, self.engine.ctx, &enc, layer,
+                &self.engine.model.weight_file, &self.engine.weight_buffer, &self.engine.ctx, &enc, layer,
                 &routing.expert_weights, routing.shared_gate_score,
                 &expert_buf.expert_data, &expert_buf.scratch_gate, &expert_buf.scratch_up, &expert_buf.scratch_act,
                 &expert_buf.expert_out, &expert_buf.shared_act, &expert_buf.shared_down, &expert_buf.combine_params,
@@ -424,7 +424,7 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
 
     fn final_norm_and_lm_head(&self, hidden: &mut [f32], logits: &mut [f32]) {
         final_norm(&self.engine.model.weight_file, hidden, C::HIDDEN_DIM);
-        gpu_lm_head(&self.engine.model.weight_file, hidden, logits, self.engine.weight_buffer, self.engine.ctx);
+        gpu_lm_head(&self.engine.model.weight_file, hidden, logits, &self.engine.weight_buffer, &self.engine.ctx);
     }
 }
 
@@ -946,36 +946,30 @@ fn gpu_lm_head(
 
 // ─── Fused4bitExp3 ──────────────────────────────────────────────────────
 
-pub struct Fused4bitExp3<'a, C: ModelConfig> {
-    pub model: &'a Model,
-    pub ctx: &'a MetalContext,
-    pub weight_buffer: &'a WeightBuffer,
-    pub expert_buffer: Option<&'a mut ExpertBuffer>,
+pub struct Fused4bitExp3<C: ModelConfig> {
+    pub model: Arc<Model>,
+    pub ctx: MetalContext,
+    pub weight_buffer: WeightBuffer,
+    pub expert_buffer: ExpertBuffer,
     pub k: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
     _phantom: PhantomData<C>,
 }
 
-impl<'a, C: ModelConfig> Fused4bitExp3<'a, C> {
-    pub fn new(
-        model: &'a Model,
-        ctx: &'a MetalContext,
-        weight_buffer: &'a WeightBuffer,
-        expert_buffer: Option<&'a mut ExpertBuffer>,
-        k: usize,
-    ) -> Result<Self, MoEError> {
-        let c = &model.config;
-        C::validate_config(c).map_err(MoEError::Config)?;
-        let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
+impl<C: ModelConfig> Fused4bitExp3<C> {
+    pub fn new(model: Arc<Model>, k: usize) -> Result<Self, MoEError> {
+        C::validate_config(&model.config).map_err(MoEError::Config)?;
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "Fused4bitExp3")?;
         Ok(Fused4bitExp3 {
-            model, ctx, weight_buffer, expert_buffer, k,
+            model, ctx, weight_buffer, expert_buffer,
+            k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
             timing: BTreeMap::new(),
             _phantom: PhantomData,
         })
     }
 }
 
-impl<'a, C: ModelConfig> Engine for Fused4bitExp3<'a, C> {
+impl<C: ModelConfig> Engine for Fused4bitExp3<C> {
     fn upload_cache(&self, cache: &Cache) {
         self.ctx.upload_cache(cache);
     }

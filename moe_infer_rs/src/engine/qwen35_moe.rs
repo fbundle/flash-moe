@@ -31,7 +31,7 @@ pub use fused_4bit_exp2::Fused4bitExp2 as Qwen35MoEFused4bitExp2;
 pub use fused_4bit_exp3::Fused4bitExp3;
 pub use fused_4bit_exp3::Fused4bitExp3 as Qwen35MoEFused4bitExp3;
 
-pub type Qwen35MoEFused4bitStripped<'a> = Fused4bit<'a, StrippedModel>;
-pub type Qwen35MoEFused4bitExp1Stripped<'a> = Fused4bitExp1<'a, StrippedModel>;
-pub type Qwen35MoEFused4bitExp2Stripped<'a> = Fused4bitExp2<'a, StrippedModel>;
-pub type Qwen35MoEFused4bitExp3Stripped<'a> = Fused4bitExp3<'a, StrippedModel>;
+pub type Qwen35MoEFused4bitStripped = Fused4bit<StrippedModel>;
+pub type Qwen35MoEFused4bitExp1Stripped = Fused4bitExp1<StrippedModel>;
+pub type Qwen35MoEFused4bitExp2Stripped = Fused4bitExp2<StrippedModel>;
+pub type Qwen35MoEFused4bitExp3Stripped = Fused4bitExp3<StrippedModel>;

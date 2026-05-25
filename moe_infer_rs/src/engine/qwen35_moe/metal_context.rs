@@ -379,7 +379,7 @@ impl MetalContext {
 impl MetalContext {
     /// One-shot initialization: create MetalContext, init buffers, wrap weight file.
     /// Returns (ctx, weight_buffer, expert_buffer) ready for engine construction.
-    pub fn init_gpu<C: super::constants::ModelConfig>(
+    pub fn new<C: super::constants::ModelConfig>(
         weight_file: &WeightFile,
         k: usize,
         label: &str,
