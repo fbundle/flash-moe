@@ -146,7 +146,7 @@ def main():
     )
     parser.add_argument(
         "--mode", default="Qwen35MoEBq4Exp2",
-        choices=["Cpu", "Qwen35MoEBq4Exp2"],
+        choices=["Cpu", "Qwen35MoEBq4Exp1", "Qwen35MoEBq4Exp2"],
         help="Pipeline mode",
     )
     parser.add_argument(
