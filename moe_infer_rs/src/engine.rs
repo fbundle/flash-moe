@@ -6,21 +6,6 @@ use crate::cache::Cache;
 use crate::error::MoEError;
 use crate::model::Model;
 
-#[path = "engine/qwen35_moe/constants.rs"]
-mod qwen35_constants;
-#[path = "engine/qwen35_moe/cpu.rs"]
-mod cpu;
-#[path = "engine/qwen35_moe/fused_4bit.rs"]
-mod fused_4bit;
-#[path = "engine/qwen35_moe/fused_4bit_exp1.rs"]
-mod fused_4bit_exp1;
-#[path = "engine/qwen35_moe/fused_4bit_exp2.rs"]
-mod fused_4bit_exp2;
-#[path = "engine/qwen35_moe/metal_context.rs"]
-pub mod metal_context;
-#[path = "engine/qwen35_moe/metal_kernels.rs"]
-mod metal_kernels;
-
 /// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
 pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
 
@@ -65,6 +50,20 @@ pub trait Engine {
 }
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
+#[path = "engine/qwen35_moe/constants.rs"]
+mod qwen35_constants;
+#[path = "engine/qwen35_moe/cpu.rs"]
+mod cpu;
+#[path = "engine/qwen35_moe/fused_4bit.rs"]
+mod fused_4bit;
+#[path = "engine/qwen35_moe/fused_4bit_exp1.rs"]
+mod fused_4bit_exp1;
+#[path = "engine/qwen35_moe/fused_4bit_exp2.rs"]
+mod fused_4bit_exp2;
+#[path = "engine/qwen35_moe/metal_context.rs"]
+pub mod metal_context;
+#[path = "engine/qwen35_moe/metal_kernels.rs"]
+mod metal_kernels;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_4bit::Fused4bit;
