@@ -84,17 +84,7 @@ let logits = engine.forward(&[1, 2, 3], &mut |_| false)?;
 
 ## Quantization
 
-Uniform 4-bit affine (group_size=64). All 2D weight matrices are packed as nibbles with per-group bf16 scale + bias. RMS norm weights, conv1d weights, dt_bias, and A_log remain bf16 or f32.
-
-Storage by dtype:
-
-| Dtype | Used for |
-|-------|----------|
-| uint32 (packed int4) | All Linear weight matrices: Q/K/V/O projections, expert gate/up/down, shared expert, lm_head, embed |
-| bf16 (uint16) | Per-group quantization scales/biases, RMS norm weights, conv1d weights, dt_bias |
-| f32 | A_log (SSM decay) |
-
-All compute is f32.
+See [`quant/README.md`](quant/README.md) for the BQ4 quantization scheme. Tensor names follow the MLX convention described in [`quant/name_mapping.json`](quant/name_mapping.json).
 
 ## Model Format
 
@@ -103,7 +93,7 @@ MoE-Infer expects a model directory with:
 ```
 model_dir/
 ├── config.json                 # HF config (read directly by Rust engine)
-├── model_weights.bin           # Mmap'd: all non-expert weights
+├── model_weights.bin           # Mmap'd: all non-expert weights (MLX naming)
 ├── model_weights.json          # Tensor manifest (name → offset, size, shape, dtype)
 ├── packed_experts/             # Per-layer expert files
 │   ├── layer_00.bin
@@ -115,6 +105,9 @@ model_dir/
 ├── tokenizer.json
 └── vocab.json
 ```
+
+Tensor names use the MLX convention: `language_model.model.layers.{L}.{block}.{kind}`.
+An HF→MLX name mapping is provided in [`quant/name_mapping.json`](quant/name_mapping.json).
 
 The engine auto-detects `packed_experts_lz4/` at load time and falls back to `packed_experts/`.
 
@@ -182,6 +175,11 @@ moe_infer_rs/                 Rust engine + Python bindings
         shaders.metal         Metal compute shaders (embedded via include_str!)
   Cargo.toml
   pyproject.toml
+
+quant/                        BQ4 quantization scheme and name mapping
+  README.md                   Block→format quantization policy
+  name_mapping.json           HF → MLX tensor name mapping (177 patterns)
+  verify_name_mapping.py      Check mapping covers all HF tensors
 
 helpers/                      Model conversion scripts
   quantize_from_hf.py         HF unquantized → MoE-Infer 4-bit format
