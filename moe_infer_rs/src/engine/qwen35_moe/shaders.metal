@@ -1232,7 +1232,7 @@ kernel void attn_sdpa_reduce(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_max = simd_max(tg_max[simd_lane]);
 
-    // Pass 2: rescale and sum block partials
+    // Pass 2: each SIMD group sums its strided subset of blocks
     float o_vals[V] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float global_sum = 0.0f;
 
@@ -1249,16 +1249,31 @@ kernel void attn_sdpa_reduce(
         }
     }
 
-    // Sum global_sum across SIMD groups via shared memory.
-    // All lanes in a SIMD group processed the same blocks, so global_sum
-    // is identical across lanes — no simd_sum needed for per-group sum.
+    // ── Merge o_vals and global_sum across SIMD groups ──
     threadgroup float tg_sum[BN];
+    threadgroup float tg_partial[BN * BD * V];  // 8 * 256 = 2048
+
+    // Publish per-group sums and partial outputs
     if (simd_lane == 0) {
         tg_sum[simd_group] = global_sum;
     }
+    for (uint j = 0; j < V; j++) {
+        tg_partial[simd_group * HEAD_DIM + elem_base + j] = o_vals[j];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float lane_sum = (simd_lane < BN) ? tg_sum[simd_lane] : 0.0f;
+
+    // Cross-group sum of global_sum
+    float lane_sum  = (simd_lane < BN) ? tg_sum[simd_lane] : 0.0f;
     global_sum = simd_sum(lane_sum);
+
+    // Cross-group sum of o_vals
+    for (uint j = 0; j < V; j++) {
+        float sum = 0.0f;
+        for (uint g = 0; g < BN; g++) {
+            sum += tg_partial[g * HEAD_DIM + elem_base + j];
+        }
+        o_vals[j] = sum;
+    }
 
     // Normalize and write
     for (uint j = 0; j < V; j++) {
