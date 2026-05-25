@@ -98,7 +98,7 @@ def main():
     # Results: dict[mode][n_tokens] -> (elapsed_ms, tok_s)
     results: dict[str, dict[int, tuple[float, float]]] = {}
 
-    all_modes = ["C"] + [f"Rust {m}" for m in RUST_MODES]
+    all_modes = [f"Rust {m}" for m in RUST_MODES] # + ["C"]
     for n in tqdm(TOKEN_COUNTS, desc="Token counts", unit="len"):
         for label in all_modes:
             tokens = random_tokens(n, seed=int(time.time()))
