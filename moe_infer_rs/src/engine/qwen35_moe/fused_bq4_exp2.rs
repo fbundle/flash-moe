@@ -30,8 +30,6 @@ use crate::math::{
     normalize_weights,
     softmax, topk,
 };
-use crate::constants::RMS_NORM_EPS as _RMS_NORM_EPS;
-
 // ─── BQ4 local: embed_lookup with MLX naming ────────────────────────────────
 
 fn embed_lookup_bq4(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
@@ -889,6 +887,17 @@ impl<C: ModelConfig> FusedBq4Exp2<C> {
     pub fn new(model: Arc<Model>, k: usize) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
         let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedBq4Exp2")?;
+
+        // // Debug: verify GPU matvec against CPU reference for key tensors
+        // eprintln!("[verify] === BF16 matvec verification ===");
+        // weight_buffer.verify_matvec(&model.weight_file, &ctx,
+        //     "language_model.model.layers.3.self_attn.q_proj",
+        //     C::NUM_ATTN_HEADS * 2 * C::HEAD_DIM, C::HIDDEN_DIM);
+        // eprintln!("[verify] === INT4 matvec verification ===");
+        // weight_buffer.verify_matvec(&model.weight_file, &ctx,
+        //     "language_model.model.layers.3.mlp.shared_expert.gate_proj",
+        //     C::SHARED_INTERMEDIATE, C::HIDDEN_DIM);
+
         Ok(FusedBq4Exp2 {
             model, ctx, weight_buffer, expert_buffer,
             k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
@@ -952,6 +961,7 @@ impl<C: ModelConfig> Engine for FusedBq4Exp2<C> {
                 let mut hidden = exec.hidden_wait();
                 pos += 1;
                 exec.engine.ctx.pos.set(pos);
+
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vocab_size..(ti + 1) * vocab_size]);
             }
         } // exec dropped — ends borrow of self

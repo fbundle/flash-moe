@@ -8,6 +8,7 @@ use crate::cache::Cache;
 use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
 use crate::engine::metal_kernels;
+use crate::math::bf16_to_f32;
 use crate::model::weights::WeightFile;
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
@@ -766,5 +767,125 @@ impl WeightBuffer {
             unsafe { let src = out_buf.contents() as *const f32; std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out_dim); }
         }
         ok
+    }
+
+    /// Debug: verify GPU matvec against CPU reference for a tensor.
+    /// Prints first N elements of both GPU and CPU results for comparison.
+    pub fn verify_matvec(
+        &self,
+        wf: &WeightFile,
+        ctx: &MetalContext,
+        prefix: &str,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let weight_name = format!("{}.weight", prefix);
+        let info = match wf.get_tensor_info(&weight_name) {
+            Some(i) => i,
+            None => {
+                eprintln!("[verify] tensor not found: {}", weight_name);
+                return;
+            }
+        };
+        let dtype = info.dtype.as_str();
+
+        // Test input: all ones → GPU output = row sums of weight matrix
+        let x: Vec<f32> = vec![1.0f32; in_dim];
+        let mut gpu_out = vec![0.0f32; out_dim];
+
+        if !self.matvec(wf, ctx, prefix, &x, &mut gpu_out, out_dim, in_dim) {
+            eprintln!("[verify] GPU matvec failed for {}", weight_name);
+            return;
+        }
+
+        // CPU reference
+        let mut cpu_out = vec![0.0f32; out_dim];
+
+        if dtype == "bf16" {
+            let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
+            let w_u16 = unsafe {
+                std::slice::from_raw_parts(w_ptr as *const u16, out_dim * in_dim)
+            };
+            for r in 0..out_dim {
+                let mut acc = 0.0f64;
+                for c in 0..in_dim {
+                    acc += bf16_to_f32(w_u16[r * in_dim + c]) as f64;
+                }
+                cpu_out[r] = acc as f32;
+            }
+        } else {
+            // INT4: dequantize and compute row sums
+            let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
+            let s_ptr = wf.get_tensor_ptr(&format!("{}.scales", prefix)).unwrap();
+            let b_ptr = wf.get_tensor_ptr(&format!("{}.biases", prefix)).unwrap();
+
+            let s_info = wf.get_tensor_info(&format!("{}.scales", prefix)).unwrap();
+            let num_groups = s_info.shape[1];
+            let group_size = in_dim / num_groups;
+            let packed_per_group = group_size / 8;
+
+            let w_u32 = unsafe {
+                std::slice::from_raw_parts(w_ptr as *const u32, out_dim * in_dim / 8)
+            };
+            let s_u16 = unsafe {
+                std::slice::from_raw_parts(s_ptr as *const u16, out_dim * num_groups)
+            };
+            let b_u16 = unsafe {
+                std::slice::from_raw_parts(b_ptr as *const u16, out_dim * num_groups)
+            };
+
+            for r in 0..out_dim {
+                let w_row = &w_u32[r * in_dim / 8..];
+                let s_row = &s_u16[r * num_groups..];
+                let b_row = &b_u16[r * num_groups..];
+
+                let mut acc = 0.0f64;
+                for g in 0..num_groups {
+                    let scale = bf16_to_f32(s_row[g]);
+                    let bias = bf16_to_f32(b_row[g]);
+                    for p in 0..packed_per_group {
+                        let packed = w_row[g * packed_per_group + p];
+                        for n in 0..8 {
+                            let nibble = (packed >> (n * 4)) & 0xF;
+                            acc += ((nibble as f32) * scale + bias) as f64;
+                        }
+                    }
+                }
+                cpu_out[r] = acc as f32;
+            }
+        }
+
+        // Compare
+        let n_show = 10usize.min(out_dim);
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f64;
+        let mut max_rel_diff = 0.0f32;
+
+        eprintln!("[verify] {} dtype={} out_dim={} in_dim={}",
+            weight_name, dtype, out_dim, in_dim);
+        for i in 0..n_show {
+            let diff = (gpu_out[i] - cpu_out[i]).abs();
+            let rel = if cpu_out[i].abs() > 1e-8 {
+                diff / cpu_out[i].abs()
+            } else {
+                0.0
+            };
+            eprintln!("[verify]   row {:4}: gpu={:12.8} cpu={:12.8} diff={:10.6} rel={:10.6}",
+                i, gpu_out[i], cpu_out[i], diff, rel);
+            max_diff = max_diff.max(diff);
+            sum_diff += diff as f64;
+            max_rel_diff = max_rel_diff.max(rel);
+        }
+
+        // Also check for NaN/Inf in GPU output
+        let mut nan_count = 0;
+        let mut inf_count = 0;
+        for i in 0..out_dim {
+            if gpu_out[i].is_nan() { nan_count += 1; }
+            if gpu_out[i].is_infinite() { inf_count += 1; }
+        }
+
+        eprintln!("[verify]   max_diff={:.8} avg_diff(first_{})={:.8} max_rel={:.8} nan={} inf={}",
+            max_diff, n_show, sum_diff / n_show as f64, max_rel_diff, nan_count, inf_count);
     }
 }

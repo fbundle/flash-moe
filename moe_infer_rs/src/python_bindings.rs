@@ -155,6 +155,34 @@ impl Engine {
     }
 }
 
+// ─── Quantize function ────────────────────────────────────────────────────────
+
+/// Full quantization pipeline: HF safetensors → BQ4 format.
+///
+/// Reads HuggingFace BF16 safetensors, classifies each weight tensor with
+/// BQ4 rules, quantizes, and writes ``model_weights.bin``,
+/// ``model_weights.json``, and ``packed_experts/layer_XX.bin``.
+#[pyfunction]
+#[pyo3(signature = (model_path, output_dir, name_mapping_path, *, qwen36=false, strip_layers=0, strip_experts=0))]
+pub fn quantize(
+    model_path: &str,
+    output_dir: &str,
+    name_mapping_path: &str,
+    qwen36: bool,
+    strip_layers: usize,
+    strip_experts: usize,
+) -> PyResult<()> {
+    crate::quantize_pipeline::run(
+        model_path,
+        output_dir,
+        name_mapping_path,
+        qwen36,
+        strip_layers,
+        strip_experts,
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
+
 // ─── Internal forward impl ─────────────────────────────────────────────────
 
 impl Engine {

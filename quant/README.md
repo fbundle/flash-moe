@@ -136,3 +136,17 @@ stored as `language_model.model.layers.{L}.mlp.gate.weight`.
 reroute a token from expert 47 to expert 231, wasting all subsequent expert
 computation.  The error multiplier makes this the most expensive quantization
 in the model per byte saved.
+
+## Qwen3.5 vs Qwen3.6 norm weight convention
+
+Qwen3.6 changed the convention for RMS norm weights: they are shifted by -1.0
+relative to Qwen3.5.  MLX-LM's sanitizer bakes a +1.0 correction into the
+quantized weights so the runtime formula `y = x * w` works for both.
+
+Our engines follow the **Qwen3.5 convention** (no runtime shift).  To quantize
+a Qwen3.6 model, pass `--qwen36` to `quantize.py` or `quantize_from_hf.py`.
+This normalizes the norm weights to Qwen3.5 convention at quantization time.
+
+Without `--qwen36` on a Qwen3.6 model, norm weights will be ~1.0 too low,
+causing all RMS norm operations to produce near-zero outputs and the model
+to generate garbage.

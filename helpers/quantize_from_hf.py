@@ -299,7 +299,7 @@ def repack_experts_layer(model_path: Path, header_cache: dict,
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
-def run(model_path_str: str, output_dir_str: str):
+def run(model_path_str: str, output_dir_str: str, *, qwen36: bool = False):
     model_path = Path(model_path_str)
     output_dir = Path(output_dir_str)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -436,8 +436,8 @@ def run(model_path_str: str, output_dir_str: str):
     total_bytes = 0
     tensor_count = 0
 
-    # Source: qwen3_5.py:318-324
-    # Norm keys that need +1.0 shift (MLX does y = x * (1 + w), we bake +1.0 into w)
+    # NOTE: Qwen3.6 norm weights are shifted by -1.0 vs Qwen3.5 convention.
+    # Pass --qwen36 to normalize them (+1.0) so engines can treat them uniformly.
     MLX_NORM_KEYS = (
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",
@@ -445,23 +445,12 @@ def run(model_path_str: str, output_dir_str: str):
         ".q_norm.weight",
         ".k_norm.weight",
     )
-    # MTP-specific norm keys that MLX filters out (via "mtp." skip) but we keep.
-    # These are also RMSNorm layers, same formula, so they need +1.0 shift too.
     MTP_NORM_KEYS = (
         ".hnorm.weight",
         ".enorm.weight",
         ".shared_head.norm.weight",
     )
     NORM_KEYS = MLX_NORM_KEYS + MTP_NORM_KEYS
-
-    # Source: qwen3_5.py:308-312 — shift norms when MTP weights present OR
-    # unsanitized conv1d (shape[-1] != 1). Raw HF conv1d is [C, 1, K] with K=4,
-    # so has_unsanitized_conv1d is always True for raw HF models.
-    has_unsanitized_conv1d = any(
-        "conv1d.weight" in k
-        for k in non_expert
-    )
-    should_shift_norm_weights = has_mtp or has_unsanitized_conv1d
 
     with open(bin_path, 'wb') as out_f:
         pbar = tqdm(sorted_non_expert, desc="Quantizing non-expert", unit="tensor")
@@ -523,8 +512,8 @@ def run(model_path_str: str, output_dir_str: str):
             else:
                 out_dtype = dtype
 
-                # Source: qwen3_5.py:328-330 — norm +1.0 shift
-                if should_shift_norm_weights and out_dtype == "BF16" \
+                # Qwen3.6 norm +1.0 shift: normalize to Qwen3.5 convention
+                if qwen36 and out_dtype == "BF16" \
                         and any(san_name.endswith(sk) for sk in NORM_KEYS):
                     f32_norm = bf16_bytes_to_f32(raw_data, shape)
                     f32_norm = f32_norm + 1.0
@@ -683,8 +672,10 @@ def main():
                         help='Path to HuggingFace model directory (with BF16 safetensors)')
     parser.add_argument('--output', type=str, default='data/models--Qwen--Qwen3.6-35B-A3B-4bit',
                         help='Output directory')
+    parser.add_argument('--qwen36', action='store_true',
+                        help='Apply +1.0 shift to norm weights (Qwen3.6 → 3.5 convention)')
     args = parser.parse_args()
-    run(args.model, args.output)
+    run(args.model, args.output, qwen36=args.qwen36)
 
 
 if __name__ == '__main__':
