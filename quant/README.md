@@ -2,8 +2,8 @@
 
 BQ4 classifies every weight tensor by its **block** — the dot-separated path
 before the last segment — and assigns a quantization format per block.
-Sensitive blocks stay full-precision; large, redundant blocks use NormalFloat
-4-bit (NF4).
+Sensitive blocks stay full-precision; large, redundant blocks use Wilkinson
+INT4 (wint4), a biased block-floating-point scheme.
 
 ## Naming convention
 
@@ -31,7 +31,7 @@ classification.
 ## Quantization rules
 
 ```haskell
-data Quant = FP16 | NF4 | BF16 | FP32
+data Quant = FP16 | INT4 | BF16 | FP32
 
 matrixTable :: String -> Quant
 matrixTable "self_attn.q_proj" = FP16
@@ -43,7 +43,8 @@ matrixTable "lm_head"          = FP16
 matrixTable "attn.qkv"         = FP16
 matrixTable "attn.proj"        = FP16
 matrixTable "patch_embed.proj" = FP16
-matrixTable _                  = NF4
+matrixTable "pos_embed"        = FP16
+matrixTable _                  = INT4
 
 bq4 :: String -> Quant
 bq4 name
@@ -58,54 +59,57 @@ bq4 name
     block          = stripLayerPrefix prefix
 ```
 
-1. **Scalar** (`A_log`) → FP32
-2. **Metadata** (`scales`, `biases`, `bias`, `dt_bias`) → BF16
-3. **Weight** — look up the block in the table.  If found, use the
-   table format; otherwise NF4.
+1. **Scalars** (`A_log`) → FP32
+2. **Vectors** (`scales`, `biases`, `bias`, `dt_bias`, and `weight` with ndim ≠ 2) → BF16
+3. **Matrices** (`weight` with ndim = 2) → look up the block in the matrix table.
+   If found, use the table format; otherwise INT4.
 
 ### Rationale
 
 **FP16 matrices** — attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`,
-`qkv`, `proj`) and routers (`mlp.gate`, `lm_head`).  Attention Q·Kᵀ amplifies
-quantization noise quadratically; router error misroutes tokens across 8
-expert passes; lm_head directly produces logits.
+`qkv`, `proj`), routers (`mlp.gate`, `lm_head`), projection embeddings
+(`patch_embed.proj`), and positional embeddings (`pos_embed`).  Attention Q·Kᵀ
+amplifies quantization noise quadratically; router error misroutes tokens across
+8 expert passes; lm_head directly produces logits.
 
-**NF4 matrices** — experts (`mlp.switch_mlp.*`, `mlp.shared_expert.*`), linear
+**INT4 matrices** — experts (`mlp.switch_mlp.*`, `mlp.shared_expert.*`), linear
 attention projections (`linear_attn.in_proj_*`, `out_proj`), embeddings
 (`embed_tokens`), vision FFN (`mlp.linear_fc*`), and MTP projection (`fc`).
 
-**BF16** — everything else: all vectors (norms, conv1d, pos_embed, dt_bias)
-and all quantization metadata (`scales`, `biases`, `bias`).
+**BF16** — everything else: all vectors (norms, conv1d, dt_bias) and all
+quantization metadata (`scales`, `biases`, `bias`).
 
-## NF4 encoding
+## Wilkinson INT4 (wint4)
 
-NF4 (4-bit NormalFloat) uses 16 non-uniform quantization levels optimised for
-a normal distribution.  The levels are equally probable under N(0,1) rather
-than equally spaced:
+Wilkinson INT4 is a biased block-floating-point scheme: each weight is
+`m × 2^E + B` where `m ∈ {0..15}` is a 4-bit mantissa, `E` is an integer
+exponent shared across the group, and `B` is a bias that centres the
+quantization grid on the group's actual value range.
 
-```
-[-1.0, -0.696, -0.525, -0.395, -0.284, -0.188, -0.101, -0.02,
-  0.02,  0.101,  0.188,  0.284,  0.395,  0.525,  0.696,  1.0]
-```
+The dequant formula is identical to standard INT4 (`nibble × scale + bias`),
+but the scale is constrained to a power of two: `scale = 2^E`.  This gives
+constant *relative* error across the group — a weight at 10.0 and one at 0.01
+get the same relative precision — unlike standard INT4 where the same absolute
+step applies to both.
 
 **Storage per group (64 weights):**
-- 32 bytes packed weights (4-bit indices into the NF4 LUT)
-- 2 bytes FP16 scale (no bias — NF4 is zero-centred)
-- Total: 34 bytes per group = 4.25 bits per weight
+- 32 bytes packed mantissas (4-bit, 8 per uint32, LSB-first)
+- 2 bytes FP16 scale (2^E)
+- 2 bytes BF16 bias (B)
+- Total: 36 bytes per group = 4.5 bits per weight
 
-Compare to the current INT4 scheme: 32 + 2 + 2 = 36 bytes = 4.5 bits per
-weight.  NF4 saves ~0.25 bits per weight *and* reduces quantization error.
+Same wire format as standard INT4.  No kernel change needed — `matvec_int4`
+already computes `nibble × scale + bias`.
 
 ## Kernel dispatch
 
 Dispatch lives in `WeightBuffer::encode_matvec_into()`.  Each tensor's dtype
 (from the weight manifest JSON) determines the Metal pipeline:
 
-| dtype   | Kernel                    | Dequant                                     |
-|---------|---------------------------|---------------------------------------------|
-| `"u32"` | `matvec_int4` (current)   | `nibble * scale + bias`                     |
-| `"nf4"` | `matvec_nf4`              | `NF4_LUT[nibble] * scale`                   |
-| `"f16"` | `matvec_fp16`             | direct dot product, no dequant              |
+| dtype   | Kernel             | Dequant                     |
+|---------|--------------------|-----------------------------|
+| `"u32"` | `matvec_int4`      | `nibble × scale + bias`     |
+| `"f16"` | `matvec_fp16`      | direct dot product, no dequant |
 
 No engine variant needed — one engine dispatches per-tensor.  Mixed
 quantization is a property of the weight file, not the runtime.
