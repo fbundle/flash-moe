@@ -2,7 +2,7 @@
 """
 quantize.py — Quantize HF BF16 Qwen3.5/3.6 MoE model using BQ4.
 
-Quantization is performed entirely in Rust via ``moe_infer.quantize()``.
+Quantization is performed entirely in Rust via ``moe_infer.qwen35_moe_bq4_quantize()``.
 The Python side only handles argument parsing and path resolution.
 
 Usage:
@@ -16,6 +16,8 @@ import os
 import sys
 
 import moe_infer
+
+mapping_path = "quant/name_mapping.json"
 
 
 def main():
@@ -32,9 +34,7 @@ def main():
                         help='Apply +1.0 shift to norm weights (Qwen3.6 → 3.5 convention)')
     args = parser.parse_args()
 
-    # Resolve name_mapping.json relative to this script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    mapping_path = os.path.join(script_dir, "name_mapping.json")
+    
     if not os.path.exists(mapping_path):
         print(f"ERROR: {mapping_path} not found", file=sys.stderr)
         sys.exit(1)
@@ -42,7 +42,7 @@ def main():
     strip_layers = 4 if args.strip else 0
     strip_experts = 4 if args.strip else 0
 
-    moe_infer.quantize(
+    moe_infer.qwen35_moe_bq4_quantize(
         args.model,
         args.output,
         mapping_path,

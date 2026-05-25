@@ -10,6 +10,7 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
+use crate::bq4::Bq4;
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -164,7 +165,7 @@ impl Engine {
 /// ``model_weights.json``, and ``packed_experts/layer_XX.bin``.
 #[pyfunction]
 #[pyo3(signature = (model_path, output_dir, name_mapping_path, *, qwen36=false, strip_layers=0, strip_experts=0))]
-pub fn quantize(
+pub fn qwen35_moe_bq4_quantize(
     model_path: &str,
     output_dir: &str,
     name_mapping_path: &str,
@@ -172,15 +173,24 @@ pub fn quantize(
     strip_layers: usize,
     strip_experts: usize,
 ) -> PyResult<()> {
-    crate::quantize_pipeline::run(
-        model_path,
-        output_dir,
-        name_mapping_path,
-        qwen36,
-        strip_layers,
-        strip_experts,
-    )
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    // Read architectures from model config.json
+    let config_path = std::path::Path::new(model_path).join("config.json");
+    let arch = std::fs::read_to_string(&config_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+        .and_then(|s| {
+            let v: serde_json::Value = serde_json::from_str(&s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let arch = v["architectures"][0].as_str()
+                .unwrap_or("Qwen3_5MoeForConditionalGeneration");
+            Ok(arch.to_string())
+        })?;
+    let quantize = match arch.as_str() {
+        "Qwen3_5MoeForConditionalGeneration" =>
+            Bq4::new(name_mapping_path, qwen36, strip_layers, strip_experts),
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unknown architecture: {}", arch))),
+    };
+    quantize.quantize(model_path, output_dir)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 
 // ─── Internal forward impl ─────────────────────────────────────────────────

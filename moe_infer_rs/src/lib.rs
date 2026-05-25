@@ -5,8 +5,8 @@
 mod cache;
 mod constants;
 mod error;
-mod quantize;
-mod quantize_pipeline;
+mod quant;
+#[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 mod timer;
 
 #[cfg(feature = "python-bindings")]
@@ -21,6 +21,6 @@ fn moe_infer(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     m.add_class::<python_bindings::Engine>()?;
     m.add_class::<python_bindings::Cache>()?;
     m.add_function(wrap_pyfunction!(python_bindings::record_engine_telemetry, m)?)?;
-    m.add_function(wrap_pyfunction!(python_bindings::quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::qwen35_moe_bq4_quantize, m)?)?;
     Ok(())
 }

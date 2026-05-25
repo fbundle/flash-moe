@@ -132,8 +132,8 @@ class Conversation:
 
 
 def main():
-    default_tokenizer = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
-    default_model = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
+    default_tokenizer = "hub/models--Qwen--Qwen3.6-35B-A3B"
+    default_model = "data/models--Qwen--Qwen3.6-35B-A3B-bq4"
 
     parser = argparse.ArgumentParser(description="MoE-Infer interactive chat")
     parser.add_argument(

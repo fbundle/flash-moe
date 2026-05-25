@@ -3,47 +3,37 @@
 BQ4 classifies every weight tensor by its **block** — the dot-separated path
 before the last segment — and assigns a quantization format per block.
 Sensitive blocks stay BF16; large, redundant blocks use affine INT4;
-some blocks use symmetric per-channel INT8.
+the lm_head uses per-channel symmetric INT8.
 
-## Naming convention
+## Code structure
 
-Tensors follow the MLX convention (`language_model.` prefix).  Split on the
-**last dot**: everything before is the block, the last segment is the kind.
-Blocks may contain dots; kinds never do.
+| File | Concern |
+|------|---------|
+| `moe_infer_rs/src/quant.rs` | `Quant` enum + dtype strings + BF16/INT4/INT8 encode/decode |
+| `moe_infer_rs/src/quantize/qwen35_moe/bq4.rs` | Model-specific: `bq4()` classification, HF→BQ4 pipeline, `Bq4` struct |
+| `moe_infer_rs/src/engine/qwen35_moe/metal_context.rs` | Reads dtype → dispatches GPU kernel via `string_to_quant()` |
+| `quant/quantize.py` | CLI, calls `moe_infer.qwen35_moe_bq4_quantize()` |
 
-```
-language_model.model.layers.{L}. self_attn.q_proj.  weight
-└─────────── prefix ───────────┘└──── block ─────┘└─ kind ─┘
-
-language_model.model.layers.{L}.  mlp.switch_mlp.gate_proj.  weight
-└─────────── prefix ───────────┘└────────── block ────────┘ └ kind ┘
-
-language_model. lm_head. weight
-└── prefix ───┘└ block ┘└ kind ┘
-```
-
-Kinds are one of: `weight`, `scales`, `biases`, `bias`, `A_log`, `dt_bias`.
-
-The prefix (`language_model.model.layers.{L}.`, `vision_tower.blocks.{B}.`,
-`mtp.layers.{L}.`, etc.) is stripped to get the **relative block** used for
-classification.
+`quant.rs` only deals with binary format concerns.  Model-specific naming
+conventions, sanitization (Qwen3.6 norm shift), and the `bq4()` classifier
+live in `bq4.rs`.
 
 ## Quantization rules
 
 ```haskell
-data Quant = BF16 | BF16Pass | INT4 | INT8 | FP32
+data Quant = FP32 | BF16 | INT4 | INT8
 
 matrixTable :: String -> Quant
-matrixTable "self_attn.q_proj" = BF16Pass
-matrixTable "self_attn.k_proj" = BF16Pass
-matrixTable "self_attn.v_proj" = BF16Pass
-matrixTable "self_attn.o_proj" = BF16Pass
-matrixTable "mlp.gate"         = BF16Pass
-matrixTable "lm_head"          = INT8          -- per-channel symmetric
-matrixTable "attn.qkv"         = BF16Pass
-matrixTable "attn.proj"        = BF16Pass
-matrixTable "patch_embed.proj" = BF16Pass
-matrixTable "pos_embed"        = BF16Pass
+matrixTable "self_attn.q_proj" = BF16
+matrixTable "self_attn.k_proj" = BF16
+matrixTable "self_attn.v_proj" = BF16
+matrixTable "self_attn.o_proj" = BF16
+matrixTable "mlp.gate"         = BF16
+matrixTable "attn.qkv"         = BF16
+matrixTable "attn.proj"        = BF16
+matrixTable "patch_embed.proj" = BF16
+matrixTable "pos_embed"        = BF16
+matrixTable "lm_head"          = INT8    -- per-channel symmetric
 matrixTable _                  = INT4
 
 bq4 :: String -> Quant
@@ -66,12 +56,13 @@ bq4 name
 
 ### Rationale
 
-**BF16Pass matrices** — attention projections (`q_proj`, `k_proj`, `v_proj`,
+**BF16 matrices** — attention projections (`q_proj`, `k_proj`, `v_proj`,
 `o_proj`, `qkv`, `proj`), router (`mlp.gate`), projection embeddings
 (`patch_embed.proj`), and positional embeddings (`pos_embed`).  Attention Q·Kᵀ
 amplifies quantization noise quadratically; router error misroutes tokens across
-expert passes.  BF16Pass skips sanitization (no norm shift or moveaxis) since
-these are pure 2D weight matrices.
+expert passes.  Sanitization (norm shift, conv1d moveaxis) is skipped for these
+since they are pure 2D weight matrices — the pipeline checks `is_norm_key()`
+and `--qwen36` only for vectors.
 
 **INT4 matrices** — experts (`mlp.switch_mlp.*`, `mlp.shared_expert.*`),
 linear attention projections (`linear_attn.in_proj_*`, `out_proj`), embeddings
@@ -85,8 +76,23 @@ Motivation: the lm_head is the single largest matrix (~947 MB BF16 → ~484 MB
 INT8 + 0.97 MB scales), applied once at the final layer so quantization error
 does not compound.
 
-**BF16** — everything else: all vectors (norms, conv1d, dt_bias) and all
-quantization metadata (`scales`, `biases`, `bias`).
+**BF16 vectors** — norms, conv1d, dt_bias, and all quantization metadata
+(`scales`, `biases`, `bias`).
+
+### Naming convention and dtype strings
+
+`Quant::as_str()` defines the manifest dtype written into `model_weights.json`.
+`string_to_quant()` does the reverse at runtime.
+
+| Quant | `as_str()` | Storage |
+|-------|-----------|---------|
+| `Fp32` | `"f32"` | raw float32 |
+| `Bf16` | `"bf16"` | raw bfloat16 |
+| `Int4` | `"u32"` | packed uint32 + `{name}.scales` (bf16) + `{name}.biases` (bf16) |
+| `Int8` | `"u8"` | packed int8 + `{name}.scales` (f32) |
+
+Both the pipeline (writer) and the engine dispatch (reader) import from
+`crate::quant` — the strings are never duplicated.
 
 ## Affine INT4
 
@@ -119,10 +125,8 @@ w_q      = round(w_f32 / scale[i])   clamped to [-127, 127]
 
 Dequant: `w_f32 = int8(w_q) × scale[i]`
 
-No zero-point — symmetric around zero.  This keeps the GPU kernel simple
-(one multiply-add per element, no bias term) and matches the distribution
-characteristics of well-trained output projection weights, which tend to
-be roughly zero-centered.
+No zero-point — symmetric around zero.  The `matvec_int8` Metal kernel
+computes `sum += float(w_q) * scale[row] * x[col]` in one pass.
 
 **Storage for lm_head [248320, 2048]:**
 - 484 MB packed int8 weights
@@ -132,13 +136,13 @@ be roughly zero-centered.
 ## Kernel dispatch
 
 Dispatch lives in `WeightBuffer::encode_matvec_into()`.  Each tensor's dtype
-(from the weight manifest JSON) determines the Metal pipeline:
+(from the weight manifest JSON) is parsed via `string_to_quant()` and matched:
 
-| dtype    | Kernel                   | Dequant                             |
-|----------|--------------------------|-------------------------------------|
-| `"u32"`  | `dequant_matvec_4bit_*`  | `nibble × scale + bias` (per-group) |
-| `"bf16"` | `matvec_bf16`            | direct dot product, no dequant      |
-| `"u8"`   | `matvec_int8` **(planned)** | `int8(w) × scale[i]` (per-channel) |
+| `Quant` variant | Metal kernel | Dequant |
+|-----------------|-------------|---------|
+| `Bf16` | `matvec_bf16` | direct dot product |
+| `Int8` | `matvec_int8` | `int8(w) × scale[row]` |
+| `Int4` (default) | `dequant_matvec_4bit_v3` | `nibble × scale + bias` |
 
 No engine variant needed — one engine dispatches per-tensor.  Mixed
 quantization is a property of the weight file, not the runtime.
@@ -149,27 +153,10 @@ Split on the last dot to get the block and kind, then feed the name through
 `bq4` above.  The resulting `Quant` is written as the `dtype` in the manifest
 JSON.
 
-The `.weight` suffix is **preserved** in the manifest for BF16/BF16Pass/INT8
-1D and 2D weight tensors (e.g. `language_model.model.layers.0.input_layernorm.weight`).
+The `.weight` suffix is **preserved** in the manifest for BF16 and INT8
+weight tensors (e.g. `language_model.model.layers.0.input_layernorm.weight`).
 For INT4 tensors, the suffix is stripped to form a base name, then three
 separate entries are written: `{.weight, .scales, .biases}`.
-
-## Expert router
-
-The expert router is a single linear projection `W_gate ∈ R[num_experts × hidden_dim]`
-stored as `language_model.model.layers.{L}.mlp.gate.weight`.
-
-**Forward pass:**
-1. Post-attention hidden state is RMS-normed to produce `h ∈ R[hidden_dim]`
-2. GPU: `scores = W_gate · h` (into `buf_gate_scores`), executed inside the
-   op1 encoder alongside attention projections
-3. CPU: softmax → top-k → normalize → select expert buffers
-
-**Why BF16Pass.**  The gate is `[256 × 2048]` = ~500K floats.  Quantizing it
-saves ~1.5MB total across all 40 layers — negligible.  But a single bit-flip
-can reroute a token from expert 47 to expert 231, wasting all subsequent expert
-computation.  The error multiplier makes this the most expensive quantization
-in the model per byte saved.
 
 ## Qwen3.5 vs Qwen3.6 norm weight convention
 
@@ -184,3 +171,11 @@ weights to Qwen3.5 convention at quantization time.
 Without `--qwen36` on a Qwen3.6 model, norm weights will be ~1.0 too low,
 causing all RMS norm operations to produce near-zero outputs and the model
 to generate garbage.
+
+## Adding a new model family
+
+1. Add a `Quantize` implementation in `src/quantize/<family>/` (struct with
+   model-specific `new()` params + a `quantize(input, output)` method).
+2. Add arch dispatch in `python_bindings::qwen35_moe_bq4_quantize()` (or add
+   a new Python-facing function).
+3. Add a `matrix_table` mapping for the model's PyTorch module names.

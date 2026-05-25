@@ -2,7 +2,7 @@
 //
 // Called from Python via a single `moe_infer.quantize()` function.
 
-use crate::quantize::{self, bq4, Quant, GROUP_SIZE};
+use crate::quant::{Quant, GROUP_SIZE, quant_f32_to_int4, quant_f32_to_int8, f32_to_bf16_u16, bf16_to_f32};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -10,12 +10,112 @@ use std::path::{Path, PathBuf};
 
 const ALIGN: u64 = 64;
 
+pub struct Bq4 {
+    name_mapping_path: String,
+    qwen36: bool,
+    strip_layers: usize,
+    strip_experts: usize,
+}
+
+impl Bq4 {
+    pub fn new(name_mapping_path: &str, qwen36: bool, strip_layers: usize, strip_experts: usize) -> Self {
+        Bq4 { name_mapping_path: name_mapping_path.to_string(), qwen36, strip_layers, strip_experts }
+    }
+}
+
+
 /// Check for Python Ctrl-C signal.  No-op when built without python-bindings.
 fn check_interrupt() -> Result<(), String> {
     #[cfg(feature = "python-bindings")]
     pyo3::Python::with_gil(|py| py.check_signals())
         .map_err(|e| format!("interrupted: {}", e))?;
     Ok(())
+}
+
+// ─── Name parsing & classification ───────────────────────────────────────────
+
+pub fn split_on_last_dot(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx + 1..]),
+        None => (name, ""),
+    }
+}
+
+pub fn strip_layer_prefix(name: &str) -> &str {
+    if let Some(after) = name.strip_prefix("language_model.model.layers.") {
+        return after.find('.').map_or(after, |d| &after[d + 1..]);
+    }
+    if let Some(after) = name.strip_prefix("language_model.") { return after; }
+    if let Some(after) = name.strip_prefix("vision_tower.blocks.") {
+        return after.find('.').map_or(after, |d| &after[d + 1..]);
+    }
+    if let Some(after) = name.strip_prefix("vision_tower.") { return after; }
+    if let Some(after) = name.strip_prefix("mtp.layers.") {
+        return after.find('.').map_or(after, |d| &after[d + 1..]);
+    }
+    if let Some(after) = name.strip_prefix("mtp.") { return after; }
+    name
+}
+
+pub fn matrix_table(block: &str) -> Quant {
+    match block {
+        "self_attn.q_proj" | "self_attn.k_proj" | "self_attn.v_proj" | "self_attn.o_proj"
+        | "mlp.gate" | "attn.qkv" | "attn.proj" | "patch_embed.proj" | "pos_embed" => Quant::Bf16,
+        "lm_head" => Quant::Int8,
+        _ => Quant::Int4,
+    }
+}
+
+pub fn bq4(mlx_name: &str, shape: &[usize]) -> Quant {
+    let (prefix, kind) = split_on_last_dot(mlx_name);
+    match kind {
+        "A_log" => { debug_assert!(shape.len() <= 1); Quant::Fp32 }
+        "scales" | "biases" | "bias" | "dt_bias" => { debug_assert!(shape.len() <= 2); Quant::Bf16 }
+        "weight" => {
+            if shape.len() != 2 { Quant::Bf16 }
+            else { matrix_table(strip_layer_prefix(prefix)) }
+        }
+        _ => panic!("unknown kind: {:?} in {}", kind, mlx_name),
+    }
+}
+
+pub fn classify_weight(mlx_name: &str, shape: &[usize]) -> String {
+    bq4(mlx_name, shape).as_str().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_on_last_dot() {
+        assert_eq!(split_on_last_dot("a.b.c.weight"), ("a.b.c", "weight"));
+        assert_eq!(split_on_last_dot("nodot"), ("nodot", ""));
+    }
+
+    #[test]
+    fn test_strip_layer_prefix() {
+        assert_eq!(strip_layer_prefix("language_model.model.layers.3.self_attn.q_proj"), "self_attn.q_proj");
+        assert_eq!(strip_layer_prefix("language_model.lm_head"), "lm_head");
+        assert_eq!(strip_layer_prefix("self_attn.q_proj"), "self_attn.q_proj");
+    }
+
+    #[test]
+    fn test_matrix_table() {
+        assert_eq!(matrix_table("self_attn.q_proj"), Quant::Bf16);
+        assert_eq!(matrix_table("lm_head"), Quant::Int8);
+        assert_eq!(matrix_table("mlp.switch_mlp.gate_up_proj"), Quant::Int4);
+    }
+
+    #[test]
+    fn test_bq4() {
+        assert_eq!(bq4("language_model.model.layers.0.self_attn.q_proj.weight", &[8192, 2048]), Quant::Bf16);
+        assert_eq!(bq4("language_model.model.layers.0.mlp.switch_mlp.gate_up_proj.weight", &[256, 2048]), Quant::Int4);
+        assert_eq!(bq4("language_model.model.layers.0.input_layernorm.weight", &[2048]), Quant::Bf16);
+        assert_eq!(bq4("language_model.model.layers.0.linear_attn.A_log", &[128]), Quant::Fp32);
+        assert_eq!(bq4("language_model.model.embed_tokens.scales", &[32, 32]), Quant::Bf16);
+    }
+
 }
 
 /// Extract layer index from tensor name.  Looks for `layers.{N}.` pattern.
@@ -285,7 +385,7 @@ fn bytes_to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
             for i in 0..n {
                 let lo = data[i * 2] as u16;
                 let hi = data[i * 2 + 1] as u16;
-                out.push(quantize::bf16_to_f32(lo | (hi << 8)));
+                out.push(bf16_to_f32(lo | (hi << 8)));
             }
             out
         }
@@ -353,17 +453,12 @@ fn expert_pack_size(hd: usize, mi: usize) -> usize {
 
 // ─── Main pipeline ───────────────────────────────────────────────────────────
 
-pub fn run(
-    model_path: &str,
-    output_dir: &str,
-    name_mapping_path: &str,
-    qwen36: bool,
-    strip_layers: usize,
-    strip_experts: usize,
-) -> Result<(), String> {
-    let model_path = Path::new(model_path);
-    let output_dir = Path::new(output_dir);
-    let mapping_path = Path::new(name_mapping_path);
+impl Bq4 {
+    pub fn quantize(&self, input: &str, output: &str) -> Result<(), String> {
+    
+    let model_path = Path::new(input);
+    let output_dir = Path::new(output);
+    let mapping_path = Path::new(&self.name_mapping_path);
 
     // ── 1. Load config ──────────────────────────────────────────────────
     let params = load_config(model_path)?;
@@ -472,10 +567,10 @@ pub fn run(
     );
 
     // ── 4b. Strip mode ──────────────────────────────────────────────────
-    let (eff_num_layers, eff_num_experts) = if strip_layers > 0 {
-        let sl = strip_layers;
-        let se = if strip_experts > 0 {
-            strip_experts
+    let (eff_num_layers, eff_num_experts) = if self.strip_layers > 0 {
+        let sl = self.strip_layers;
+        let se = if self.strip_experts > 0 {
+            self.strip_experts
         } else {
             num_experts
         };
@@ -558,7 +653,7 @@ pub fn run(
     ins!("linear_conv_kernel_dim", params.linear_conv_kernel_dim);
     ins!("partial_rotary_factor", params.partial_rotary_factor);
     ins!("rope_theta", params.rope_theta);
-    ins!("mtp_num_hidden_layers", if strip_layers > 0 { 0 } else { mtp_layers });
+    ins!("mtp_num_hidden_layers", if self.strip_layers > 0 { 0 } else { mtp_layers });
 
     // Layer types
     let layer_types: Vec<String> = (0..eff_num_layers.min(num_main_layers))
@@ -622,8 +717,11 @@ pub fn run(
         let mut out_shape = shape.clone();
 
         // ── Sanitize (BF16 only) ────────────────────────────────────
-        if q.needs_sanitization() {
-            if qwen36 && is_norm_key(&mlx_name) {
+        // Qwen3.6 norm weights are shifted by -1.0 vs Qwen3.5 convention;
+        // --qwen36 flag applies the correction here.  conv1d.weight
+        // uses a different axis layout in HF (C,K,S) vs MLX (C,S,K).
+        if q == Quant::Bf16 {
+            if self.qwen36 && is_norm_key(&mlx_name) {
                 for v in &mut f32_vals {
                     *v += 1.0;
                 }
@@ -672,7 +770,7 @@ pub fn run(
         match q {
             Quant::Int4 => {
                 let (packed, scales, biases) =
-                    quantize::quant_f32_to_int4(&f32_padded, out_dim, padded_in);
+                    quant_f32_to_int4(&f32_padded, out_dim, padded_in);
                 let num_groups = padded_in / GROUP_SIZE;
 
                 let packed_bytes: Vec<u8> =
@@ -736,7 +834,7 @@ pub fn run(
             }
             Quant::Int8 => {
                 let (packed, scales) =
-                    quantize::quant_f32_to_int8(&f32_padded, out_dim, in_dim);
+                    quant_f32_to_int8(&f32_padded, out_dim, in_dim);
 
                 // Convert Vec<i8> → bytes (safe: transmute is fine for i8)
                 let packed_bytes: Vec<u8> = unsafe {
@@ -774,8 +872,8 @@ pub fn run(
                     tensor_count += 1;
                 }
             }
-            Quant::Bf16 | Quant::Bf16Pass => {
-                let bf16 = quantize::f32_to_bf16_u16(&f32_padded);
+            Quant::Bf16 => {
+                let bf16 = f32_to_bf16_u16(&f32_padded);
                 let data: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let dlen = data.len() as u64;
                 out_f.write_all(&data).map_err(|e| e.to_string())?;
@@ -906,10 +1004,10 @@ pub fn run(
             let down_base = e * (hidden * inter);
             let down_f32_e: Vec<f32> = down_f32[down_base..down_base + hidden * inter].to_vec();
 
-            let (gate_p, gate_s, gate_b) = quantize::quant_f32_to_int4(&gate_f32, inter, hidden);
-            let (up_p, up_s, up_b) = quantize::quant_f32_to_int4(&up_f32, inter, hidden);
+            let (gate_p, gate_s, gate_b) = quant_f32_to_int4(&gate_f32, inter, hidden);
+            let (up_p, up_s, up_b) = quant_f32_to_int4(&up_f32, inter, hidden);
             let (down_p, down_s, down_b) =
-                quantize::quant_f32_to_int4(&down_f32_e, hidden, inter);
+                quant_f32_to_int4(&down_f32_e, hidden, inter);
 
             let base = e * expert_size;
 
@@ -994,4 +1092,5 @@ pub fn run(
     eprintln!("============================================================");
 
     Ok(())
+}
 }

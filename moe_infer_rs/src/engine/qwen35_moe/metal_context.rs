@@ -10,6 +10,7 @@ use crate::error::MoEError;
 use crate::engine::metal_kernels;
 use crate::math::bf16_to_f32;
 use crate::model::weights::WeightFile;
+use crate::quant::{Quant, string_to_quant};
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
 
@@ -700,42 +701,43 @@ impl WeightBuffer {
         };
         let w_off = (w_ptr as usize - self.base as usize) as u64;
 
-        // BQ4 dispatch: check dtype to choose kernel
+        // BQ4 dispatch: parse dtype string → Quant → choose kernel
         let dtype = wf.get_tensor_info(&weight_name)
             .map(|info| info.dtype.as_str())
             .unwrap_or("u32");
+        let q = string_to_quant(dtype);
 
-        if dtype == "bf16" {
-            // Direct BF16 matvec (attention, routers — no dequant)
-            metal_kernels::encode_matvec_bf16_offset(
-                ctx, encoder,
-                &self.buf, w_off,
-                x_buf, x_offset, out_buf, out_offset,
-                out_dim as u32, in_dim as u32,
-            );
-            return true;
+        match q {
+            Some(Quant::Bf16) => {
+                metal_kernels::encode_matvec_bf16_offset(
+                    ctx, encoder,
+                    &self.buf, w_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32,
+                );
+                return true;
+            }
+            Some(Quant::Int8) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
+                    }
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_matvec_int8_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32,
+                );
+                return true;
+            }
+            _ => {} // INT4 or unknown → fall through
         }
 
-        if dtype == "u8" {
-            // INT8 per-channel symmetric matvec (lm_head)
-            let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
-                Some(p) => p,
-                None => {
-                    eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
-                    return false;
-                }
-            };
-            let s_off = (s_ptr as usize - self.base as usize) as u64;
-            metal_kernels::encode_matvec_int8_offset(
-                ctx, encoder,
-                &self.buf, w_off, &self.buf, s_off,
-                x_buf, x_offset, out_buf, out_offset,
-                out_dim as u32, in_dim as u32,
-            );
-            return true;
-        }
-
-        // Default: INT4 dequant matvec
+        // INT4 dequant matvec
         let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
             Some(p) => p,
             None => {
@@ -823,7 +825,9 @@ impl WeightBuffer {
         // CPU reference
         let mut cpu_out = vec![0.0f32; out_dim];
 
-        if dtype == "bf16" {
+        let q = string_to_quant(dtype);
+
+        if q == Some(Quant::Bf16) {
             let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
             let w_u16 = unsafe {
                 std::slice::from_raw_parts(w_ptr as *const u16, out_dim * in_dim)
