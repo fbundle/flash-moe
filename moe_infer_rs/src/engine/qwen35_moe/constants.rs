@@ -54,36 +54,38 @@ pub trait ModelConfig: 'static {
     const DOWN_B_SIZE: usize;
     const EXPECTED_ARCHITECTURE: &'static str;
 
-    fn validate_config(hidden_dim: usize, num_layers: usize, num_experts: usize,
-                       num_experts_per_tok: usize, moe_intermediate: usize,
-                       shared_intermediate: usize, num_attn_heads: usize,
-                       num_kv_heads: usize, head_dim: usize, vocab_size: usize,
-                       linear_num_v_heads: usize, linear_num_k_heads: usize,
-                       linear_total_key: usize, linear_total_value: usize,
-                       architectures_str: &str,
-    ) -> Result<(), String> {
+    fn validate_config(c: &crate::model::config::ModelConfig) -> Result<(), String> {
         let mut errs = Vec::new();
-        if !architectures_str.is_empty()
-            && !architectures_str.split(',').any(|a| a.trim() == Self::EXPECTED_ARCHITECTURE)
-        {
-            errs.push(format!(
-                "architecture mismatch: config={:?}, expected=\"{}\"",
-                architectures_str, Self::EXPECTED_ARCHITECTURE));
+        let get = |k| c.get_usize(k).unwrap_or(0);
+
+        let archs: Vec<&str> = c.resolve("architectures")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        if !archs.iter().any(|a| *a == Self::EXPECTED_ARCHITECTURE) {
+            errs.push(format!("architecture mismatch: found={:?}, expected=\"{}\"",
+                archs, Self::EXPECTED_ARCHITECTURE));
         }
-        if hidden_dim != Self::HIDDEN_DIM { errs.push(format!("hidden_dim: config={}, const={}", hidden_dim, Self::HIDDEN_DIM)); }
-        if num_layers != Self::NUM_LAYERS { errs.push(format!("num_layers: config={}, const={}", num_layers, Self::NUM_LAYERS)); }
-        if num_experts != Self::NUM_EXPERTS { errs.push(format!("num_experts: config={}, const={}", num_experts, Self::NUM_EXPERTS)); }
-        if num_experts_per_tok != Self::NUM_EXPERTS_PER_TOK { errs.push(format!("num_experts_per_tok: config={}, const={}", num_experts_per_tok, Self::NUM_EXPERTS_PER_TOK)); }
-        if moe_intermediate != Self::MOE_INTERMEDIATE { errs.push(format!("moe_intermediate: config={}, const={}", moe_intermediate, Self::MOE_INTERMEDIATE)); }
-        if shared_intermediate != Self::SHARED_INTERMEDIATE { errs.push(format!("shared_intermediate: config={}, const={}", shared_intermediate, Self::SHARED_INTERMEDIATE)); }
-        if num_attn_heads != Self::NUM_ATTN_HEADS { errs.push(format!("num_attn_heads: config={}, const={}", num_attn_heads, Self::NUM_ATTN_HEADS)); }
-        if num_kv_heads != Self::NUM_KV_HEADS { errs.push(format!("num_kv_heads: config={}, const={}", num_kv_heads, Self::NUM_KV_HEADS)); }
-        if head_dim != Self::HEAD_DIM { errs.push(format!("head_dim: config={}, const={}", head_dim, Self::HEAD_DIM)); }
-        if vocab_size != Self::VOCAB_SIZE { errs.push(format!("vocab_size: config={}, const={}", vocab_size, Self::VOCAB_SIZE)); }
-        if linear_num_v_heads != Self::LINEAR_NUM_V_HEADS { errs.push(format!("linear_num_v_heads: config={}, const={}", linear_num_v_heads, Self::LINEAR_NUM_V_HEADS)); }
-        if linear_num_k_heads != Self::LINEAR_NUM_K_HEADS { errs.push(format!("linear_num_k_heads: config={}, const={}", linear_num_k_heads, Self::LINEAR_NUM_K_HEADS)); }
-        if linear_total_key != Self::LINEAR_TOTAL_KEY { errs.push(format!("linear_total_key: config={}, const={}", linear_total_key, Self::LINEAR_TOTAL_KEY)); }
-        if linear_total_value != Self::LINEAR_TOTAL_VALUE { errs.push(format!("linear_total_value: config={}, const={}", linear_total_value, Self::LINEAR_TOTAL_VALUE)); }
+
+        let lnum_k = get("linear_num_key_heads");
+        let lkey_dim = get("linear_key_head_dim");
+        let lnum_v = get("linear_num_value_heads");
+        let lval_dim = get("linear_value_head_dim");
+
+        if get("hidden_size") != Self::HIDDEN_DIM { errs.push(format!("hidden_size: config={}, const={}", get("hidden_size"), Self::HIDDEN_DIM)); }
+        if get("num_hidden_layers") != Self::NUM_LAYERS { errs.push(format!("num_hidden_layers: config={}, const={}", get("num_hidden_layers"), Self::NUM_LAYERS)); }
+        if get("num_experts") != Self::NUM_EXPERTS { errs.push(format!("num_experts: config={}, const={}", get("num_experts"), Self::NUM_EXPERTS)); }
+        if get("num_experts_per_tok") != Self::NUM_EXPERTS_PER_TOK { errs.push(format!("num_experts_per_tok: config={}, const={}", get("num_experts_per_tok"), Self::NUM_EXPERTS_PER_TOK)); }
+        if get("moe_intermediate_size") != Self::MOE_INTERMEDIATE { errs.push(format!("moe_intermediate_size: config={}, const={}", get("moe_intermediate_size"), Self::MOE_INTERMEDIATE)); }
+        if get("shared_expert_intermediate_size") != Self::SHARED_INTERMEDIATE { errs.push(format!("shared_expert_intermediate_size: config={}, const={}", get("shared_expert_intermediate_size"), Self::SHARED_INTERMEDIATE)); }
+        if get("num_attention_heads") != Self::NUM_ATTN_HEADS { errs.push(format!("num_attention_heads: config={}, const={}", get("num_attention_heads"), Self::NUM_ATTN_HEADS)); }
+        if get("num_key_value_heads") != Self::NUM_KV_HEADS { errs.push(format!("num_key_value_heads: config={}, const={}", get("num_key_value_heads"), Self::NUM_KV_HEADS)); }
+        if get("head_dim") != Self::HEAD_DIM { errs.push(format!("head_dim: config={}, const={}", get("head_dim"), Self::HEAD_DIM)); }
+        if get("vocab_size") != Self::VOCAB_SIZE { errs.push(format!("vocab_size: config={}, const={}", get("vocab_size"), Self::VOCAB_SIZE)); }
+        if lnum_v != Self::LINEAR_NUM_V_HEADS { errs.push(format!("linear_num_value_heads: config={}, const={}", lnum_v, Self::LINEAR_NUM_V_HEADS)); }
+        if lnum_k != Self::LINEAR_NUM_K_HEADS { errs.push(format!("linear_num_key_heads: config={}, const={}", lnum_k, Self::LINEAR_NUM_K_HEADS)); }
+        if lnum_k * lkey_dim != Self::LINEAR_TOTAL_KEY { errs.push(format!("linear_total_key: config={}, const={}", lnum_k * lkey_dim, Self::LINEAR_TOTAL_KEY)); }
+        if lnum_v * lval_dim != Self::LINEAR_TOTAL_VALUE { errs.push(format!("linear_total_value: config={}, const={}", lnum_v * lval_dim, Self::LINEAR_TOTAL_VALUE)); }
         if errs.is_empty() { Ok(()) } else { Err(errs.join("; ")) }
     }
 }

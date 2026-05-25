@@ -965,16 +965,7 @@ impl<'a, C: ModelConfig> Fused4bitExp3<'a, C> {
         k: usize,
     ) -> Result<Self, MoEError> {
         let c = &model.config;
-        let get = |k| c.get_usize(k).unwrap_or(0);
-        C::validate_config(
-            get("hidden_dim"), get("num_layers"), get("num_experts"),
-            get("num_experts_per_tok"), get("moe_intermediate"),
-            get("shared_intermediate"), get("num_attn_heads"),
-            get("num_kv_heads"), get("head_dim"), get("vocab_size"),
-            get("linear_num_v_heads"), get("linear_num_k_heads"),
-            get("linear_total_key"), get("linear_total_value"),
-            c.get_str("architectures").unwrap_or(""),
-        ).map_err(MoEError::Config)?;
+        C::validate_config(c).map_err(MoEError::Config)?;
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         Ok(Fused4bitExp3 {
             model, ctx, weight_buffer, expert_buffer, k,

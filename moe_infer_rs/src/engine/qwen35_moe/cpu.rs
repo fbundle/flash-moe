@@ -66,16 +66,7 @@ pub struct CpuEngine<'a, C: ModelConfig> {
 impl<'a, C: ModelConfig> CpuEngine<'a, C> {
     pub fn new(model: &'a crate::model::Model, k: usize) -> Result<Self, MoEError> {
         let c = &model.config;
-        let get = |k| c.get_usize(k).unwrap_or(0);
-        C::validate_config(
-            get("hidden_dim"), get("num_layers"), get("num_experts"),
-            get("num_experts_per_tok"), get("moe_intermediate"),
-            get("shared_intermediate"), get("num_attn_heads"),
-            get("num_kv_heads"), get("head_dim"), get("vocab_size"),
-            get("linear_num_v_heads"), get("linear_num_k_heads"),
-            get("linear_total_key"), get("linear_total_value"),
-            c.get_str("architectures").unwrap_or(""),
-        ).map_err(MoEError::Config)?;
+        C::validate_config(c).map_err(MoEError::Config)?;
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         let cache = RefCell::new(Cache::new(c));
         Ok(CpuEngine { model, k, cache, _phantom: std::marker::PhantomData })

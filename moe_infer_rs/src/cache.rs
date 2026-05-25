@@ -36,15 +36,15 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(config: &ModelConfig) -> Self {
-        let num_layers = config.get_usize("num_layers").unwrap();
-        let num_kv_heads = config.get_usize("num_kv_heads").unwrap();
+        let num_layers = config.get_usize("num_hidden_layers").unwrap();
+        let num_kv_heads = config.get_usize("num_key_value_heads").unwrap();
         let head_dim = config.get_usize("head_dim").unwrap();
         let kv_dim = num_kv_heads * head_dim;
-        let lnum_v_heads = config.get_usize("linear_num_v_heads").unwrap();
-        let ltotal_key = config.get_usize("linear_total_key").unwrap();
-        let lnum_k_heads = config.get_usize("linear_num_k_heads").unwrap();
-        let ltotal_value = config.get_usize("linear_total_value").unwrap();
-        let lconv_dim = config.get_usize("linear_conv_dim").unwrap();
+        let lnum_v_heads = config.get_usize("linear_num_value_heads").unwrap();
+        let lnum_k_heads = config.get_usize("linear_num_key_heads").unwrap();
+        let ltotal_key = lnum_k_heads * config.get_usize("linear_key_head_dim").unwrap();
+        let ltotal_value = lnum_v_heads * config.get_usize("linear_value_head_dim").unwrap();
+        let lconv_dim = ltotal_key * 2 + ltotal_value;
 
         let mut states = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {

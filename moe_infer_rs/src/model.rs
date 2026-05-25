@@ -38,8 +38,10 @@ impl Model {
 
         let packed_dir = dir.join("packed_experts");
         let lz4_dir = dir.join("packed_experts_lz4");
-        let expert_size = config.get_usize("expert_size_4bit").unwrap();
-        let num_layers = config.get_usize("num_layers").unwrap();
+        let hd = config.get_usize("hidden_size").unwrap();
+        let mi = config.get_usize("moe_intermediate_size").unwrap();
+        let expert_size = config::expert_size_4bit(hd, mi, 64);
+        let num_layers = config.get_usize("num_hidden_layers").unwrap();
 
         let mut expert_files = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
@@ -86,7 +88,7 @@ impl Model {
         let lz4_count = expert_files.iter().filter(|e| matches!(e, ExpertFile::Lz4 { .. })).count();
         eprintln!(
             "[model] {} layers hidden={} experts={} lz4_layers={}",
-            num_layers, config.get_usize("hidden_dim").unwrap_or(0),
+            num_layers, hd,
             config.get_usize("num_experts").unwrap_or(0), lz4_count
         );
         Ok(Model { config, weight_file: wf, expert_files })

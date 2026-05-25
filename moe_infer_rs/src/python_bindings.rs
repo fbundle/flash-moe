@@ -38,8 +38,8 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!("Model({} layers, hidden={})",
-            self.inner.config.get_usize("num_layers").unwrap_or(0),
-            self.inner.config.get_usize("hidden_dim").unwrap_or(0))
+            self.inner.config.get_usize("num_hidden_layers").unwrap_or(0),
+            self.inner.config.get_usize("hidden_size").unwrap_or(0))
     }
 }
 
@@ -181,8 +181,8 @@ impl Engine {
 
     fn __repr__(&self) -> String {
         format!("Engine(loaded: {} layers, hidden={})",
-            self.model.config.get_usize("num_layers").unwrap_or(0),
-            self.model.config.get_usize("hidden_dim").unwrap_or(0))
+            self.model.config.get_usize("num_hidden_layers").unwrap_or(0),
+            self.model.config.get_usize("hidden_size").unwrap_or(0))
     }
 }
 
