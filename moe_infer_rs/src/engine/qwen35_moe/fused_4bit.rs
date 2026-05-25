@@ -1,5 +1,5 @@
 /// Qwen3.6-35B-A3B-4bit Fused4bit engine — all model dimensions are compile-time constants.
-use super::constants::ModelConfig;
+use crate::engine::qwen35_constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
 
-use crate::engine::qwen35_moe::metal_kernels;
-use crate::engine::qwen35_moe::metal_context::{metal_buf_shared, WeightBuffer, MetalContext, ExpertBuffer, MAX_K};
+use crate::engine::metal_kernels;
+use crate::engine::metal_context::{metal_buf_shared, WeightBuffer, MetalContext, ExpertBuffer, MAX_K};
 use crate::cache::Cache;
 use crate::engine::Engine;
 use crate::model::Model;

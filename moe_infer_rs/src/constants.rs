@@ -22,6 +22,3 @@ pub const GROUP_SIZE: usize = 64;
 
 /// Convolution kernel size for the linear attention conv1d step.
 pub const CONV_KERNEL_SIZE: usize = 4;
-
-// ─── Backward-compat re-exports ─────────────────────────────────────────
-// Removed — use engine::qwen35_moe::constants::{FullModel, StrippedModel} directly.

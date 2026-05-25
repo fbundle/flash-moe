@@ -3,7 +3,7 @@
 use ndarray::Array1;
 use std::cell::RefCell;
 
-use super::constants::ModelConfig;
+use crate::engine::qwen35_constants::ModelConfig;
 use crate::constants::{FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS, CONV_KERNEL_SIZE};
 use crate::cache::Cache;
 use crate::engine::{Engine, SignalCheckFn};

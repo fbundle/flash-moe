@@ -5,7 +5,7 @@ use metal::*;
 use std::ffi::c_void;
 
 use crate::constants::{ROWS_PER_TG, TG_SIZE};
-use crate::engine::qwen35_moe::metal_context::MetalContext;
+use crate::engine::metal_context::MetalContext;
 
 /// Helper: set a u32 constant buffer value at the given index.
 unsafe fn set_u32(encoder: &ComputeCommandEncoderRef, index: u64, value: u32) {

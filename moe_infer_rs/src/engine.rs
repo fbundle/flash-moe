@@ -3,14 +3,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::cache::Cache;
-use crate::engine::qwen35_moe::{Qwen35MoEFullModel, Qwen35MoEStrippedModel};
-use qwen35_moe::{Qwen35MoEFused4bit, Qwen35MoEFused4bitExp1, Qwen35MoEFused4bitExp2, Qwen35MoEFused4bitExp3};
-
 use crate::error::MoEError;
 use crate::model::Model;
 
-#[path = "engine/qwen35_moe.rs"]
-pub mod qwen35_moe;
+#[path = "engine/qwen35_moe/constants.rs"]
+mod qwen35_constants;
+#[path = "engine/qwen35_moe/cpu.rs"]
+mod cpu;
+#[path = "engine/qwen35_moe/fused_4bit.rs"]
+mod fused_4bit;
+#[path = "engine/qwen35_moe/fused_4bit_exp1.rs"]
+mod fused_4bit_exp1;
+#[path = "engine/qwen35_moe/fused_4bit_exp2.rs"]
+mod fused_4bit_exp2;
+#[path = "engine/qwen35_moe/metal_context.rs"]
+pub mod metal_context;
+#[path = "engine/qwen35_moe/metal_kernels.rs"]
+mod metal_kernels;
 
 /// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
 pub type SignalCheckFn<'a> = &'a mut dyn FnMut() -> bool;
@@ -55,9 +64,12 @@ pub trait Engine {
     }
 }
 
-// ─── Engine type ──────────────────────────────────────────────────────────────
-
 // ─── Type-erased engine ─────────────────────────────────────────────────────
+
+use crate::engine::qwen35_constants::{FullModel, StrippedModel};
+use crate::engine::fused_4bit::Fused4bit;
+use crate::engine::fused_4bit_exp1::Fused4bitExp1;
+use crate::engine::fused_4bit_exp2::Fused4bitExp2;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -77,21 +89,17 @@ impl DynEngine {
             .unwrap_or_default();
         let inner: Box<dyn Engine> = match (engine_type, arch) {
             ("Qwen35MoEFused4bit", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(Qwen35MoEFused4bit::<Qwen35MoEFullModel>::new(model, k)?),
+                Box::new(Fused4bit::<FullModel>::new(model, k)?),
             ("Qwen35MoEFused4bit", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(Qwen35MoEFused4bit::<Qwen35MoEStrippedModel>::new(model, k)?),
+                Box::new(Fused4bit::<StrippedModel>::new(model, k)?),
             ("Qwen35MoEFused4bitExp1", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(Qwen35MoEFused4bitExp1::<Qwen35MoEFullModel>::new(model, k)?),
+                Box::new(Fused4bitExp1::<FullModel>::new(model, k)?),
             ("Qwen35MoEFused4bitExp1", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(Qwen35MoEFused4bitExp1::<Qwen35MoEStrippedModel>::new(model, k)?),
+                Box::new(Fused4bitExp1::<StrippedModel>::new(model, k)?),
             ("Qwen35MoEFused4bitExp2", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(Qwen35MoEFused4bitExp2::<Qwen35MoEFullModel>::new(model, k)?),
+                Box::new(Fused4bitExp2::<FullModel>::new(model, k)?),
             ("Qwen35MoEFused4bitExp2", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(Qwen35MoEFused4bitExp2::<Qwen35MoEStrippedModel>::new(model, k)?),
-            ("Qwen35MoEFused4bitExp3", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(Qwen35MoEFused4bitExp3::<Qwen35MoEFullModel>::new(model, k)?),
-            ("Qwen35MoEFused4bitExp3", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(Qwen35MoEFused4bitExp3::<Qwen35MoEStrippedModel>::new(model, k)?),
+                Box::new(Fused4bitExp2::<StrippedModel>::new(model, k)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),

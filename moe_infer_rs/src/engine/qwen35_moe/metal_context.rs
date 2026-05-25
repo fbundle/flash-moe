@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::cache::Cache;
 use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
-use crate::engine::qwen35_moe::metal_kernels;
+use crate::engine::metal_kernels;
 use crate::model::weights::WeightFile;
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
@@ -379,7 +379,7 @@ impl MetalContext {
 impl MetalContext {
     /// One-shot initialization: create MetalContext, init buffers, wrap weight file.
     /// Returns (ctx, weight_buffer, expert_buffer) ready for engine construction.
-    pub fn new<C: super::constants::ModelConfig>(
+    pub fn new<C: crate::engine::qwen35_constants::ModelConfig>(
         weight_file: &WeightFile,
         k: usize,
         label: &str,

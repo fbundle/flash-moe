@@ -155,7 +155,7 @@ impl Engine {
     }
 }
 
-// ─── Internal forward impl (lazy-inits the inner engine) ────────────────────
+// ─── Internal forward impl ─────────────────────────────────────────────────
 
 impl Engine {
     fn forward_impl(
