@@ -428,27 +428,16 @@ fn encode_pre_expert_linear(
     let pnw_ptr = wf.get_tensor_ptr(&post_norm_name).unwrap();
     let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
     let temp_res = c.buf_temp_residual.as_ref().unwrap();
-    let post_sum = c.buf_post_sum_sq.as_ref().unwrap();
     {
-        enc.set_compute_pipeline_state(&c.rms_norm_sum);
-        enc.set_buffer(0, Some(temp_res), 0);
-        enc.set_buffer(1, Some(post_sum), 0);
-        enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
-    }
-    {
-        let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+        let pipe = c.rms_norm_fused_bf16.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(temp_res), 0);
         enc.set_buffer(1, Some(&gw.buf), post_norm_weight_off);
-        enc.set_buffer(2, Some(post_sum), 0);
-        enc.set_buffer(3, Some(c.buf_post_normed.as_ref().unwrap()), 0);
-        {
-            enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
-        }
+        enc.set_buffer(2, Some(c.buf_post_normed.as_ref().unwrap()), 0);
+        enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
         enc.dispatch_thread_groups(
-            metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+            metal::MTLSize::new(1, 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
     }
@@ -491,13 +480,11 @@ fn encode_pre_expert_full(
 
     let buf_moe = c.buf_moe_hidden.as_ref().unwrap();
     let qkv_x = c.buf_qkv_x.as_ref().unwrap();
-    let sum_sq = c.buf_post_sum_sq.as_ref().unwrap();
     let qbuf = c.buf_qkv_q.as_ref().unwrap();
     let kbuf = c.buf_qkv_k.as_ref().unwrap();
     let vbuf = c.buf_qkv_v.as_ref().unwrap();
     let q_out_buf = c.buf_attn_q.as_ref().unwrap();
     let q_gate_buf = c.buf_attn_q_gate.as_ref().unwrap();
-    let scores_buf = c.buf_attn_scores.as_ref().unwrap();
     let out_buf = c.buf_attn_out.as_ref().unwrap();
     let kc_buf = &c.buf_kv_k[fa_idx];
     let vc_buf = &c.buf_kv_v[fa_idx];
@@ -513,22 +500,16 @@ fn encode_pre_expert_full(
     let pnw_ptr = wf.get_tensor_ptr(
         &format!("model.layers.{}.input_layernorm.weight", layer)).unwrap();
     let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
-    enc.set_compute_pipeline_state(&c.rms_norm_sum);
-    enc.set_buffer(0, Some(buf_moe), 0);
-    enc.set_buffer(1, Some(sum_sq), 0);
-    enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
     {
-        let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+        let pipe = c.rms_norm_fused_bf16.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(buf_moe), 0);
         enc.set_buffer(1, Some(&gw.buf), post_norm_weight_off);
-        enc.set_buffer(2, Some(sum_sq), 0);
-        enc.set_buffer(3, Some(qkv_x), 0);
-        enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+        enc.set_buffer(2, Some(qkv_x), 0);
+        enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
         enc.dispatch_thread_groups(
-            MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+            MTLSize::new(1, 1, 1),
             MTLSize::new(256, 1, 1),
         );
     }
@@ -596,53 +577,19 @@ fn encode_pre_expert_full(
         );
     }
 
-    // ── attn_scores_batched ──
+    // ── Fused SDPA (scores + online softmax + values) ──
     {
-        let pipe = c.attn_scores_batched.as_ref().unwrap();
+        let pipe = c.attn_sdpa_fused.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(q_out_buf), 0);
         enc.set_buffer(1, Some(kc_buf), 0);
-        enc.set_buffer(2, Some(scores_buf), 0);
-        enc.set_bytes(3, 4, &(head_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(4, 4, &(kv_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(5, 4, &(seq_len as u32) as *const u32 as *const c_void);
-        enc.set_bytes(6, 4, &(MAX_SEQ as u32) as *const u32 as *const c_void);
+        enc.set_buffer(2, Some(vc_buf), 0);
+        enc.set_buffer(3, Some(out_buf), 0);
+        enc.set_bytes(4, 4, &(seq_len as u32) as *const u32 as *const c_void);
         let scale: f32 = 1.0 / (head_dim as f32).sqrt();
-        enc.set_bytes(7, 4, &scale as *const f32 as *const c_void);
-        enc.set_bytes(8, 4, &((num_q / num_kv) as u32) as *const u32 as *const c_void);
-        enc.set_bytes(9, 4, &(seq_len as u32) as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new((num_q as u32 * seq_len as u32) as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-    }
-    // ── attn_softmax_batched ──
-    {
-        let pipe = c.attn_softmax_batched.as_ref().unwrap();
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(scores_buf), 0);
-        enc.set_bytes(1, 4, &(seq_len as u32) as *const u32 as *const c_void);
-        enc.set_bytes(2, 4, &(MAX_SEQ as u32) as *const u32 as *const c_void);
+        enc.set_bytes(5, 4, &scale as *const f32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(num_q as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-    }
-    // ── attn_values_batched ──
-    {
-        let pipe = c.attn_values_batched.as_ref().unwrap();
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(scores_buf), 0);
-        enc.set_buffer(1, Some(vc_buf), 0);
-        enc.set_buffer(2, Some(out_buf), 0);
-        enc.set_bytes(3, 4, &(head_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(4, 4, &(kv_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(5, 4, &(seq_len as u32) as *const u32 as *const c_void);
-        enc.set_bytes(6, 4, &(MAX_SEQ as u32) as *const u32 as *const c_void);
-        enc.set_bytes(7, 4, &((num_q / num_kv) as u32) as *const u32 as *const c_void);
-        let total_threads = num_q as u32 * head_dim as u32;
-        enc.dispatch_thread_groups(
-            MTLSize::new(((total_threads + 255) / 256) as u64, 1, 1),
             MTLSize::new(256, 1, 1),
         );
     }
@@ -676,23 +623,15 @@ fn encode_pre_expert_full(
     // ── post_attention_layernorm ──
     let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer);
     {
-        enc.set_compute_pipeline_state(&c.rms_norm_sum);
-        enc.set_buffer(0, Some(temp_buf), 0);
-        enc.set_buffer(1, Some(sum_sq), 0);
-        enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-    }
-    {
         let pnw_ptr = wf.get_tensor_ptr(&post_norm_name).unwrap();
         let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
-        let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+        let pipe = c.rms_norm_fused_bf16.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(temp_buf), 0);
         enc.set_buffer(1, Some(&gw.buf), post_norm_weight_off);
-        enc.set_buffer(2, Some(sum_sq), 0);
-        enc.set_buffer(3, Some(normed_buf), 0);
-        enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-        enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+        enc.set_buffer(2, Some(normed_buf), 0);
+        enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
         enc.dispatch_thread_groups(
             MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
             MTLSize::new(256, 1, 1),
@@ -812,24 +751,16 @@ fn encode_post_expert<C: ModelConfig>(
     if let Some((norm_ptr, base)) = next_norm_weight {
         let norm_off = (norm_ptr as usize - base) as u64;
         let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
-        let sum_sq = ctx.buf_cmd3_sum_sq.as_ref().unwrap();
 
-        enc.set_compute_pipeline_state(&ctx.rms_norm_sum);
-        enc.set_buffer(0, Some(buf_moe), 0);
-        enc.set_buffer(1, Some(sum_sq), 0);
-        enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
-
-        let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
+        let pipe = ctx.rms_norm_fused_bf16.as_ref().unwrap();
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(buf_moe), 0);
         enc.set_buffer(1, Some(&weight_buffer.buf), norm_off);
-        enc.set_buffer(2, Some(sum_sq), 0);
-        enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
+        enc.set_buffer(2, Some(ctx.buf_input.as_ref().unwrap()), 0);
+        enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const c_void);
         {
-            enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const c_void);
             let eps = RMS_NORM_EPS;
-            enc.set_bytes(5, 4, &eps as *const f32 as *const c_void);
+            enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
         }
         enc.dispatch_thread_groups(
             metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),

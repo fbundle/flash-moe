@@ -175,10 +175,12 @@ pub struct MetalContext {
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
     pub rms_norm_sum: ComputePipelineState,
+    pub rms_norm_fused_bf16: Option<ComputePipelineState>,   // single-pass fused RMS norm
     pub rms_norm_apply_bf16: Option<ComputePipelineState>,
     pub residual_add: Option<ComputePipelineState>,
     pub sigmoid_gate: Option<ComputePipelineState>,
     pub moe_combine_residual: Option<ComputePipelineState>,
+    pub attn_sdpa_fused: Option<ComputePipelineState>,        // fused online-softmax SDPA
     pub attn_scores_batched: Option<ComputePipelineState>,
     pub attn_softmax_batched: Option<ComputePipelineState>,
     pub attn_values_batched: Option<ComputePipelineState>,
@@ -417,10 +419,12 @@ impl MetalContext {
             // Optional pipelines
             let matvec_fast = make_pipeline("dequant_matvec_4bit_fast").ok();
             let swiglu_vec4 = make_pipeline("swiglu_fused_vec4").ok();
+            let rms_norm_fused_bf16 = make_pipeline("rms_norm_fused_bf16").ok();
             let rms_norm_apply_bf16 = make_pipeline("rms_norm_apply_bf16").ok();
             let residual_add = make_pipeline("residual_add").ok();
             let sigmoid_gate = make_pipeline("sigmoid_gate").ok();
             let moe_combine_residual = make_pipeline("moe_combine_residual").ok();
+            let attn_sdpa_fused = make_pipeline("attn_sdpa_fused").ok();
             let attn_scores_batched = make_pipeline("attn_scores_batched").ok();
             let attn_softmax_batched = make_pipeline("attn_softmax_batched").ok();
             let attn_values_batched = make_pipeline("attn_values_batched").ok();
@@ -448,10 +452,12 @@ impl MetalContext {
                 swiglu,
                 swiglu_vec4,
                 rms_norm_sum,
+                rms_norm_fused_bf16,
                 rms_norm_apply_bf16,
                 residual_add,
                 sigmoid_gate,
                 moe_combine_residual,
+                attn_sdpa_fused,
                 attn_scores_batched,
                 attn_softmax_batched,
                 attn_values_batched,

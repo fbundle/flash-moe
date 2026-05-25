@@ -1,6 +1,12 @@
 /*
  * shaders.metal — Optimized Metal compute shaders for 4-bit quantized MoE inference
  *
+ * Sources:
+ *   - MLX SDPA / quantized kernels: https://github.com/ml-explore/mlx (Apple)
+ *     vendored at vendor/mlx/mlx/backend/metal/kernels/
+ *   - Metal Flash Attention: https://github.com/philipturner/metal-flash-attention
+ *     vendored at vendor/metal-flash-attention/
+ *
  * Core operations:
  *   1. dequant_matvec_4bit: Naive 4-bit affine dequant matvec (reference)
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
@@ -27,6 +33,14 @@
 
 #include <metal_stdlib>
 using namespace metal;
+
+// ============================================================================
+// Model dimension constants (Qwen3.5/3.6-35B-A3B)
+// ============================================================================
+#define HEAD_DIM        256
+#define NUM_KV_HEADS    2
+#define KV_DIM          (NUM_KV_HEADS * HEAD_DIM)  // 512
+#define HEADS_PER_KV    8
 
 // ============================================================================
 // BFloat16 helpers
@@ -739,7 +753,68 @@ kernel void weighted_sum(
 
 
 // ============================================================================
-// Kernel 4: RMS Normalization
+// Kernel 4: RMS Normalization — single-pass fused (MLX rms_single_row pattern)
+// ============================================================================
+//
+// Computes RMS norm in one pass: sum of squares → rsqrt → normalize with bf16 weight.
+// Eliminates the intermediate sum_sq buffer and second kernel dispatch.
+//
+// Dispatch: one threadgroup, 256 threads.  All threads cooperate on reduction.
+
+kernel void rms_norm_fused_bf16(
+    device const float*    x       [[buffer(0)]],
+    device const uint16_t* weight  [[buffer(1)]],  // bf16 weights
+    device float*          out     [[buffer(2)]],
+    constant uint&         dim     [[buffer(3)]],
+    constant float&        eps     [[buffer(4)]],
+    uint lid       [[thread_position_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float shared_sums[32];
+
+    // Pass 1: compute sum of squares
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float val = x[i];
+        acc += val * val;
+    }
+
+    // SIMD reduction
+    float simd_val = simd_sum(acc);
+    if (simd_lane == 0) {
+        shared_sums[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum_sq = 0.0f;
+    uint num_simd = (tg_size + 31) / 32;
+    if (simd_group == 0 && simd_lane < num_simd) {
+        sum_sq = simd_sum(shared_sums[simd_lane]);
+    }
+
+    // Broadcast sum_sq to all threads
+    threadgroup float broadcast_sum = 0.0f;
+    if (simd_group == 0 && simd_lane == 0) {
+        broadcast_sum = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum_sq = broadcast_sum;
+
+    // Compute rms
+    float inv_rms = metal::precise::rsqrt(sum_sq / float(dim) + eps);
+
+    // Pass 2: normalize and write output
+    for (uint i = lid; i < dim; i += tg_size) {
+        float w = bf16_to_f32(weight[i]);
+        out[i] = x[i] * inv_rms * w;
+    }
+}
+
+
+// ============================================================================
+// Kernel 4b: RMS Normalization — two-pass (legacy, kept for compat)
 // ============================================================================
 
 kernel void rms_norm_sum_sq(
@@ -836,7 +911,152 @@ kernel void residual_add(
 
 
 // ============================================================================
-// Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
+// Kernel 6: Fused SDPA — scores + online softmax + value aggregation
+// ============================================================================
+//
+// Replaces the three-kernel attn_scores/softmax/values pipeline with a single
+// fused kernel.  Adapted from MLX's sdpa_vector pattern.
+//
+// One threadgroup per query head (grid = [num_q, 1]).  Within the TG, 8 SIMD
+// groups split the KV sequence — each handles every 8th position.  Online
+// softmax (running max / exp-sum, base-2 exponents) avoids materializing the
+// full [num_heads, seq_len] score buffer.  After the KV loop, each SIMD group
+// publishes its rescaled partial outputs to shared memory, then every lane
+// sums across groups for its v_per_thread output elements.
+//
+// TG: 256 threads (8 SIMD groups x 32 lanes), head_dim=256 → v_per_thread=8.
+// GQA mapping: kv_head = head / heads_per_kv.
+
+kernel void attn_sdpa_fused(
+    device const float* Q          [[buffer(0)]],   // [num_heads, HEAD_DIM]
+    device const float* K_cache    [[buffer(1)]],   // [max_seq, KV_DIM]
+    device const float* V_cache    [[buffer(2)]],   // [max_seq, KV_DIM]
+    device float*       output     [[buffer(3)]],   // [num_heads, HEAD_DIM]
+    constant uint&      seq_len    [[buffer(4)]],   // current sequence length
+    constant float&     scale      [[buffer(5)]],   // 1/sqrt(HEAD_DIM)
+    uint tgid   [[threadgroup_position_in_grid]],   // = query head index
+    uint simd_lane  [[thread_index_in_simdgroup]],  // 0..31
+    uint simd_group [[simdgroup_index_in_threadgroup]] // 0..7
+) {
+    constexpr uint BD = 32;                  // SIMD width
+    constexpr uint BN = 8;                   // SIMD groups per TG
+    constexpr uint V = HEAD_DIM / BD;        // 256/32 = 8
+
+    uint h    = tgid;  // one TG per query head (no tiling)
+    uint kv_h = h / HEADS_PER_KV;
+
+    device const float* qh = Q + h * HEAD_DIM;
+    device const float* k_base = K_cache + kv_h * HEAD_DIM;
+    device const float* v_base = V_cache + kv_h * HEAD_DIM;
+
+    float q_vals[V];
+    float o_vals[V] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Pre-scale Q by log2(e) so inner loop can use fast::exp2 instead of exp.
+    constexpr float log2_e = 1.442695041f;
+    float q_scale = scale * log2_e;
+    uint elem_base = simd_lane * V;  // 0, 8, 16, …, 248
+    for (uint j = 0; j < V; j++) {
+        q_vals[j] = q_scale * qh[elem_base + j];
+    }
+
+    // Online softmax state (identical across all lanes in a SIMD group
+    // because simd_sum broadcasts the full dot-product to every lane).
+    float max_score = -1e30f;
+    float sum_exp   = 0.0f;
+
+    // KV loop — each SIMD group handles a strided subset of positions
+    for (uint pos = simd_group; pos < seq_len; pos += BN) {
+        device const float* kp = k_base + pos * KV_DIM + elem_base;
+        device const float* vp = v_base + pos * KV_DIM + elem_base;
+
+        float score = 0.0f;
+        for (uint j = 0; j < V; j++) {
+            score += q_vals[j] * kp[j];
+        }
+        score = simd_sum(score);  // full dot product across all 256 elements
+
+        float new_max   = max(max_score, score);
+        float factor    = fast::exp2(max_score - new_max);
+        float exp_score = fast::exp2(score - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_score;
+
+        for (uint j = 0; j < V; j++) {
+            o_vals[j] = o_vals[j] * factor + exp_score * vp[j];
+        }
+    }
+
+    // ── Merge partial results across SIMD groups ──
+
+    // sg_max: per-group maxima (size BD so simd_lane indexing is safe)
+    // sg_sum: per-group rescaled exp-sums
+    // sg_partial: per-group partial outputs, indexed [group * HEAD_DIM + elem]
+    threadgroup float sg_max[BD];
+    threadgroup float sg_sum[BN];
+    threadgroup float sg_partial[BN * BD * V];  // 8 * 256 = 2048
+
+    // Initialize sg_max so lanes 8..31 don't inject garbage into simd_max.
+    sg_max[simd_lane] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Lane 0 of each SIMD group publishes its group's max_score.
+    if (simd_lane == 0) {
+        sg_max[simd_group] = max_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Global max across all 8 SIMD groups.
+    float local_max  = sg_max[simd_lane];
+    float global_max = simd_max(local_max);
+
+    // Each group rescales its partials using its own max (broadcast from lane 0).
+    float group_max     = simd_broadcast_first(max_score);
+    float group_sum     = simd_broadcast_first(sum_exp);
+    float rescale       = fast::exp2(group_max - global_max);
+    float rescaled_sum  = group_sum * rescale;
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] *= rescale;
+    }
+
+    // Publish rescaled partial outputs and per-group sum.
+    for (uint j = 0; j < V; j++) {
+        sg_partial[simd_group * HEAD_DIM + elem_base + j] = o_vals[j];
+    }
+    if (simd_lane == 0) {
+        sg_sum[simd_group] = rescaled_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each lane sums its V output elements across all 8 SIMD groups.
+    for (uint j = 0; j < V; j++) {
+        float sum = 0.0f;
+        for (uint g = 0; g < BN; g++) {
+            sum += sg_partial[g * HEAD_DIM + elem_base + j];
+        }
+        o_vals[j] = sum;
+    }
+
+    // Global sum of rescaled per-group exp-sums.
+    float local_sum  = (simd_lane < BN) ? sg_sum[simd_lane] : 0.0f;
+    float global_sum = simd_sum(local_sum);
+
+    // Normalize and write output.
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] = (global_sum == 0.0f) ? 0.0f : (o_vals[j] / global_sum);
+    }
+
+    device float* out_ptr = output + h * HEAD_DIM + elem_base;
+    for (uint j = 0; j < V; j++) {
+        out_ptr[j] = o_vals[j];
+    }
+}
+
+
+// ============================================================================
+// Kernel 6b: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
 //
 // Computes scores[h, p] = sum_d(Q[h, d] * K[p, kv_h*head_dim + d]) * scale

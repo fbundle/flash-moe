@@ -30,8 +30,7 @@ python helpers/convert.py --model hub/models--mlx-community--Qwen3.6-35B-A3B-4bi
 ### 2. Build and run
 
 ```bash
-cd moe_infer_rs
-maturin develop --release
+maturin develop --release -m moe_infer_rs/Cargo.toml
 python chat.py
 ```
 
