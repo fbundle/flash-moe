@@ -233,38 +233,21 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         normalize_weights(&mut expert_weights);
 
         let actual_k = k.min(MAX_K);
-        let expert_buf = &mut self.engine.expert_buffer;
-        let mut miss_ei = [0usize; MAX_K];
-        let mut miss_k_slot = [0usize; MAX_K];
-        let mut miss_count = 0;
-        for ki in 0..actual_k {
-            let eidx = expert_indices[ki];
-            if let Some(buf) = expert_buf.cache.lookup(layer, eidx) {
-                expert_buf.expert_data[ki] = buf;
-            } else {
-                miss_ei[miss_count] = eidx;
-                miss_k_slot[miss_count] = ki;
-                miss_count += 1;
-            }
-        }
-        for m in 0..miss_count {
-            let ki = miss_k_slot[m];
-            let eidx = miss_ei[m];
-            let buf = expert_buf.cache.insert_get_buf(layer, eidx);
-            expert_buf.expert_data[ki] = buf;
-        }
-        if miss_count > 0 {
+
+        // Always read all K experts from disk — trust the OS page cache
+        // for repeated reads (flash-moe: ~38% faster than custom Metal LRU).
+        {
             let t_io = Instant::now();
             let expert_file = &self.engine.model.expert_files[layer];
             let expert_size = expert_file.expert_size();
+            let expert_buf = &self.engine.expert_buffer;
             let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
-            for m in 0..miss_count {
-                let ki = miss_k_slot[m];
-                reads[m] = (miss_ei[m], expert_buf.expert_data[ki].contents() as usize);
+            for ki in 0..actual_k {
+                reads[ki] = (expert_indices[ki], expert_buf.expert_data[ki].contents() as usize);
             }
             rayon::scope(|s| {
-                for m in 0..miss_count {
-                    let (eidx, ptr_u) = reads[m];
+                for ki in 0..actual_k {
+                    let (eidx, ptr_u) = reads[ki];
                     let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
                     s.spawn(move |_| {
                         expert_file.read_expert(eidx, dst).unwrap();
