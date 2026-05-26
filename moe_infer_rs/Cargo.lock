@@ -229,7 +229,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "moe-infer"
+name = "moe_infer_rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",

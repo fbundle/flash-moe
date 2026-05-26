@@ -14,7 +14,7 @@ mod python_bindings;
 
 #[cfg(feature = "python-bindings")]
 #[pyo3::pymodule]
-fn moe_infer(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+fn moe_infer_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     use pyo3::prelude::*;
     use pyo3::wrap_pyfunction;
     m.add_class::<python_bindings::Model>()?;
