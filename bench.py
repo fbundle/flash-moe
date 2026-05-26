@@ -7,7 +7,7 @@ from tqdm import tqdm
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = "data/models--Qwen--Qwen3.6-35B-A3B-bq4"
 C_DIR = "moe_infer_c"
-RS_DIR = "moe_infer_rs"
+RS_DIR = "."
 
 TOKEN_COUNTS = [20, 50, 100, 200, 500]
 from helpers.avail_models import ACTIVE_ENGINES as RUST_MODES
@@ -88,7 +88,7 @@ def main():
     subprocess.run(["make", "bench"], cwd=C_DIR, check=True, capture_output=True)
     tqdm.write("Building Rust module...")
     subprocess.run(
-        [sys.executable, "-m", "maturin", "develop", "--release"],
+        ["uv", "run", "maturin", "develop", "--release"],
         cwd=RS_DIR, check=True, capture_output=True,
     )
 

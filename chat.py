@@ -26,7 +26,7 @@ def _get_response_extractor(model_name: str):
     return _RESPONSE_EXTRACTORS["raw"]
 
 
-from helpers.generate import generate_from
+from moe_infer.generate import generate_from
 
 
 class Conversation:

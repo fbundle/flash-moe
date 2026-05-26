@@ -32,7 +32,7 @@ use crate::math::{
 };
 // ─── BQ4 local: embed_lookup with MLX naming ────────────────────────────────
 
-fn embed_lookup_bq4(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
+fn embed_lookup(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
     let (Some(w), Some(s), Some(b)) = (
         wf.get_tensor_u32("language_model.model.embed_tokens.weight"),
         wf.get_tensor_u16("language_model.model.embed_tokens.scales"),
@@ -66,7 +66,7 @@ fn embed_lookup_bq4(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_di
 
 // ─── BQ4 local: final_norm with MLX naming ──────────────────────────────────
 
-fn final_norm_bq4(wf: &WeightFile, hidden: &mut [f32], hidden_dim: usize) {
+fn final_norm(wf: &WeightFile, hidden: &mut [f32], hidden_dim: usize) {
     let Some(fnw_u16) = wf.get_tensor_u16("language_model.model.norm.weight") else { return };
     let fnw_f32: Vec<f32> = fnw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
     let sum_sq: f32 = hidden[..hidden_dim].iter().map(|v| v * v).sum();
@@ -355,7 +355,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
     // ── Final norm + LM head ───────────────────────────────────────────────
 
     fn final_norm_and_lm_head(&self, hidden: &mut [f32], logits: &mut [f32]) {
-        final_norm_bq4(&self.engine.model.weight_file, hidden, C::HIDDEN_DIM);
+        final_norm(&self.engine.model.weight_file, hidden, C::HIDDEN_DIM);
         gpu_lm_head(&self.engine.model.weight_file, hidden, logits, &self.engine.weight_buffer, &self.engine.ctx);
     }
 }
@@ -893,7 +893,7 @@ impl<C: ModelConfig> Engine for FusedBq4Exp1<C> {
     fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
         let hidden_dim = C::HIDDEN_DIM;
         for (i, &id) in token_ids.iter().enumerate() {
-            embed_lookup_bq4(&self.model.weight_file, id as usize, &mut embeddings[i * hidden_dim..(i + 1) * hidden_dim], hidden_dim);
+            embed_lookup(&self.model.weight_file, id as usize, &mut embeddings[i * hidden_dim..(i + 1) * hidden_dim], hidden_dim);
         }
     }
 

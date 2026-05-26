@@ -114,7 +114,7 @@ def main():
     print(f"[demo] Prefill: {time.time()-t0:.1f}s", flush=True)
 
     # 6. Generate
-    from helpers.generate import generate_from
+    from moe_infer.generate import generate_from
 
     print(f"[demo] Generating (max {args.max_tokens} tokens)...")
     text, stats = generate_from(
