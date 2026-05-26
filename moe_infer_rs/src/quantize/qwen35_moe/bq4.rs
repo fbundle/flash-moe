@@ -445,6 +445,7 @@ fn is_vision_tensor(mlx_name: &str) -> bool {
 
 // ─── Expert pack size ────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 fn expert_pack_size(hd: usize, mi: usize) -> usize {
     let gs = GROUP_SIZE;
     let gate_w = mi * hd / 2;

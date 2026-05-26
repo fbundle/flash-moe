@@ -1,5 +1,6 @@
-/// CPU reference engine — all computation on CPU using ndarray + dequant matvec.
-/// Serves as a verification baseline for the GPU engines.
+#![allow(dead_code)]
+//! CPU reference engine — all computation on CPU using ndarray + dequant matvec.
+//! Serves as a verification baseline for the GPU engines.
 use ndarray::Array1;
 use std::cell::RefCell;
 

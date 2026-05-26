@@ -71,13 +71,11 @@ def main():
     proc = AutoImageProcessor.from_pretrained(hub)
     img = Image.open(args.image).convert("RGB")
     proc_kwargs = {"images": img, "return_tensors": "pt"}
-    size = {}
-    if args.min_pixels > 0:
-        size["shortest_edge"] = args.min_pixels
-    if args.max_pixels > 0:
-        size["longest_edge"] = args.max_pixels
-    if size:
-        proc_kwargs["size"] = size
+    if args.min_pixels > 0 or args.max_pixels > 0:
+        proc_kwargs["size"] = {
+            "shortest_edge": args.min_pixels or 65536,
+            "longest_edge": args.max_pixels or 16777216,
+        }
     inputs = proc(**proc_kwargs)
     pixel_values = inputs["pixel_values"]                            # [N, 1536]
     grid_thw = inputs["image_grid_thw"]                              # [[1, H, W]]

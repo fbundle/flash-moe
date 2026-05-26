@@ -123,6 +123,7 @@ pub fn quant_f32_to_int4(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> (Ve
     (packed, scales, biases)
 }
 
+#[allow(dead_code)]
 pub fn int4_to_f32(packed: &[u32], scales: &[u16], biases: &[u16], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let num_groups = in_dim / GROUP_SIZE;
     let words_per_row = in_dim / 8;
@@ -166,6 +167,7 @@ pub fn quant_f32_to_int8(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> (Ve
     (packed, scales)
 }
 
+#[allow(dead_code)]
 pub fn int8_to_f32(packed: &[i8], scales: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; out_dim * in_dim];
     for row in 0..out_dim {

@@ -31,8 +31,7 @@ data/models--Qwen--Qwen3.6-35B-A3B-bq4/
 ├── config.json
 ├── model_weights.bin       # ~2 GB (mmap'd)
 ├── model_weights.json      # tensor manifest
-├── packed_experts/          # 40 × layer_NN.bin (~4.5 GB total)
-└── tokenizer.json -> ...    # symlink to hub tokenizer
+└── packed_experts/          # 40 × layer_NN.bin (~4.5 GB total)
 ```
 
 ### 3. Chat
@@ -140,7 +139,7 @@ See [`quant/README.md`](quant/README.md) for the BQ4 scheme.  Quick summary:
 | Norm weights, biases | BF16 | Vectors, sensitive to error |
 
 Vision encoder weights (`vision_tower.*`) are excluded from the main pipeline
-and extracted separately (see [`quant/README.md`](quant/README.md)).
+and loaded directly from HF safetensors at runtime by `vision_demo.py`.
 
 ## Model format
 
@@ -149,10 +148,8 @@ model_dir/
 ├── config.json
 ├── model_weights.bin           # mmap'd non-expert weights
 ├── model_weights.json          # tensor manifest
-├── packed_experts/             # layer_00.bin … layer_39.bin
-├── packed_experts_lz4/         # optional LZ4-compressed experts
-├── tokenizer.json
-└── vocab.json
+└── packed_experts/             # layer_00.bin … layer_39.bin
+    (packed_experts_lz4/)       # optional LZ4-compressed experts
 ```
 
 Tensor names use the MLX convention: `language_model.model.layers.{L}.{block}.{kind}`.
