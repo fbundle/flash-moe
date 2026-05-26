@@ -86,11 +86,7 @@ def main():
     # Build
     tqdm.write("Building C bench (full model)...")
     subprocess.run(["make", "bench"], cwd=C_DIR, check=True, capture_output=True)
-    tqdm.write("Building Rust module...")
-    subprocess.run(
-        ["uv", "run", "maturin", "develop", "--release"],
-        cwd=RS_DIR, check=True, capture_output=True,
-    )
+
 
     tqdm.write(f"\nModel: {MODEL_DIR}")
     tqdm.write(f"Modes: {', '.join(RUST_MODES)} (Rust) + C\n")
