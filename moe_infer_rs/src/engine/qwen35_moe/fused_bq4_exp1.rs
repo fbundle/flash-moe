@@ -890,18 +890,21 @@ impl<C: ModelConfig> Engine for FusedBq4Exp1<C> {
         self.ctx.download_cache(cache);
     }
 
-    fn forward(
+    fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
+        let hidden_dim = C::HIDDEN_DIM;
+        for (i, &id) in token_ids.iter().enumerate() {
+            embed_lookup_bq4(&self.model.weight_file, id as usize, &mut embeddings[i * hidden_dim..(i + 1) * hidden_dim], hidden_dim);
+        }
+    }
+
+    fn forward_hidden(
         &mut self,
-        input_ids: &[i64],
+        embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        assert!(self.k <= C::NUM_EXPERTS_PER_TOK,
-            "k ({}) must not exceed model's num_experts_per_tok ({})",
-            self.k, C::NUM_EXPERTS_PER_TOK);
-
         let t0 = Instant::now();
-        let n_tokens = input_ids.len();
         let hidden_dim = C::HIDDEN_DIM;
+        let n_tokens = embeddings.len() / hidden_dim;
         let vocab_size = C::VOCAB_SIZE;
         let num_layers = C::NUM_LAYERS;
 
@@ -914,13 +917,8 @@ impl<C: ModelConfig> Engine for FusedBq4Exp1<C> {
         {
             let mut exec = ExecCtx { engine: self, pending: None };
 
-            let mut embed = vec![0.0f32; n_tokens * hidden_dim];
-            for (i, &id) in input_ids.iter().enumerate() {
-                embed_lookup_bq4(&exec.engine.model.weight_file, id as usize, &mut embed[i * hidden_dim..(i + 1) * hidden_dim], C::HIDDEN_DIM);
-            }
-
-            for (ti, _) in input_ids.iter().enumerate() {
-                let embed_hidden = &embed[ti * hidden_dim..(ti + 1) * hidden_dim];
+            for ti in 0..n_tokens {
+                let embed_hidden = &embeddings[ti * hidden_dim..(ti + 1) * hidden_dim];
                 exec.init_hidden(embed_hidden);
 
                 for layer in 0..num_layers {

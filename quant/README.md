@@ -147,6 +147,13 @@ Dispatch lives in `WeightBuffer::encode_matvec_into()`.  Each tensor's dtype
 No engine variant needed — one engine dispatches per-tensor.  Mixed
 quantization is a property of the weight file, not the runtime.
 
+## Vision encoder
+
+Vision encoder weights (`vision_tower.*`) are **excluded** from the main BQ4
+pipeline.  The classifier skips any tensor whose MLX name starts with
+`vision_tower.`.  Vision weights are extracted separately via
+`quant/extract_vision_encoder.py` into a `vision_encoder/` subdirectory.
+
 ## Weight conversion
 
 Split on the last dot to get the block and kind, then feed the name through

@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArray2, PyArrayMethods};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
@@ -104,6 +104,41 @@ impl Engine {
         })
     }
 
+    /// Convert token IDs to embeddings. Returns [n, hidden_dim] float32 array.
+    fn embed_lookup(&self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>) -> PyResult<PyObject> {
+        let ids = input_ids.readonly();
+        let ids = ids.as_slice()?;
+        let n = ids.len();
+        let hd = self.model.config.get_usize("hidden_size").unwrap();
+        let mut embed = vec![0.0f32; n * hd];
+        self.engine.embed_lookup(ids, &mut embed);
+        let arr = PyArray2::<f32>::from_owned_array(py,
+            numpy::ndarray::Array2::from_shape_vec((n, hd), embed)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("shape error: {}", e)))?);
+        Ok(arr.into_pyobject(py)?.into_any().into())
+    }
+
+    /// Process pre-computed embeddings through the LM. Returns [n, vocab_size] logits.
+    fn forward_hidden(&mut self, py: Python<'_>, embeddings: &Bound<PyArray2<f32>>,
+        cache: &mut Cache,
+    ) -> PyResult<PyObject> {
+        let emb = embeddings.readonly();
+        let emb_slice = emb.as_slice()?;
+        let shape = emb.shape();
+        let n = shape[0];
+        let vs = self.model.config.get_usize("vocab_size").unwrap();
+
+        let logits = self.forward_hidden_impl(emb_slice, &mut cache.inner, &mut || py.check_signals().is_err())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let arr = PyArray2::<f32>::from_owned_array(py,
+            numpy::ndarray::Array2::from_shape_vec((n, vs), logits)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("shape error: {}", e)))?);
+        Ok(arr.into_pyobject(py)?.into_any().into())
+    }
+
     fn forward(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
     ) -> PyResult<PyObject> {
@@ -113,9 +148,13 @@ impl Engine {
         let start = if pos < ids.len() { pos } else { 0 };
         let new_ids = &ids[start..];
         let n = new_ids.len();
+        let hd = self.model.config.get_usize("hidden_size").unwrap();
         let vs = self.model.config.get_usize("vocab_size").unwrap();
 
-        let logits = self.forward_impl(new_ids, &mut cache.inner, &mut || py.check_signals().is_err())
+        let mut embed = vec![0.0f32; n * hd];
+        self.engine.embed_lookup(new_ids, &mut embed);
+
+        let logits = self.forward_hidden_impl(&embed, &mut cache.inner, &mut || py.check_signals().is_err())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
@@ -196,14 +235,14 @@ pub fn qwen35_moe_bq4_quantize(
 // ─── Internal forward impl ─────────────────────────────────────────────────
 
 impl Engine {
-    fn forward_impl(
+    fn forward_hidden_impl(
         &mut self,
-        input_ids: &[i64],
+        embeddings: &[f32],
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
         self.engine.upload_cache(cache);
-        let logits = self.engine.forward(input_ids, check_signal)?;
+        let logits = self.engine.forward_hidden(embeddings, check_signal)?;
         self.engine.download_cache(cache);
         self.telemetry = self.engine.telemetry();
         Ok(logits)

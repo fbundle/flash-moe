@@ -438,6 +438,11 @@ fn is_expert_tensor(mlx_name: &str) -> bool {
         || mlx_name.contains(".switch_mlp.down_proj.")
 }
 
+/// Vision encoder tensors are extracted separately — see quant/extract_vision_encoder.py.
+fn is_vision_tensor(mlx_name: &str) -> bool {
+    mlx_name.starts_with("vision_tower.")
+}
+
 // ─── Expert pack size ────────────────────────────────────────────────────────
 
 fn expert_pack_size(hd: usize, mi: usize) -> usize {
@@ -539,6 +544,10 @@ impl Bq4 {
     for (hf_name, shard) in weight_map.iter() {
         match name_map.get(hf_name) {
             Some(mlx_name) => {
+                if is_vision_tensor(mlx_name) {
+                    // Vision encoder extracted separately — skip here.
+                    continue;
+                }
                 if is_expert_tensor(mlx_name) {
                     expert.push((hf_name.clone(), shard.clone()));
                 } else {

@@ -35,10 +35,14 @@ pub trait Engine {
     /// Download GPU buffers → CPU cache after forward.
     fn download_cache(&self, cache: &mut Cache);
 
-    /// Process `input_ids` through all layers. Returns logits [n, vocab_size].
-    fn forward(
+    /// Convert token IDs to embeddings. Writes into `embeddings` [n, hidden_dim].
+    fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]);
+
+    /// Process pre-computed embeddings through all layers.
+    /// `embeddings` shape: [n_tokens, hidden_dim]. Returns logits [n, vocab_size].
+    fn forward_hidden(
         &mut self,
-        input_ids: &[i64],
+        embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError>;
 
@@ -107,8 +111,12 @@ impl DynEngine {
         self.inner.download_cache(cache);
     }
 
-    pub fn forward(&mut self, input_ids: &[i64], check_signal: SignalCheckFn<'_>) -> Result<Vec<f32>, MoEError> {
-        self.inner.forward(input_ids, check_signal)
+    pub fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
+        self.inner.embed_lookup(token_ids, embeddings);
+    }
+
+    pub fn forward_hidden(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>) -> Result<Vec<f32>, MoEError> {
+        self.inner.forward_hidden(embeddings, check_signal)
     }
 
     pub fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {

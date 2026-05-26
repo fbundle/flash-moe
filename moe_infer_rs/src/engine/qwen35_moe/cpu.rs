@@ -502,13 +502,21 @@ impl<'a, C: ModelConfig> Engine for CpuEngine<'a, C> {
         cache.copy_from(&self.cache.borrow());
     }
 
-    fn forward(
+    fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
+        let hd = C::HIDDEN_DIM;
+        for (i, &id) in token_ids.iter().enumerate() {
+            embed_lookup(&self.model.weight_file, id as usize,
+                &mut embeddings[i * hd..(i + 1) * hd], hd);
+        }
+    }
+
+    fn forward_hidden(
         &mut self,
-        input_ids: &[i64],
+        embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        let n_tokens = input_ids.len();
         let hd = C::HIDDEN_DIM;
+        let n_tokens = embeddings.len() / hd;
         let vocab_size = C::VOCAB_SIZE;
         let num_layers = C::NUM_LAYERS;
 
@@ -517,18 +525,11 @@ impl<'a, C: ModelConfig> Engine for CpuEngine<'a, C> {
             return Ok(logits);
         }
 
-        // Embed all tokens
-        let mut embed = vec![0.0f32; n_tokens * hd];
-        for (i, &id) in input_ids.iter().enumerate() {
-            embed_lookup(&self.model.weight_file, id as usize,
-                &mut embed[i * hd..(i + 1) * hd], hd);
-        }
-
         let pos = self.cache.borrow().pos;
 
         for ti in 0..n_tokens {
             let cur_pos = pos + ti;
-            let embed_hidden = &embed[ti * hd..(ti + 1) * hd];
+            let embed_hidden = &embeddings[ti * hd..(ti + 1) * hd];
 
             let mut hidden = Array1::from_vec(embed_hidden.to_vec());
 
@@ -560,4 +561,6 @@ impl<'a, C: ModelConfig> Engine for CpuEngine<'a, C> {
         self.cache.borrow_mut().set_pos(pos + n_tokens);
         Ok(logits)
     }
+
+
 }
