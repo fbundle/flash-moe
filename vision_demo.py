@@ -52,7 +52,7 @@ def load_vision_encoder(hub: str) -> Qwen3_5MoeVisionModel:
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3.6-35B-A3B vision demo")
-    parser.add_argument("--image", default="vendor/crycat-crying-cat.gif")
+    parser.add_argument("--image", default="data/crycat-crying-cat.gif")
     parser.add_argument("--question", default="What is in this image?")
     parser.add_argument("--model", default="data/models--Qwen--Qwen3.6-35B-A3B-bq4")
     parser.add_argument("--max-tokens", type=int, default=128)
