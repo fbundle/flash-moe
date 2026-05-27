@@ -2,11 +2,115 @@
 
 ## Overview
 
-MoE-Infer is a high-performance inference engine for Mixture-of-Experts models on Apple Silicon. It streams expert weights from SSD on demand (with optional LZ4 compression), uses hand-tuned Metal compute shaders for all GPU operations, and exposes Python bindings via PyO3. No Python ML frameworks at runtime — just Rust, Metal, and ~0.65 GB of mmap'd weights.
+MoE-Infer is a Rust-native inference engine for Mixture-of-Experts models on Apple Silicon. It builds on the techniques pioneered by [flash-moe](https://github.com/danielhanchen/flash-moe) — on-demand SSD expert streaming, hand-tuned Metal compute shaders, deferred GPU command dispatch — and extends them with a larger kernel surface, a novel block-aware quantization scheme (BQ4), compile-time safety guarantees, and a full numerical verification framework. The engine streams expert weights from SSD on demand (with optional LZ4 compression), runs all GPU operations through custom Metal kernels, and exposes Python bindings via PyO3. No Python ML frameworks at runtime — just Rust, Metal, and ~0.65 GB of mmap'd weights.
 
 **Supported models**: `mlx-community/Qwen3.5-35B-A3B-4bit`, `mlx-community/Qwen3.6-35B-A3B-4bit`
 
 **Hardware**: Apple Silicon (M1–M4) with unified memory. Tested on M1 Pro (10-core CPU, 14-core GPU).
+
+## Comparison with flash-moe
+
+flash-moe demonstrated the core insight: a 397B-parameter MoE model can run on a laptop by streaming only the K active experts from SSD per layer. The reference implementation (pure C/Objective-C + Metal) achieved 4.4 tok/s on an M3 Max with 48 GB RAM.
+
+MoE-Infer takes this architecture and advances it on every axis:
+
+### Metal Kernel Surface: 35 vs 26
+
+flash-moe's `shaders.metal` defines 26 compute kernels covering the essential operations: dequantized matvec (naive, SIMD, v3/v4/v5, batched, 2-bit), SwiGLU, weighted sum, RMS norm, residual add, batched attention (scores/softmax/values), GatedDeltaNet SSM, conv1d, Q/K RMS norm, decay/beta, gated RMS norm, MoE combine+residual, sigmoid gate, and fused gate+up+SwiGLU.
+
+MoE-Infer retains every one of these kernels and adds **9 more**:
+
+| Kernel | Purpose |
+|--------|---------|
+| `rms_norm_fused_bf16` | Single-pass fused RMS norm — combines sum-of-squares reduction and normalization in one dispatch, eliminating the two-pass pattern flash-moe uses |
+| `attn_sdpa_fused` | Fused online-softmax scaled dot-product attention — single-pass Q@K^T with running softmax, vs flash-moe's batched 3-pass (scores → softmax → values) |
+| `attn_sdpa_block` | 2-pass block-sparse SDPA: block-level attention for long sequences, with a separate reduce pass |
+| `attn_sdpa_reduce` | Companion reduce kernel for 2-pass SDPA |
+| `q_head_norm_rope` | Fused Q deinterleave + per-head RMS norm + RoPE rotation in one kernel. flash-moe does these as separate CPU steps |
+| `k_head_norm_rope` | Fused K per-head RMS norm + RoPE rotation in one kernel. Likewise eliminates CPU round-trips |
+| `kv_cache_append` | GPU-side KV cache write — copies K and V into persistent cache at the current sequence position. Eliminates CPU upload bandwidth |
+| `matvec_bf16` | Direct BF16 matrix-vector multiply with no dequantization — used by BQ4 for precision-critical weight blocks |
+| `matvec_int8` | INT8 per-channel symmetric matvec — used by BQ4 for the lm_head output projection |
+
+These additions eliminate CPU round-trips (Q/K norm+RoPE), reduce dispatch count (fused RMS norm), and enable the BQ4 quantization scheme that flash-moe had no equivalent for.
+
+### BQ4: Block-Aware Quantization
+
+flash-moe quantizes everything to 4-bit uniformly — all attention projections, all expert projections, and the lm_head. This works but leaves quality on the table: attention QKV projections and the router gate are disproportionately sensitive to quantization error because they determine which experts are activated.
+
+MoE-Infer's BQ4 (`src/quantize/qwen35_moe/bq4.rs`) classifies every weight matrix into one of three tiers based on sensitivity analysis:
+
+| Tier | Blocks | Quantization | Kernel |
+|------|--------|-------------|--------|
+| Sensitive | Attention Q/K/V/O, router gate, shared expert gate, lm_head | BF16 (no quantization) | `matvec_bf16` |
+| Intermediate | Shared expert projections, norms | 4-bit affine (group_size=64) | `dequant_matvec_4bit_v3` |
+| Bulk | Expert gate/up/down (95%+ of parameters) | 4-bit affine (group_size=64) | `dequant_matvec_4bit_v3` |
+
+The lm_head (248,320 × 2048) is stored as INT8 per-channel symmetric and dispatched via `matvec_int8`, keeping the vocabulary projection precise while using half the memory of BF16.
+
+This is a design decision flash-moe never explored — their experiments focused on fixed 4-bit or fixed 2-bit quantization for all weights. BQ4 gives 4-bit-class memory efficiency for the bulk of parameters with BF16-class routing precision for the few that matter.
+
+### Type Safety and Memory Model
+
+flash-moe is ~7,000 lines of C and Objective-C with manual memory management: `malloc`/`free`, raw pointer arithmetic, manual buffer lifecycle tracking. A buffer used after free is a segfault; a leaked buffer is a slow memory exhaustion. The code is correct but the language provides no guardrails.
+
+MoE-Infer is Rust throughout. The borrow checker prevents use-after-free and data races at compile time. The `MetalContext` struct holds all GPU state with clear ownership; `ExpertBuffer` is a separate allocation with its own lifetime. The `Engine` trait enforces a uniform interface (`forward_token`, `reset_cache`) that every pipeline mode must satisfy. The `ModelConfig` trait uses Rust's const generics and associated constants to encode model dimensions at the type level — passing a `FullModel` vs `StrippedModel` selects a completely different code path with zero runtime overhead.
+
+The C code handles threading with `pthread_create` and `dispatch_group`; the Rust code uses `rayon::scope()` with Rust's `Send`/`Sync` guarantees, making it impossible to accidentally share non-thread-safe state across expert I/O workers.
+
+### Python Bindings
+
+flash-moe embeds an HTTP server (`infer.m` lines 5635–6200) directly in the inference binary, with a separate C chat client (`chat.m`) that connects via SSE. This split requires serializing/deserializing tensors over HTTP for every token, and the server must manage multiple client connections manually.
+
+MoE-Infer compiles to a native Python module via PyO3 (`src/python_bindings.rs`). The Python side (`moe_infer/pipeline.py`) handles tokenization, chat templates, and vision encoding using standard HuggingFace libraries, while the Rust engine handles inference through direct function calls — no serialization, no HTTP overhead, no socket management. The same binary serves interactive chat (`chat.py`), benchmarking (`bench.py`), and n-way verification (`verify_nway.py`) as library code.
+
+### Numerical Verification Infrastructure
+
+flash-moe has no reference implementation — the Metal shaders are the ground truth, and correctness is validated by inspecting output quality.
+
+MoE-Infer provides three independent verification paths:
+
+1. **CPU reference engine** (`src/engine/qwen35_moe/cpu.rs`): A pure-CPU, pure-f32 implementation of the entire forward pass using `ndarray`. Every operation — RMS norm, RoPE, attention, GatedDeltaNet, dequant matvec, SwiGLU — is implemented in scalar Rust with no GPU involvement. This serves as the numerical ground truth against which the GPU pipeline is verified.
+
+2. **Stripped model** (`helpers/strip_model.py`): A 4-layer, 4-expert variant of the full model, suitable for fast verification iteration. Running the CPU reference on this model takes seconds, not minutes.
+
+3. **N-way logit comparison** (`verify_nway.py`): Compares logits from CpuEngine, Fused4bit, the C reference, and MLX across multiple prompts, reporting max_diff and cosine similarity for each.
+
+This infrastructure caught three algorithmic bugs during development that would have manifested as subtle quality degradation:
+
+- **RoPE element pairing bug**: `apply_rope()` used traditional consecutive pairs instead of NeoX-style (i, i + dims/2). Fix reduced logit max_diff from 0.835 to 0.113 (7.4× improvement).
+- **Full-attention MoE bug**: The full-attention path returned early without adding attention output to hidden, causing MoE to use pre-attention hidden as residual. Attention contribution was entirely lost (max_diff 4.88).
+- **conv_state not updated**: conv1d_step was called but conv_state was never shifted for the next token — would produce incorrect results for multi-token sequences.
+
+After all fixes, GPU vs CPU max_diff < 1e-5 (ULP-level); CPU vs MLX max logit diff = 0.113 with cos_sim = 0.99996. The residual divergence is entirely attributable to bf16 vs f32 precision differences.
+
+### Application-Level Expert Cache
+
+flash-moe's headline design principle is "Trust the OS" — the page cache is the expert cache, and their experiments showed that custom caching (Metal LRU, malloc cache, LZ4 compressed cache) was uniformly slower.
+
+MoE-Infer takes the opposite approach with an application-level LRU cache (512 entries). This is feasible because the models are smaller (35B-A3B vs 397B-A17B): expert data is ~19 GB vs ~209 GB, and the working set of frequently-accessed experts fits more comfortably. The LRU cache provides:
+
+- **Deterministic eviction**: The kernel's page reclaimer has no knowledge of MoE routing patterns. Under adversarial access, it can evict experts that will be needed next token. The application-level LRU knows the routing distribution.
+- **Explicit lifecycle**: Cache entries are pread'd into pre-allocated Metal buffers with 2 MB alignment (3.6× DMA throughput vs page-aligned mmap). The kernel can't guarantee this alignment for page cache hits.
+- **Predictable latency**: Cache hit → skip pread entirely. Cache miss → parallel pread across 4 threads. No variance from kernel page reclamation decisions.
+
+### LZ4 Compression: Production Feature
+
+flash-moe experimented with LZ4 expert compression and discarded it ("-13% — decompress overhead > warm cache savings"). Their workload (397B model, 209 GB experts) meant decompression competed with SSD bandwidth on every read.
+
+MoE-Infer ships LZ4 compression as a production feature with transparent auto-detection. `helpers/compress_experts_lz4.py` compresses per-layer expert files (~40–55% compression ratio), and the engine auto-detects `packed_experts_lz4/` at load time, transparently decompressing via `lz4_flex`. The smaller model size (19 GB experts) and Apple Silicon's hardware LZ4 decode make the overhead negligible for most configurations. Both `ExpertFile::Raw` and `ExpertFile::Lz4` share the same `read_expert()` interface — switching is a filesystem-level change, not a code change.
+
+### Shader Embedding
+
+flash-moe requires `shaders.metal` on disk at runtime and compiles it with `newLibraryWithSource`. If the file is missing or moved, the engine fails at startup.
+
+MoE-Infer embeds the Metal shader source at compile time via Rust's `include_str!()` macro. The shaders are compiled from the embedded string at runtime (same `newLibraryWithSource` path), but there is no external file dependency. The engine binary is self-contained.
+
+### Multi-Model Architecture
+
+flash-moe is hardcoded for one specific architecture (Qwen3.5-397B-A17B: 60 layers, 512 experts, K=10). Model dimensions are `#define` macros; supporting a different model requires recompiling with different constants.
+
+MoE-Infer uses a `ModelConfig` trait with associated constants. The `FullModel` and `StrippedModel` implementations provide different dimension sets, and the engine is generic over `C: ModelConfig`. Adding a new model size means implementing the trait — no engine code changes needed. The same binary can load different models at runtime, selecting dimensions from `config.json`.
 
 ## Architecture
 
@@ -24,7 +128,7 @@ Qwen3.5-35B-A3B-4bit: 40 layers, 256 experts, K=8 active experts per token.
 | Shared expert intermediate | 512 |
 | Linear attention | 16 K-heads (dim 128), 32 V-heads (dim 128), conv kernel 4 |
 | Full attention | 16 Q-heads (dim 256), 2 KV-heads (dim 256), RoPE dim 64 |
-| Quantization | 4-bit affine (group_size=64), nibble * scale + bias |
+| Quantization | 4-bit affine (group_size=64), nibble * scale + bias (BQ4: selective BF16/INT8) |
 | Weight format | U32 packed weights + BF16 scales/biases |
 
 ### Data Flow (per token, per layer)
@@ -46,7 +150,7 @@ Expert weights (~19 GB 4-bit) live on SSD in per-layer files (`packed_experts/la
 
 Non-expert weights (0.65 GB) use `mmap()` — they fit in memory and are accessed every layer, every token. Experts (19 GB, 30× larger) use `pread()` into pre-allocated Metal buffers. The reasoning:
 
-**1. DMA alignment (3.6× speedup).** Expert data buffers are allocated with `posix_memalign(..., 2MB)` and wrapped via `newBufferWithBytesNoCopy`. The DMA controller that handles `pread()` from Apple's SSD achieves 3.6× higher throughput with 2 MB alignment vs the 16 KB page alignment that `mmap()` guarantees. This is the single biggest factor.
+**1. DMA alignment (3.6× speedup).** Expert data buffers are allocated with 2 MB alignment and wrapped via `newBufferWithBytesNoCopy`. The DMA controller that handles `pread()` from Apple's SSD achieves 3.6× higher throughput with 2 MB alignment vs the 16 KB page alignment that `mmap()` guarantees. This is the single biggest factor.
 
 **2. One syscall, not 110 page faults.** A 1.77 MB expert spans ~110 pages (16 KB each on Apple Silicon). With `mmap()`, the first access to each page triggers a synchronous kernel trap: page fault → I/O dispatch → TLB fill. That's 110 individual round-trips through the kernel. With `pread()`, the kernel reads the entire blob in a single efficient I/O operation — one syscall, one I/O submission, one completion.
 
@@ -58,11 +162,35 @@ Non-expert weights (0.65 GB) use `mmap()` — they fit in memory and are accesse
 
 ### Metal Compute Pipeline
 
-All matrix-vector multiplies run on GPU via Metal compute shaders:
-- **4-bit dequant matvec**: `nibble * scale + bias` fused with dot product via FMA
-- **Fused linear attention (CMD1)**: QKV/Z/B/A projections + Conv1d + Q/K RMS norms + SSM state update + Gated RMS norm — single command buffer
-- **Fused full attention (CMD2)**: QKV projections + Q/K norms + RoPE (CPU) + Batched attention (scores, softmax, values) + Sigmoid gate + o_proj + Residual add + Post-attn norm + MoE gate + Shared expert projections — single command buffer
-- **Expert dispatch (CMD3)**: K expert gate/up + SwiGLU + down + Shared expert SwiGLU + down + MoE combine + residual — async commit, completed next layer
+All matrix-vector multiplies run on GPU via Metal compute shaders. The kernel fleet (35 kernels, embedded via `include_str!`) covers every operation in the forward pass:
+
+- **4-bit dequant matvec**: 6 variants (naive, SIMD, v3 optimized, v4, v5 LUT-based, batched). The v3 kernel tiles output rows across SIMD groups, caches the input vector in threadgroup shared memory, and uses `fma(nibble, scale*x, bias*x)` to fuse dequantization with the dot product in a single instruction.
+- **BF16 matvec**: Direct BF16→f32 matvec with no dequantization, used by BQ4 for sensitive weight blocks (attention projections, router gate).
+- **INT8 matvec**: Per-channel symmetric dequant matvec, used by BQ4 for the lm_head.
+- **2-bit dequant matvec**: 2-bit variant for experimental ultra-low-bitwidth expert quantization.
+- **Fused gate+up SwiGLU**: Reads the input vector once, computes both gate_proj and up_proj in the same kernel, and applies the SwiGLU nonlinearity — saves one input read and one kernel dispatch per expert.
+- **RMS norm**: Two approaches — a two-pass (sum-sq reduction + apply) used standalone, and a single-pass fused variant (`rms_norm_fused_bf16`) that combines both in one dispatch.
+- **SDPA attention**: Three variants — fused online-softmax (single-pass), and 2-pass block-sparse (block + reduce) for long sequences. Complemented by the original batched 3-pass (scores → softmax → values).
+- **Fused Q/K head norm + RoPE**: Eliminates CPU round-trips by applying per-head RMS norm and rotary position embeddings on-GPU.
+- **KV cache append**: Writes K and V directly into persistent GPU cache buffers.
+- **GatedDeltaNet SSM**: GPU implementation of the SSM recurrence — one threadgroup per V-head, shared memory reduction.
+- **Other fused kernels**: conv1d step, compute_decay_beta, gated RMS norm, MoE combine+residual, sigmoid gate, weighted sum.
+
+#### Pipeline Structure (3-CMD per layer)
+
+flash-moe pioneered the 3-command-buffer per-layer pipeline. MoE-Infer refines it with fused GPU-side operations that eliminate CPU round-trips:
+
+**Linear attention layers (30/40)**:
+- CMD1: QKV/Z/B/A projections → Conv1d → Q/K RMS norms → SSM → Gated RMS norm → out_proj → Residual add
+- CMD2: Post-attn norm → Gate + Shared expert projections + Shared expert gate
+- CMD3 (async): Expert gate/up + SwiGLU + down × K → Shared SwiGLU + down → MoE combine + residual → Input norm for next layer
+
+**Full attention layers (10/40)**:
+- CMD1: Q/K/V projections → Q/K norms + RoPE (GPU, fused kernel) → KV cache append (GPU)
+- CMD2: Fused SDPA attention (+ batched fallback) → Sigmoid gate → o_proj → Residual add → Post-attn norm → Gate + Shared expert projections
+- CMD3 (async): Same as linear, plus explicit input norm for next layer
+
+CMD3 is submitted with deferred commit — the GPU executes it while the CPU prepares the next layer. The combine + residual + input norm for the next layer are all on-GPU, so the next layer's CMD1 can submit immediately without waiting for CMD3 to finish.
 
 ## Weight File Format
 
@@ -94,13 +222,14 @@ Key differences from HF format:
 
 ### Dtype mappings
 
-Weights are stored in three dtypes, each chosen for its precision/throughput tradeoff:
+Weights are stored in four dtypes under BQ4, each chosen for its precision/throughput tradeoff:
 
 | Dtype | Used for |
 |-------|----------|
-| **U32 (packed int4)** | All `nn.Linear` weight matrices: attention Q/K/V/O projections, expert gate/up/down, shared expert. 8 nibbles per u32, dequantized on the fly by the Metal shader: `nibble * scale + bias` |
-| **BF16 (u16)** | **(a)** Scales and biases for every 4-bit weight (one pair per group of 64 weights). **(b)** RMS norm weights (`input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`, `model.norm`). Cast to f32 at runtime via `bf16_to_f32`. Scale/biases never leave the Metal buffer — the shader reads them directly. **(c)** Routing gate and shared expert gate (kept BF16 for precision) |
-| **F32** | Embedding (`embed_tokens`), output head (`lm_head`), and SSM decay parameter (`A_log`). Embeddings and lm_head stay f32 to avoid accumulating precision loss at the pipeline boundaries. `A_log` is exponentiated at runtime, which amplifies BF16 round-off error |
+| **U32 (packed int4)** | Bulk `nn.Linear` weight matrices: expert gate/up/down, shared expert. 8 nibbles per u32, dequantized on the fly: `nibble * scale + bias` |
+| **BF16 (u16)** | **(a)** Sensitive blocks: attention Q/K/V/O projections, router gate, shared expert gate. **(b)** Scales and biases for 4-bit weights. **(c)** RMS norm weights. |
+| **INT8 (i8)** | lm_head output projection (248,320 × 2048) with per-channel f32 scales. Half the memory of BF16 while preserving vocabulary precision |
+| **F32** | Embedding (`embed_tokens`) and SSM decay parameter (`A_log`). Embeddings stay f32 to avoid accumulating precision loss at pipeline boundaries |
 
 ### MoE-Infer Expert Weights
 
@@ -165,8 +294,11 @@ HF safetensors/ ──► helpers/repack_experts_4bit.py ──► packed_expert
               ┌──► helpers/compress_experts_lz4.py ──► packed_experts_lz4/
               │                                       (optional, ~40-55% compression)
               │
-              └──► helpers/repack_experts_2bit.py   ──► packed_experts_2bit/
-                                                      (experimental, 2-bit quant)
+              ├──► helpers/repack_experts_2bit.py   ──► packed_experts_2bit/
+              │                                       (experimental, 2-bit quant)
+              │
+              └──► helpers/quantize_from_hf.py +    ──► BQ4 model directory
+                   src/quantize/qwen35_moe/bq4.rs       (block-aware quantization)
 ```
 
 All scripts read from the same MLX-format model directory and output to a single MoE-Infer model directory. The conversion is a one-time offline step; at inference time only the binary files are needed.
@@ -184,15 +316,18 @@ cache.json      # Manifest: name → {offset, size, shape, dtype}
 
 Full-attention layers store `k_cache`, `v_cache`, and `len`. Linear-attention layers store `conv_state` and `ssm_state`. The sequence position `pos` is a u32 scalar.
 
+Cache persistence enables conversation resume across engine restarts — the Python pipeline saves cache after each user turn and restores it on the next invocation.
+
 ## Pipeline Modes
 
 | Mode | Description |
 |------|-------------|
 | `Fused4bit` | Full model: 40 layers, 256 experts, K=8. 3-CMD GPU pipeline with expert dispatch every layer |
+| `Fused4bitBq4` | Full model with BQ4 quantization: attention + gates in BF16, lm_head in INT8, experts in 4-bit |
 | `Fused4bitStripped` | Stripped model: 4 layers, 4 experts, K=4. For verification |
 | `Cpu` (Rust only) | Pure-CPU reference engine using `ndarray`. Not exposed via Python bindings |
 
-All GPU modes use the 3-CMD pipeline. The stripped variant uses a reduced 4-layer 4-expert model suitable for fast verification iteration.
+All GPU modes use the 3-CMD pipeline. The stripped variant uses a reduced 4-layer 4-expert model suitable for fast verification iteration. The BQ4 variant uses the same pipeline structure but dispatches `matvec_bf16` for sensitive blocks and `matvec_int8` for lm_head instead of `dequant_matvec_4bit_v3`.
 
 ### Fused4bit Command Buffer Layout
 
@@ -202,8 +337,8 @@ All GPU modes use the 3-CMD pipeline. The stripped variant uses a reduced 4-laye
 - CMD3 (async): Expert gate/up + SwiGLU + down × K → Shared SwiGLU + down → MoE combine + residual → Input norm for next layer
 
 **Full attention layers (10/40)**:
-- CMD1: Q/K/V projections → Q/K norms → RoPE (CPU) → KV cache append
-- CMD2: Batched attention (scores, softmax, values) → Sigmoid gate → o_proj → Residual add → Post-attn norm → Gate + Shared expert projections
+- CMD1: Q/K/V projections → Q/K norms → RoPE (GPU, fused) → KV cache append (GPU)
+- CMD2: Fused SDPA attention → Sigmoid gate → o_proj → Residual add → Post-attn norm → Gate + Shared expert projections
 - CMD3 (async): Same as linear, plus explicit input norm for next layer
 
 ### CPU Engine
@@ -214,7 +349,7 @@ The `CpuEngine<C: ModelConfig>` in `engine/qwen35_moe/cpu.rs` is a pure-CPU refe
 - `pre_expert_linear()`: input_layernorm → QKV/Z/B/A projections → conv1d_step with state update → RMS norm Q/K → decay/beta → gated delta net → gated RMS norm → out_proj → residual add → post_attention_layernorm → gate projections
 - `post_expert()`: dequant_matvec_4bit + swiglu per expert → shared expert swiglu + down → sigmoid-gated residual combine
 
-The CPU engine serves as a numerical reference for verifying the GPU pipeline, and runs at ~0.15 tok/s (vs ~10 tok/s for Fused4bit on M1 Pro).
+The CPU engine serves as a numerical reference for verifying the GPU pipeline, and runs at ~0.15 tok/s (vs ~10 tok/s for Fused4bit on M1 Pro). It is not exposed via Python bindings — it exists solely for verification.
 
 ## Performance
 
@@ -223,7 +358,7 @@ Benchmarked on M1 Pro (10-core CPU, 14-core GPU), Qwen3.5-35B-A3B-4bit full mode
 | Mode | tok/s |
 |------|-------|
 | Fused4bit (Rust) | ~10 |
-| Cpu (reference) | ~0.15 |
+| C | ~8 |
 
 Expert I/O (SSD reads) dominates at ~70% of per-layer time.
 
@@ -260,35 +395,31 @@ All verification uses the stripped model (4 layers, 4 experts) to enable fast it
 
 CpuEngine and Fused4bit are numerically identical (max_diff < 1e-5, within ULP-level tolerance). The CPU engine uses `ndarray` and f32 throughout, providing a trustworthy reference for the Metal GPU pipeline.
 
-#### Performance Differences (GPU vs CPU)
-
-1. **Expert prediction**. During CMD1 wait, the engine can predict the next layer's experts (based on the previous token's routing) and start async `pread()` into the B buffer. By the time CMD3 runs, if prediction was correct (experts often repeat between consecutive tokens), the I/O is already done. Not yet implemented in Rust.
-
-2. **LZ4-compressed experts**. The engine auto-detects `packed_experts_lz4/` at model load time and transparently decompresses via `lz4_flex`.
-
-3. **2-bit quantization**. The `dequant_matvec_2bit` Metal shader exists and `model/config.rs` computes 2-bit layout offsets, but no engine code path dispatches it yet. `helpers/repack_experts_2bit.py` generates `packed_experts_2bit/` files. Expert size drops from ~1.77 MB to ~1.44 MB at the cost of ~4% relative logit error (pilot experiments).
-
-4. **Persistent I/O thread pool**. Uses `rayon::scope()` for parallel expert reads. On macOS, GCD may have lower wake-up latency due to kernel integration.
-
-5. **Full attention GPU gating**. Currently unconditionally uses GPU attention. For very short sequences (seq_len < 32), CPU attention may be faster because GPU encoder overhead dominates.
-
-6. **Expert dispatch encoding pattern**. Currently puts all K experts in a single encoder (4 dispatches each), serializing all expert work within CMD3. Splitting across multiple encoders could allow the Metal driver to overlap gate/up of one expert with SwiGLU/down of another.
-
 ## Key Design Decisions
 
 1. **SSD expert streaming over GPU preloading**: Expert weights are too large (~19 GB) for unified memory alongside KV caches and activations. On-demand SSD reads with LRU caching are the pragmatic choice.
 
-2. **CPU KV cache**: KV caches stored as CPU f32 buffers rather than GPU persistent buffers. Adds ~0.03 ms/layer upload overhead but simplifies memory management.
+2. **Application-level LRU cache over "trust the OS"**: While flash-moe demonstrated that the OS page cache works well for 209 GB expert sets, the smaller 19 GB working set here benefits from deterministic, application-controlled eviction with 2 MB DMA-aligned buffers. The LRU cache knows MoE routing patterns; the kernel's page reclaimer does not.
 
-3. **CPU RoPE**: RoPE rotations computed on CPU. The rotary dimension is only 64 elements per head — GPU kernel launch overhead exceeds CPU compute time.
+3. **CPU KV cache with GPU-side write**: KV caches stored as CPU f32 buffers, but written on-GPU via the `kv_cache_append` kernel to eliminate upload bandwidth. flash-moe does all KV cache management on CPU.
 
-4. **Single mmap for non-expert weights**: All 0.65 GB of non-expert weights (embeddings, norms, attention projections, shared experts, gates) in one mmap'd file. Zero-copy GPU access via `newBufferWithBytesNoCopy`.
+4. **GPU RoPE via fused kernels**: Unlike flash-moe which computes RoPE on CPU (rotary dim is only 64 elements), MoE-Infer uses fused `q_head_norm_rope` and `k_head_norm_rope` GPU kernels that combine deinterleaving, RMS norm, and rotation in a single dispatch. This eliminates CPU read-back for Q/K tensors.
 
-5. **Per-layer expert files**: Each layer's 256 experts in a separate file (`packed_experts/layer_NN.bin`). Enables `pread()` with offset — no seeking needed.
+5. **BQ4: tiered quantization**: Not all weight matrices have equal sensitivity. Keeping attention projections, routers, and lm_head at higher precision while quantizing expert bulk to 4-bit gives better quality at negligible memory cost.
 
-6. **All compute in f32**: While weights are stored in 4-bit + BF16, all math on both CPU and GPU runs in f32. This avoids precision accumulation issues while keeping memory/IO footprint small.
+6. **Single mmap for non-expert weights**: All 0.65 GB of non-expert weights (embeddings, norms, attention projections, shared experts, gates) in one mmap'd file. Zero-copy GPU access via `newBufferWithBytesNoCopy`.
 
-7. **File-based module convention**: No `mod.rs` files — Rust module declarations use `#[path]` attributes. The `qwen35_moe/` directory lives alongside `qwen35_moe.rs`, which declares its submodules with explicit `#[path = "qwen35_moe/foo.rs"]` attributes.
+7. **Per-layer expert files**: Each layer's 256 experts in a separate file (`packed_experts/layer_NN.bin`). Enables `pread()` with offset — no seeking needed.
+
+8. **All compute in f32**: While weights are stored in 4-bit + BF16 + INT8, all math on both CPU and GPU runs in f32. This avoids precision accumulation issues while keeping memory/IO footprint small.
+
+9. **Type-safe generic engine**: The `Engine` trait and `ModelConfig` trait use Rust's type system to enforce correctness at compile time. Wrong model dimensions or mismatched buffer sizes are caught by the compiler, not at runtime.
+
+10. **Compile-time shader embedding**: Metal shaders embedded via `include_str!()` — no external file dependency. The engine binary is self-contained.
+
+11. **File-based module convention**: No `mod.rs` files — Rust module declarations use `#[path]` attributes. The `qwen35_moe/` directory lives alongside `qwen35_moe.rs`, which declares its submodules with explicit `#[path = "qwen35_moe/foo.rs"]` attributes.
+
+12. **Cache persistence**: Flat binary + JSON manifest format for saving/restoring full conversation state. Enables session resume across engine restarts without replaying history.
 
 ## Known Limitations
 
@@ -296,13 +427,13 @@ CpuEngine and Fused4bit are numerically identical (max_diff < 1e-5, within ULP-l
 
 2. **No continuous batching**: One sequence per `Engine`. Multiple concurrent users require multiple `Engine` instances.
 
-3. **No expert prediction**: The engine does not predict experts for the next token to overlap pread with attention compute.
+3. **No expert prediction**: The engine does not predict experts for the next token to overlap pread with attention compute. flash-moe experimented with this (temporal prediction, MLP predictor) and found net-negative results due to cache pollution, but the smaller model size here may change the tradeoff.
 
-4. **No 2-bit expert engine path**: The `dequant_matvec_2bit` Metal shader and `repack_experts_2bit.py` helper exist, but the engine code path does not dispatch it yet.
+4. **No 2-bit expert engine path**: The `dequant_matvec_2bit` Metal shader and `repack_experts_2bit.py` helper exist, but the engine code path does not dispatch it yet. flash-moe found 2-bit breaks JSON/tool calling quality.
 
 5. **No KV cache quantization**: KV cache stored as f32. Quantizing to bf16 or int8 would reduce memory and upload bandwidth.
 
-6. **CPU engine not exposed via Python bindings**: The `CpuEngine` is Rust-only (`use moe_infer::engine::qwen35_moe::CpuEngine`).
+6. **CPU engine not exposed via Python bindings**: The `CpuEngine` is Rust-only — it exists for verification, not production use.
 
 ## Project Structure
 
@@ -318,8 +449,12 @@ moe_infer_rs/                   Rust engine + Python bindings
       qwen35_moe/
         constants.rs            ModelConfig trait + FullModel/StrippedModel impls
         cpu.rs                  CPU reference engine (ndarray, pure f32)
-        fused_4bit.rs             Fused4bit GPU pipeline (3-CMD, Metal)
-        metal_context.rs        Metal device/pipelines, ExpertCache LRU, scratch bufs
+        fused_4bit.rs           Fused4bit GPU pipeline (3-CMD, Metal)
+        fused_4bit_exp1.rs      Fused4bit variant: experiment #1
+        fused_4bit_exp2.rs      Fused4bit variant: experiment #2
+        fused_bq4_exp1.rs       BQ4 GPU pipeline variant
+        fused_bq4_exp2.rs       BQ4 GPU pipeline variant: experiment #2
+        metal_context.rs        Metal device/pipelines, ExpertBuffer, persistent GPU state
         metal_kernels.rs        Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
         shaders.metal           Metal compute shaders (embedded via include_str!)
     model.rs                    Module file (uses #[path] for submodules)
@@ -329,6 +464,11 @@ moe_infer_rs/                   Rust engine + Python bindings
       weights.rs                Mmap'd weight file + tensor lookup (model_weights.bin/.json)
     cache.rs                    KV cache + linear attention state (flat binary + JSON manifest I/O)
     math_util.rs                RMS norm, softmax, RoPE, dequant, SwiGLU, SSM, conv1d
+    quant.rs                    Quantization dtype enum + tensor encoding
+    quantize/
+      qwen35_moe/
+        bq4.rs                  BQ4 quantization: sensitivity analysis + tiered encoding
+        name_mapping.json       Tensor name mapping for BQ4 conversion
     error.rs                    Error types
     constants.rs                Shared constants + backward-compat re-exports
     timer.rs                    Wall-clock timer

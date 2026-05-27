@@ -377,7 +377,7 @@ wheels = [
 
 [[package]]
 name = "moe-infer"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
@@ -402,7 +402,7 @@ vision = [
 [package.metadata]
 requires-dist = [
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "moe-infer", extras = ["vision", "serve", "mlx"], marker = "extra == 'all'" },
+    { name = "moe-infer", extras = ["vision"], marker = "extra == 'all'" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pillow", marker = "extra == 'vision'", specifier = ">=10.0" },
     { name = "safetensors", specifier = ">=0.4" },
@@ -411,7 +411,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = ">=5.9.0" },
 ]
-provides-extras = ["vision", "serve", "mlx", "all"]
+provides-extras = ["vision", "all"]
 
 [[package]]
 name = "mpmath"
