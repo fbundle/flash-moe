@@ -6,6 +6,7 @@ mod cache;
 mod constants;
 mod error;
 mod quant;
+mod safetensors;
 #[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 mod timer;
 
