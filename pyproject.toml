@@ -23,13 +23,6 @@ vision = [
     "Pillow>=10.0",
     "torchvision>=0.27.0",
 ]
-serve = [
-    # "fastapi>=0.136.3",
-]
-mlx = [
-    # "mlx-lm>=0.31.3",
-]
 all = [
-    "moe_infer[vision,serve,mlx]",
-    # "lz4>=4.4.5",
+    "moe_infer[vision]",
 ]

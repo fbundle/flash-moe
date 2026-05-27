@@ -15,13 +15,15 @@ Open Terminal and run these commands from the project folder:
 
 ```bash
 # 1. Build and install
-uv sync --reinstall --extra vision
+uv add moe_infer[all]  # or `uv sync --reinstall --extra vision` if you live inside this project
 
 # 2. Download the model (about 30 GB)
 hf download Qwen/Qwen3.6-35B-A3B \
   --local-dir hub/models--Qwen--Qwen3.6-35B-A3B
 
 ```
+
+If you live in a cave, you can install with pip `pip install moe_infer[all]`
 
 ```python
 # 3. Convert the model (takes ~5 minutes)
