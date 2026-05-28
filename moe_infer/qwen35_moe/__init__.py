@@ -99,7 +99,7 @@ def convert(
     output: str | None = None,
     *,
     version: str,
-    scheme: str = "bq4",
+    scheme: str | list[str] = "bq4",
 ) -> None:
     """Full conversion: HF hub → quantized model + tokenizer + vision_encoder.
 
@@ -111,30 +111,28 @@ def convert(
         Output root.  Defaults to ``data/<hub-basename>``.
     version : str
         Qwen generation: ``"3.5"`` or ``"3.6"``.
-        Qwen3.6 applies a +1.0 norm-weight correction.
-    scheme : str
-        Quantization scheme: ``"bq4"`` (selective) or ``"int4"`` (all-INT4).
+    scheme : str or list of str
+        Quantization schemes: ``"bq4"``, ``"int4"``, or both via a list.
     """
     hub_path = input.rstrip("/")
     if output is None:
-        suffix = f"-{scheme}" if scheme != "bq4" else "-bq4"
-        output = f"data/{_os.path.basename(hub_path)}{suffix}"
+        output = f"data/{_os.path.basename(hub_path)}"
 
-    model_dir = _os.path.join(output, "model_bq4")
-    print(f"[1/3] Quantizing model → {model_dir}")
-    quantize(
-        hub_path, model_dir,
-        version=version,
-        scheme=scheme,
-    )
+    schemes = scheme if isinstance(scheme, list) else [scheme]
 
-    print(f"[2/3] Extracting tokenizer → {output}/tokenizer")
+    for s in schemes:
+        model_dir = _os.path.join(output, f"model_{s}")
+        print(f"[quantize] {s} → {model_dir}")
+        quantize(hub_path, model_dir, version=version, scheme=s)
+
+    print(f"[extract] Tokenizer → {output}/tokenizer")
     extract_tokenizer(hub_path, _os.path.join(output, "tokenizer"))
 
-    print(f"[3/3] Extracting vision encoder → {output}/vision_encoder")
+    print(f"[extract] Vision encoder → {output}/vision_encoder")
     extract_vision(hub_path, _os.path.join(output, "vision_encoder"))
 
     print(f"\nDone → {output}/")
-    print(f"  model_bq4/       (quantized weights)")
-    print(f"  tokenizer/       (AutoTokenizer-ready)")
-    print(f"  vision_encoder/  (AutoImageProcessor + visual weights)")
+    for s in schemes:
+        print(f"  model_{s}/  ({s})")
+    print(f"  tokenizer/")
+    print(f"  vision_encoder/")
