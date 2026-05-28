@@ -79,6 +79,6 @@ def sample(
 
     total = probs.sum()
     if total <= 0:
-        return 0
+        return int(np.argmax(logits))
     probs /= total
     return int(np.random.choice(n, p=probs))
