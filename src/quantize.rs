@@ -199,8 +199,9 @@ pub fn run(
             // Pad inner dim for INT4
             let out_dim = out_shape[0];
             let in_dim = if out_shape.len() >= 2 { out_shape[1] } else { 0 };
-            let (padded_in, f32_padded) = if matches!(q, DType::Int4 | DType::Fp4E2m1) {
-                let pi = (in_dim + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
+            let group_align = if q == DType::Fp8E4m3 { crate::dtype::FP8_GROUP_SIZE } else { GROUP_SIZE };
+            let (padded_in, f32_padded) = if matches!(q, DType::Int4 | DType::Fp4E2m1 | DType::Fp8E4m3) {
+                let pi = (in_dim + group_align - 1) / group_align * group_align;
                 if pi != in_dim {
                     let mut p = vec![0.0f32; out_dim * pi];
                     for r in 0..out_dim {
@@ -226,7 +227,7 @@ pub fn run(
             // INT4/INT8 encode adds .weight/.scales/.biases suffixes, so strip
             // .weight from the base to avoid double ".weight.weight".
             // BF16/Fp32 encode adds no suffix, so keep .weight for direct lookups.
-            let strip_weight = matches!(q, DType::Int4 | DType::Int8 | DType::Fp4E2m1) && mlx_name.ends_with(".weight");
+            let strip_weight = matches!(q, DType::Int4 | DType::Int8 | DType::Fp4E2m1 | DType::Fp8E4m3) && mlx_name.ends_with(".weight");
             let base = if strip_weight {
                 mlx_name[..mlx_name.len() - 7].to_string()
             } else {
