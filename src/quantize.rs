@@ -16,7 +16,7 @@ use crate::safetensors::{bytes_to_f32, parse_safetensors, read_tensor_bytes};
 const ALIGN: u64 = 64;
 
 /// What to do with a given weight tensor.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum WeightKind {
     /// Process during shard pass, write to model_weights.bin.
     Normal,
@@ -27,6 +27,7 @@ pub enum WeightKind {
 }
 
 /// Everything the pipeline needs to know about a weight tensor.
+#[derive(Clone)]
 pub struct WeightClass {
     pub name: String,
     pub quant: DType,
@@ -102,25 +103,8 @@ pub fn run(
     };
     eprintln!("  Total tensors: {}", weight_map.len());
 
-    // ── 2. Classify all tensors ─────────────────────────────────────
-    let mut classified: Vec<(String, WeightClass)> = Vec::new();
-
-    for (hf_name, _shard) in weight_map.iter() {
-        classified.push((hf_name.clone(), WeightClass {
-            name: String::new(),
-            quant: DType::Bf16,
-            kind: WeightKind::Normal,
-        }));
-    }
-
-    // Actually, we need to classify BEFORE the shard pass so we can:
-    // (a) know which tensors to skip, (b) collect expert layers.
-    // But we need shapes.  Easiest: download first shard's header to get shapes,
-    // then classify all tensors, then re-process in order.
-    //
-    // Alternative: just group by shard, download each shard once,
-    // parse its header, classify its tensors, and process immediately.
-    // This is the one-pass approach: group by shard, parse its header, classify
+    // ── 2. Classify as we process each shard (need shapes from headers) ──
+    let mut classified: HashMap<String, WeightClass> = HashMap::new();
 
     // ── 3. Group by shard and classify on the fly ───────────────────
     let shard_order: Vec<String> = {
@@ -182,10 +166,12 @@ pub fn run(
             let cls = scheme.classify(hf_name, &shape);
             let mlx_name = cls.name.clone();
 
+            // Store classification for expert pass
+            classified.insert(hf_name.clone(), cls.clone());
+
             match cls.kind {
                 WeightKind::Skip => continue,
                 WeightKind::Expert(layer) => {
-                    // Track expert info for phase 2
                     let entry = expert_by_layer.entry(layer)
                         .or_insert_with(|| (String::new(), String::new()));
                     if mlx_name.contains("gate_up_proj") || mlx_name.contains("gate_proj") {
@@ -306,10 +292,11 @@ pub fn run(
     eprintln!("============================================================");
 
     let t1 = std::time::Instant::now();
+    let classified_vec: Vec<(String, WeightClass)> = classified.into_iter().collect();
     let expert_layers_done = scheme.process_experts(
         &repo,
         &weight_map,
-        &classified,
+        &classified_vec,
         output_dir,
     )?;
 
