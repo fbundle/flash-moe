@@ -7,6 +7,8 @@ behaviour (EOS tokens, response extraction) is set by subclasses.
 
 from __future__ import annotations
 
+import sys
+import time
 from typing import Any, Iterator
 
 import numpy as np
@@ -58,6 +60,19 @@ def _check_mtp(model_dir: str) -> bool:
         return False
     tc = cfg.get("text_config", cfg)
     return tc.get("mtp_num_hidden_layers", 0) > 0
+
+
+def _print_telemetry(t_start: float, t_first_token: float, num_tokens: int) -> None:
+    ttft_ms = (t_first_token - t_start) * 1000.0
+    tt_ms = (time.time() - t_start) * 1000.0
+    num_gen = num_tokens - 1
+    gen_s = (tt_ms - ttft_ms) / 1000.0
+    tok_s = num_gen / gen_s if gen_s > 0 and num_gen > 0 else 0.0
+    print(
+        f"\n── TTFT: {ttft_ms:,.0f}ms | TT: {tt_ms:,.0f}ms |"
+        f" tokens: {num_tokens} | tok/s: {tok_s:,.1f} ──",
+        file=sys.stderr,
+    )
 
 
 def _word_stream(
@@ -244,6 +259,8 @@ class Pipeline:
         """
         # Build message content — use structured image items when images
         # are present so the chat template emits <|image_pad|> tokens.
+        t_start = time.time()
+
         if images:
             content: list[dict[str, str]] = []
             for _ in images:
@@ -266,10 +283,11 @@ class Pipeline:
             embeds = self._engine.embed_lookup(input_ids)
 
         logits = self._engine.forward_hidden(embeds, self._cache)
+        t_first_token = time.time()
 
         if stream:
             return self._stream_chat(
-                logits[-1],
+                logits[-1], t_start, t_first_token,
                 max_tokens, temperature, top_k, top_p, min_p,
             )
 
@@ -292,6 +310,8 @@ class Pipeline:
             on_token=_on_token,
         )
 
+        _print_telemetry(t_start, t_first_token, len(tokens))
+
         response = self._extract_response(completion)
         self._messages.append({"role": "assistant", "content": response})
         return response
@@ -299,6 +319,8 @@ class Pipeline:
     def _stream_chat(
         self,
         first_logits: np.ndarray,
+        t_start: float,
+        t_first_token: float,
         max_tokens: int,
         temperature: float,
         top_k: int,
@@ -330,6 +352,8 @@ class Pipeline:
         remainder = text[cursor[0] :]
         if remainder:
             yield remainder
+
+        _print_telemetry(t_start, t_first_token, len(token_ids))
 
         response = self._extract_response(text)
         self._messages.append({"role": "assistant", "content": response})
