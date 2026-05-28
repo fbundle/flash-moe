@@ -223,17 +223,21 @@ pub fn run(
                 offset += pad;
             }
 
+            // INT4/INT8 encode adds .weight/.scales/.biases suffixes, so strip
+            // .weight from the base to avoid double ".weight.weight".
+            // BF16/Fp32 encode adds no suffix, so keep .weight for direct lookups.
+            let strip_weight = matches!(q, DType::Int4 | DType::Int8) && mlx_name.ends_with(".weight");
+            let base = if strip_weight {
+                mlx_name[..mlx_name.len() - 7].to_string()
+            } else {
+                mlx_name.clone()
+            };
+
             // Encode and write
             let encoded = q.encode(&f32_padded, out_dim, padded_in);
             for et in &encoded {
-                // Avoid double .weight when encode also adds .weight suffix
-                let base = if et.suffix == ".weight" && mlx_name.ends_with(".weight") {
-                    &mlx_name[..mlx_name.len() - 7]
-                } else {
-                    &mlx_name[..]
-                };
                 let tname = if et.suffix.is_empty() {
-                    base.to_string()
+                    base.clone()
                 } else {
                     format!("{}{}", base, et.suffix)
                 };
