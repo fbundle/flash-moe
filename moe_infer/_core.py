@@ -106,6 +106,11 @@ class HfRepo:
         """Download *filename* and return its local path."""
         return self._inner.ensure(filename)
 
+    def ensure_batch(self, filenames: list[str]) -> list[str]:
+        """Download multiple files in parallel (Rust-side threading).
+        Returns local paths in the same order."""
+        return self._inner.ensure_batch(filenames)
+
     def remove(self, filename: str) -> None:
         """Delete a cached file from the staging directory."""
         self._inner.remove(filename)
