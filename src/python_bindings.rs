@@ -10,7 +10,9 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
-use crate::bq4::{Bq4, QwenVersion};
+use crate::bq4::{BQ4Scheme, QwenVersion};
+use crate::hf_util::HfRepo;
+use crate::int4::Int4Scheme;
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -93,7 +95,7 @@ pub struct Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFused4bit", k=0))]
+    #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFusedExp2", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
         let engine = DynEngine::new(pipeline_mode, model.inner.clone(), k)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -203,13 +205,12 @@ impl Engine {
 /// BQ4 rules, quantizes, and writes ``model_weights.bin``,
 /// ``model_weights.json``, and ``packed_experts/layer_XX.bin``.
 #[pyfunction]
-#[pyo3(signature = (model_path, output_dir, *, version, strip_layers=0, strip_experts=0))]
-pub fn qwen35_moe_bq4_quantize(
+#[pyo3(signature = (model_path, output_dir, *, version, scheme="bq4"))]
+pub fn qwen35_moe_quantize(
     model_path: &str,
     output_dir: &str,
     version: &str,
-    strip_layers: usize,
-    strip_experts: usize,
+    scheme: &str,
 ) -> PyResult<()> {
     let qwen_version = match version {
         "3.5" => QwenVersion::V35,
@@ -218,24 +219,119 @@ pub fn qwen35_moe_bq4_quantize(
             format!("Unknown version: {}. Expected '3.5' or '3.6'.", version)
         )),
     };
-    // Read architectures from model config.json
-    let config_path = std::path::Path::new(model_path).join("config.json");
-    let arch = std::fs::read_to_string(&config_path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-        .and_then(|s| {
-            let v: serde_json::Value = serde_json::from_str(&s)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            let arch = v["architectures"][0].as_str()
-                .unwrap_or("Qwen3_5MoeForConditionalGeneration");
-            Ok(arch.to_string())
-        })?;
-    let quantize = match arch.as_str() {
-        "Qwen3_5MoeForConditionalGeneration" =>
-            Bq4::new(strip_layers, strip_experts, qwen_version),
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unknown architecture: {}", arch))),
+
+    // Determine directory containing config.json (local or HF staging)
+    let config_dir = if std::path::Path::new(model_path).is_dir() {
+        std::path::PathBuf::from(model_path)
+    } else {
+        let repo = crate::hf_util::HfRepo::from_hf(model_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        repo.ensure("config.json")
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        repo.path().to_path_buf()
     };
-    quantize.quantize(model_path, output_dir)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+
+    let config_json = std::fs::read_to_string(config_dir.join("config.json"))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let arch = {
+        let v: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        v["architectures"][0].as_str()
+            .unwrap_or("Qwen3_5MoeForConditionalGeneration")
+            .to_string()
+    };
+
+    if arch != "Qwen3_5MoeForConditionalGeneration" {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown architecture: {}", arch)
+        ));
+    };
+
+    match scheme {
+        "bq4" => {
+            let s = BQ4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        "int4" => {
+            let s = Int4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown scheme: {}. Expected 'bq4' or 'int4'.", scheme)
+        )),
+    }
+}
+
+// ─── HfRepo (HF downloader exposed to Python) ────────────────────────────
+
+#[pyclass(unsendable)]
+pub struct PyHfRepo {
+    repo: HfRepo,
+}
+
+#[pymethods]
+impl PyHfRepo {
+    #[new]
+    #[pyo3(signature = (repo_id))]
+    fn new(repo_id: &str) -> PyResult<Self> {
+        HfRepo::from_hf(repo_id)
+            .map(|repo| PyHfRepo { repo })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Download a file and return its local path.
+    fn ensure(&self, filename: &str) -> PyResult<String> {
+        self.repo.ensure(filename)
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Download multiple files in parallel (Rust-side threading).
+    /// Returns local paths in the same order.
+    fn ensure_batch(&self, filenames: Vec<String>) -> PyResult<Vec<String>> {
+        self.repo.ensure_batch(&filenames)
+            .map(|paths| paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Get a file's expected size from HF (or local fs metadata).
+    fn file_size(&self, filename: &str) -> PyResult<u64> {
+        self.repo.file_size(filename)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Get (filename, size_bytes) for all files in the repo.
+    fn file_sizes(&self) -> PyResult<Vec<(String, u64)>> {
+        self.repo.file_sizes()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Delete a cached file.
+    fn remove(&self, filename: &str) {
+        self.repo.remove(filename)
+    }
+
+    /// List immediate children of *dir* (defaults to root).  Behaves like UNIX
+    /// ``ls``: returns names of files and directories at that level.
+    #[pyo3(signature = (dir=None))]
+    fn ls(&self, dir: Option<&str>) -> PyResult<Vec<String>> {
+        self.repo.ls(dir)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    #[getter]
+    fn path(&self) -> String {
+        self.repo.path().to_string_lossy().to_string()
+    }
+
+    #[getter]
+    fn is_hf(&self) -> bool {
+        self.repo.is_hf()
+    }
 }
 
 // ─── Internal forward impl ─────────────────────────────────────────────────

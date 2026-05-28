@@ -432,6 +432,75 @@ kernel void dequant_matvec_4bit_v5(
 }
 
 // ============================================================================
+// Kernel 1g: FP4_E2M1 dequant matvec
+// ============================================================================
+// Same structure as v3/v5 but decodes FP4 E2M1 nibbles via a static lookup
+// table.  No bias — FP4's symmetric encoding handles the zero point natively.
+//
+//   dequant_val = fp4_lut[nibble] * scale
+//
+// The LUT is hard-coded to match the Rust-side FP4_E2M1_LUT.
+
+constant float fp4_e2m1_lut[16] = {
+     0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+};
+
+kernel void dequant_matvec_fp4_e2m1(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(2)]],  // [in_dim]
+    device float*          out        [[buffer(3)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(4)]],
+    constant uint&         in_dim     [[buffer(5)]],
+    constant uint&         group_size [[buffer(6)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        // Dequant with FP4 LUT: val = lut[nibble] * scale, then multiply with x
+        acc += fp4_e2m1_lut[(packed >>  0) & 0xF] * scale * x_shared[x_base + 0];
+        acc += fp4_e2m1_lut[(packed >>  4) & 0xF] * scale * x_shared[x_base + 1];
+        acc += fp4_e2m1_lut[(packed >>  8) & 0xF] * scale * x_shared[x_base + 2];
+        acc += fp4_e2m1_lut[(packed >> 12) & 0xF] * scale * x_shared[x_base + 3];
+        acc += fp4_e2m1_lut[(packed >> 16) & 0xF] * scale * x_shared[x_base + 4];
+        acc += fp4_e2m1_lut[(packed >> 20) & 0xF] * scale * x_shared[x_base + 5];
+        acc += fp4_e2m1_lut[(packed >> 24) & 0xF] * scale * x_shared[x_base + 6];
+        acc += fp4_e2m1_lut[(packed >> 28) & 0xF] * scale * x_shared[x_base + 7];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
 // Kernel 1e: 2-bit affine dequant matvec (same structure as v3)
 // ============================================================================
 // Packs 16 x 2-bit values per uint32. Each value is 0-3, dequantized as:
@@ -1976,6 +2045,89 @@ kernel void matvec_int8(
 
     float sum = simd_sum(acc);
 
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// Kernel 22: FP8_E4M3 dequant matvec
+// ============================================================================
+// Per-group scaled FP8 E4M3 weights.  No bias — FP8's symmetric encoding
+// handles the zero point natively.  Uses a 256-entry LUT for byte→float decode.
+//
+//   dequant_val = lut[byte] * scale
+
+constant float fp8_e4m3_lut[256] = {
+     0.0000000f,  0.0019531f,  0.0039062f,  0.0058594f,  0.0078125f,  0.0097656f,  0.0117188f,  0.0136719f,
+     0.0156250f,  0.0175781f,  0.0195312f,  0.0214844f,  0.0234375f,  0.0253906f,  0.0273438f,  0.0292969f,
+     0.0312500f,  0.0351562f,  0.0390625f,  0.0429688f,  0.0468750f,  0.0507812f,  0.0546875f,  0.0585938f,
+     0.0625000f,  0.0703125f,  0.0781250f,  0.0859375f,  0.0937500f,  0.1015625f,  0.1093750f,  0.1171875f,
+     0.1250000f,  0.1406250f,  0.1562500f,  0.1718750f,  0.1875000f,  0.2031250f,  0.2187500f,  0.2343750f,
+     0.2500000f,  0.2812500f,  0.3125000f,  0.3437500f,  0.3750000f,  0.4062500f,  0.4375000f,  0.4687500f,
+     0.5000000f,  0.5625000f,  0.6250000f,  0.6875000f,  0.7500000f,  0.8125000f,  0.8750000f,  0.9375000f,
+     1.0000000f,  1.1250000f,  1.2500000f,  1.3750000f,  1.5000000f,  1.6250000f,  1.7500000f,  1.8750000f,
+     2.0000000f,  2.2500000f,  2.5000000f,  2.7500000f,  3.0000000f,  3.2500000f,  3.5000000f,  3.7500000f,
+     4.0000000f,  4.5000000f,  5.0000000f,  5.5000000f,  6.0000000f,  6.5000000f,  7.0000000f,  7.5000000f,
+     8.0000000f,  9.0000000f, 10.0000000f, 11.0000000f, 12.0000000f, 13.0000000f, 14.0000000f, 15.0000000f,
+    16.0000000f, 18.0000000f, 20.0000000f, 22.0000000f, 24.0000000f, 26.0000000f, 28.0000000f, 30.0000000f,
+    32.0000000f, 36.0000000f, 40.0000000f, 44.0000000f, 48.0000000f, 52.0000000f, 56.0000000f, 60.0000000f,
+    64.0000000f, 72.0000000f, 80.0000000f, 88.0000000f, 96.0000000f,104.0000000f,112.0000000f,120.0000000f,
+   128.0000000f,144.0000000f,160.0000000f,176.0000000f,192.0000000f,208.0000000f,224.0000000f,240.0000000f,
+   240.0000000f,240.0000000f,240.0000000f,240.0000000f,240.0000000f,240.0000000f,240.0000000f,240.0000000f,
+    -0.0000000f, -0.0019531f, -0.0039062f, -0.0058594f, -0.0078125f, -0.0097656f, -0.0117188f, -0.0136719f,
+    -0.0156250f, -0.0175781f, -0.0195312f, -0.0214844f, -0.0234375f, -0.0253906f, -0.0273438f, -0.0292969f,
+    -0.0312500f, -0.0351562f, -0.0390625f, -0.0429688f, -0.0468750f, -0.0507812f, -0.0546875f, -0.0585938f,
+    -0.0625000f, -0.0703125f, -0.0781250f, -0.0859375f, -0.0937500f, -0.1015625f, -0.1093750f, -0.1171875f,
+    -0.1250000f, -0.1406250f, -0.1562500f, -0.1718750f, -0.1875000f, -0.2031250f, -0.2187500f, -0.2343750f,
+    -0.2500000f, -0.2812500f, -0.3125000f, -0.3437500f, -0.3750000f, -0.4062500f, -0.4375000f, -0.4687500f,
+    -0.5000000f, -0.5625000f, -0.6250000f, -0.6875000f, -0.7500000f, -0.8125000f, -0.8750000f, -0.9375000f,
+    -1.0000000f, -1.1250000f, -1.2500000f, -1.3750000f, -1.5000000f, -1.6250000f, -1.7500000f, -1.8750000f,
+    -2.0000000f, -2.2500000f, -2.5000000f, -2.7500000f, -3.0000000f, -3.2500000f, -3.5000000f, -3.7500000f,
+    -4.0000000f, -4.5000000f, -5.0000000f, -5.5000000f, -6.0000000f, -6.5000000f, -7.0000000f, -7.5000000f,
+    -8.0000000f, -9.0000000f,-10.0000000f,-11.0000000f,-12.0000000f,-13.0000000f,-14.0000000f,-15.0000000f,
+   -16.0000000f,-18.0000000f,-20.0000000f,-22.0000000f,-24.0000000f,-26.0000000f,-28.0000000f,-30.0000000f,
+   -32.0000000f,-36.0000000f,-40.0000000f,-44.0000000f,-48.0000000f,-52.0000000f,-56.0000000f,-60.0000000f,
+   -64.0000000f,-72.0000000f,-80.0000000f,-88.0000000f,-96.0000000f,-104.000000f,-112.000000f,-120.000000f,
+  -128.000000f,-144.000000f,-160.000000f,-176.000000f,-192.000000f,-208.000000f,-224.000000f,-240.000000f,
+  -240.000000f,-240.000000f,-240.000000f,-240.000000f,-240.000000f,-240.000000f,-240.000000f,-240.000000f,
+};
+
+kernel void matvec_fp8_e4m3(
+    device const uchar*     W_u8     [[buffer(0)]],  // [out_dim, in_dim]
+    device const uint16_t*  scales   [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const float*     x        [[buffer(2)]],  // [in_dim]
+    device float*           out      [[buffer(3)]],  // [out_dim]
+    constant uint&          out_dim   [[buffer(4)]],
+    constant uint&          in_dim    [[buffer(5)]],
+    constant uint&          group_size [[buffer(6)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uchar* w_row = W_u8 + row * in_dim;
+    device const uint16_t* s_row = scales + row * (in_dim / group_size);
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        uint g = col / group_size;
+        float scale = bf16_to_f32(s_row[g]);
+        float w = fp8_e4m3_lut[w_row[col]] * scale;
+        acc += w * x_shared[col];
+    }
+
+    float sum = simd_sum(acc);
     if (simd_lane == 0) {
         out[row] = sum;
     }

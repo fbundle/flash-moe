@@ -156,16 +156,17 @@ class Pipeline:
         *,
         hub: str | None = None,
         tokenizer: Any = None,
-        mode: str = "Qwen35MoEBq4Exp2",
+        mode: str = "Qwen35MoEFusedExp2",
         k: int = 0,
+        quantize_mode: str = "bq4",
     ) -> None:
         import os
 
         root = model_path  # saved for sibling lookups (tokenizer/, vision_encoder/)
 
-        # Auto-discover converted format: root/model_bq4/
-        model_bq4 = os.path.join(root, "model_bq4")
-        if os.path.isdir(model_bq4):
+        # Auto-discover converted format: root/model_bq4/ (or model_int4/)
+        model_subdir = os.path.join(root, f"model_{quantize_mode}")
+        if os.path.isdir(model_subdir):
             if tokenizer is None:
                 tok_dir = os.path.join(root, "tokenizer")
                 if os.path.isdir(tok_dir):
@@ -174,7 +175,7 @@ class Pipeline:
                 vis_dir = os.path.join(root, "vision_encoder")
                 if os.path.isdir(vis_dir):
                     hub = vis_dir
-            model_path = model_bq4
+            model_path = model_subdir
 
         # LM (raw Rust types — wrappers break cross-calls)
         self._model = _rs.Model(model_path)

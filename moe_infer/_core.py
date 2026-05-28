@@ -46,7 +46,7 @@ class Engine:
     model : Model
         A loaded :class:`Model` instance.
     pipeline_mode : str
-        One of ``"Qwen35MoEBq4Exp1"`` or ``"Qwen35MoEBq4Exp2"``.
+        One of ``"Qwen35MoEFusedExp1"`` or ``"Qwen35MoEFusedExp2"``.
     k : int
         Active experts per token.  0 means "use model default" (8 for Qwen3.6).
     """
@@ -54,7 +54,7 @@ class Engine:
     def __init__(
         self,
         model: Model,
-        pipeline_mode: str = "Qwen35MoEBq4Exp2",
+        pipeline_mode: str = "Qwen35MoEFusedExp2",
         k: int = 0,
     ) -> None:
         self._inner = _rs.Engine(model._inner, pipeline_mode, k)
@@ -87,6 +87,61 @@ class Cache:
         return self._inner.__repr__()
 
 
+# ── HfRepo ────────────────────────────────────────────────────────────────────
+
+class HfRepo:
+    """HuggingFace repo file downloader (local or remote).
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace repo ID (e.g. ``"Qwen/Qwen3.6-35B-A3B"``) or a
+        local directory path.
+    """
+
+    def __init__(self, repo_id: str) -> None:
+        self._inner = _rs.PyHfRepo(repo_id)
+
+    def ensure(self, filename: str) -> str:
+        """Download *filename* and return its local path."""
+        return self._inner.ensure(filename)
+
+    def ensure_batch(self, filenames: list[str]) -> list[str]:
+        """Download multiple files in parallel (Rust-side threading).
+        Returns local paths in the same order."""
+        return self._inner.ensure_batch(filenames)
+
+    def file_size(self, filename: str) -> int:
+        """Get a file's expected size in bytes (from HF API or local fs)."""
+        return self._inner.file_size(filename)
+
+    def file_sizes(self) -> list[tuple[str, int]]:
+        """Get (filename, size_bytes) for all files in the repo."""
+        return self._inner.file_sizes()
+
+    def remove(self, filename: str) -> None:
+        """Delete a cached file from the staging directory."""
+        self._inner.remove(filename)
+
+    def ls(self, dir: str | None = None) -> list[str]:
+        """List immediate children of *dir* (defaults to root).  Behaves like
+        UNIX ``ls``: returns names of files and directories at that level."""
+        return self._inner.ls(dir)
+
+    @property
+    def path(self) -> str:
+        """Local staging directory path."""
+        return self._inner.path
+
+    @property
+    def is_hf(self) -> bool:
+        """True if this is a remote HF repo (vs a local directory)."""
+        return self._inner.is_hf
+
+    def __repr__(self) -> str:
+        return f"HfRepo({self.path!r})"
+
+
 # ── Top-level functions ──────────────────────────────────────────────────────
 
 def record_engine_telemetry(on: bool) -> None:
@@ -101,8 +156,8 @@ def record_engine_telemetry(on: bool) -> None:
 # ── Qwen-specific re-exports (moved to moe_infer.qwen35_moe) ─────────────────
 
 from moe_infer.qwen35_moe import (  # noqa: E402
-    bq4_convert as qwen35_moe_bq4_convert,
-    bq4_extract_tokenizer as qwen35_moe_bq4_extract_tokenizer,
-    bq4_extract_vision as qwen35_moe_bq4_extract_vision,
-    bq4_quantize as qwen35_moe_bq4_quantize,
+    convert as qwen35_moe_convert,
+    extract_tokenizer as qwen35_moe_extract_tokenizer,
+    extract_vision as qwen35_moe_extract_vision,
+    quantize as qwen35_moe_quantize,
 )

@@ -58,18 +58,18 @@ pub trait Engine {
 mod qwen35_constants;
 #[path = "engine/qwen35_moe/cpu.rs"]
 mod cpu;
-#[path = "engine/qwen35_moe/fused_bq4_exp1.rs"]
-mod fused_bq4_exp1;
-#[path = "engine/qwen35_moe/fused_bq4_exp2.rs"]
-mod fused_bq4_exp2;
+#[path = "engine/qwen35_moe/fused_exp1.rs"]
+mod fused_exp1;
+#[path = "engine/qwen35_moe/fused_exp2.rs"]
+mod fused_exp2;
 #[path = "engine/qwen35_moe/metal_context.rs"]
 pub mod metal_context;
 #[path = "engine/qwen35_moe/metal_kernels.rs"]
 mod metal_kernels;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
-use crate::engine::fused_bq4_exp1::FusedBq4Exp1;
-use crate::engine::fused_bq4_exp2::FusedBq4Exp2;
+use crate::engine::fused_exp1::FusedExp1;
+use crate::engine::fused_exp2::FusedExp2;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -88,14 +88,14 @@ impl DynEngine {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let inner: Box<dyn Engine> = match (engine_type, arch) {
-            ("Qwen35MoEBq4Exp1", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(FusedBq4Exp1::<FullModel>::new(model, k)?),
-            ("Qwen35MoEBq4Exp1", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(FusedBq4Exp1::<StrippedModel>::new(model, k)?),
-            ("Qwen35MoEBq4Exp2", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(FusedBq4Exp2::<FullModel>::new(model, k)?),
-            ("Qwen35MoEBq4Exp2", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(FusedBq4Exp2::<StrippedModel>::new(model, k)?),
+            ("Qwen35MoEFusedExp1", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp1::<FullModel>::new(model, k)?),
+            ("Qwen35MoEFusedExp1", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp1::<StrippedModel>::new(model, k)?),
+            ("Qwen35MoEFusedExp2", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp2::<FullModel>::new(model, k)?),
+            ("Qwen35MoEFusedExp2", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp2::<StrippedModel>::new(model, k)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),

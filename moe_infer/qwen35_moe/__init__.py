@@ -7,7 +7,7 @@ import os as _os
 import _moe_infer_rs as _rs  # type: ignore[import-untyped]
 
 
-def bq4_extract_tokenizer(hub_path: str, output_dir: str) -> None:
+def extract_tokenizer(hub_path: str, output_dir: str) -> None:
     """Copy tokenizer files from a HF hub to *output_dir*."""
     import shutil
 
@@ -28,7 +28,7 @@ def bq4_extract_tokenizer(hub_path: str, output_dir: str) -> None:
             shutil.copy2(src, _os.path.join(output_dir, name))
 
 
-def bq4_extract_vision(hub_path: str, output_dir: str) -> None:
+def extract_vision(hub_path: str, output_dir: str) -> None:
     """Copy vision-encoder files from a HF hub to *output_dir*."""
     import json
     import shutil
@@ -67,41 +67,41 @@ def bq4_extract_vision(hub_path: str, output_dir: str) -> None:
     )
 
 
-def bq4_quantize(
+def quantize(
     model_path: str,
     output_dir: str,
     *,
     version: str,
-    strip_layers: int = 0,
-    strip_experts: int = 0,
+    scheme: str = "bq4",
 ) -> None:
-    """Quantize a HF Qwen3.5-MoE model to BQ4 format.
+    """Quantize a HF Qwen3.5-MoE model.
 
     Parameters
     ----------
     version : str
         Qwen generation: ``"3.5"`` or ``"3.6"``.
         Qwen3.6 applies a +1.0 norm-weight correction.
+    scheme : str
+        Quantization scheme: ``"bq4"`` (selective) or ``"int4"`` (all-INT4).
     """
     if version not in ("3.5", "3.6"):
         raise ValueError(f"version must be '3.5' or '3.6', got {version!r}")
-    _rs.qwen35_moe_bq4_quantize(
+    _rs.qwen35_moe_quantize(
         model_path,
         output_dir,
         version=version,
-        strip_layers=strip_layers,
-        strip_experts=strip_experts,
+        scheme=scheme,
     )
 
 
-def bq4_convert(
+def convert(
     input: str,
     output: str | None = None,
     *,
     version: str,
-    strip: bool = False,
+    scheme: str | list[str] = "bq4",
 ) -> None:
-    """Full conversion: HF hub → model_bq4 + tokenizer + vision_encoder.
+    """Full conversion: HF hub → quantized model + tokenizer + vision_encoder.
 
     Parameters
     ----------
@@ -111,32 +111,28 @@ def bq4_convert(
         Output root.  Defaults to ``data/<hub-basename>``.
     version : str
         Qwen generation: ``"3.5"`` or ``"3.6"``.
-        Qwen3.6 applies a +1.0 norm-weight correction.
-    strip : bool
-        If True, create a test model with 4 layers × 4 experts.
+    scheme : str or list of str
+        Quantization schemes: ``"bq4"``, ``"int4"``, or both via a list.
     """
     hub_path = input.rstrip("/")
     if output is None:
         output = f"data/{_os.path.basename(hub_path)}"
 
-    strip_layers = 4 if strip else 0
-    strip_experts = 4 if strip else 0
+    schemes = scheme if isinstance(scheme, list) else [scheme]
 
-    print(f"[1/3] Quantizing model → {output}/model_bq4")
-    bq4_quantize(
-        hub_path, _os.path.join(output, "model_bq4"),
-        version=version,
-        strip_layers=strip_layers,
-        strip_experts=strip_experts,
-    )
+    for s in schemes:
+        model_dir = _os.path.join(output, f"model_{s}")
+        print(f"[quantize] {s} → {model_dir}")
+        quantize(hub_path, model_dir, version=version, scheme=s)
 
-    print(f"[2/3] Extracting tokenizer → {output}/tokenizer")
-    bq4_extract_tokenizer(hub_path, _os.path.join(output, "tokenizer"))
+    print(f"[extract] Tokenizer → {output}/tokenizer")
+    extract_tokenizer(hub_path, _os.path.join(output, "tokenizer"))
 
-    print(f"[3/3] Extracting vision encoder → {output}/vision_encoder")
-    bq4_extract_vision(hub_path, _os.path.join(output, "vision_encoder"))
+    print(f"[extract] Vision encoder → {output}/vision_encoder")
+    extract_vision(hub_path, _os.path.join(output, "vision_encoder"))
 
     print(f"\nDone → {output}/")
-    print(f"  model_bq4/      (quantized weights)")
-    print(f"  tokenizer/      (AutoTokenizer-ready)")
-    print(f"  vision_encoder/ (AutoImageProcessor + visual weights)")
+    for s in schemes:
+        print(f"  model_{s}/  ({s})")
+    print(f"  tokenizer/")
+    print(f"  vision_encoder/")

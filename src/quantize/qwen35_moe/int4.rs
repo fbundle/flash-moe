@@ -1,5 +1,4 @@
-// BQ4Scheme: selective quantization — attention projections → BF16, lm_head → INT8,
-// everything else → INT4.  Qwen3.5/Qwen3.6-specific.
+// Int4Scheme: all 2D weight matrices → INT4.  Qwen3.5/Qwen3.6-specific.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,39 +13,30 @@ pub use crate::qwen35_moe_common::{
 
 use crate::qwen35_moe_common::{
     NameMap, NAME_MAPPING_JSON, load_name_mapping,
-    split_on_last_dot, strip_layer_prefix,
+    split_on_last_dot,
     extract_layer, is_expert_tensor, is_vision_tensor,
     is_norm_key, moveaxis_2_to_1,
     process_experts_common, write_manifest_config_common,
 };
 
-// ─── BQ4 dtype selection ─────────────────────────────────────────────────────
+// ─── INT4 dtype selection ────────────────────────────────────────────────────
 
-fn matrix_table(block: &str) -> DType {
-    match block {
-        "self_attn.q_proj" | "self_attn.k_proj" | "self_attn.v_proj" | "self_attn.o_proj"
-        | "mlp.gate" | "attn.qkv" | "attn.proj" | "patch_embed.proj" | "pos_embed" => DType::Bf16,
-        "lm_head" => DType::Int8,
-        _ => DType::Int4,
-    }
-}
-
-fn bq4(mlx_name: &str, shape: &[usize]) -> DType {
-    let (prefix, kind) = split_on_last_dot(mlx_name);
+fn int4_quant(mlx_name: &str, shape: &[usize]) -> DType {
+    let (_, kind) = split_on_last_dot(mlx_name);
     match kind {
         "A_log" => { debug_assert!(shape.len() <= 1); DType::Fp32 }
         "scales" | "biases" | "bias" | "dt_bias" => { debug_assert!(shape.len() <= 2); DType::Bf16 }
         "weight" => {
             if shape.len() != 2 { DType::Bf16 }
-            else { matrix_table(strip_layer_prefix(prefix)) }
+            else { DType::Int4 }
         }
         _ => DType::Bf16,
     }
 }
 
-// ─── BQ4Scheme ───────────────────────────────────────────────────────────────
+// ─── Int4Scheme ──────────────────────────────────────────────────────────────
 
-pub struct BQ4Scheme {
+pub struct Int4Scheme {
     version: QwenVersion,
     params: ModelParams,
     name_map: NameMap,
@@ -54,7 +44,7 @@ pub struct BQ4Scheme {
     eff_num_experts: usize,
 }
 
-impl BQ4Scheme {
+impl Int4Scheme {
     pub fn new(model_path: &Path, version: QwenVersion) -> Result<Self, String> {
         let params = load_config(model_path)?;
         let num_layers = params.num_layers;
@@ -78,7 +68,7 @@ impl BQ4Scheme {
     }
 }
 
-impl QuantScheme for BQ4Scheme {
+impl QuantScheme for Int4Scheme {
     fn hidden_dim(&self) -> usize { self.params.hidden_dim }
     fn num_layers(&self) -> usize { self.eff_num_layers }
     fn num_experts(&self) -> usize { self.eff_num_experts }
@@ -94,12 +84,12 @@ impl QuantScheme for BQ4Scheme {
 
         if is_expert_tensor(&mlx_name) {
             if let Some(layer) = extract_layer(hf_name) {
-                let q = bq4(&mlx_name, shape);
+                let q = int4_quant(&mlx_name, shape);
                 return WeightClass { name: mlx_name, quant: q, kind: WeightKind::Expert(layer) };
             }
         }
 
-        let q = bq4(&mlx_name, shape);
+        let q = int4_quant(&mlx_name, shape);
         WeightClass { name: mlx_name, quant: q, kind: WeightKind::Normal }
     }
 
@@ -135,28 +125,5 @@ impl QuantScheme for BQ4Scheme {
         cfg: &mut serde_json::Map<String, serde_json::Value>,
     ) {
         write_manifest_config_common(&self.params, self.eff_num_layers, self.eff_num_experts, cfg)
-    }
-}
-
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_matrix_table() {
-        assert_eq!(matrix_table("self_attn.q_proj"), DType::Bf16);
-        assert_eq!(matrix_table("lm_head"), DType::Int8);
-        assert_eq!(matrix_table("mlp.switch_mlp.gate_up_proj"), DType::Int4);
-    }
-
-    #[test]
-    fn test_bq4() {
-        assert_eq!(bq4("language_model.model.layers.0.self_attn.q_proj.weight", &[8192, 2048]), DType::Bf16);
-        assert_eq!(bq4("language_model.model.layers.0.mlp.switch_mlp.gate_up_proj.weight", &[256, 2048]), DType::Int4);
-        assert_eq!(bq4("language_model.model.layers.0.input_layernorm.weight", &[2048]), DType::Bf16);
-        assert_eq!(bq4("language_model.model.layers.0.linear_attn.A_log", &[128]), DType::Fp32);
-        assert_eq!(bq4("language_model.model.embed_tokens.scales", &[32, 32]), DType::Bf16);
     }
 }

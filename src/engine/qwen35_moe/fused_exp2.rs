@@ -1,10 +1,17 @@
-/// Qwen3.6-35B-A3B-4bit Fused4bitExp1 engine — all model dimensions are compile-time constants.
+/// Qwen3.6-35B-A3B-BQ4 FusedExp2 engine.
+///
+/// Same structure as Fused4bitExp2 but uses MLX naming convention
+/// (language_model. prefix) for tensor lookups in the manifest.
+///
+/// The BQ4 dispatch is handled transparently by WeightBuffer::encode_matvec_into:
+///   - "bf16" → matvec_bf16 kernel (attention, routers, lm_head)
+///   - "u32"  → standard 4-bit dequant matvec (experts, embeddings, etc.)
 use crate::engine::qwen35_constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::marker::PhantomData;
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
@@ -20,18 +27,63 @@ use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::weights::WeightFile;
 use crate::math::{
     bf16_to_f32,
-    embed_lookup, final_norm, normalize_weights,
+    normalize_weights,
     softmax, topk,
 };
+// ─── BQ4 local: embed_lookup with MLX naming ────────────────────────────────
 
-// ─── Deferred expert results (local copy) ─────────────────────────────────
+fn embed_lookup(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
+    let (Some(w), Some(s), Some(b)) = (
+        wf.get_tensor_u32("language_model.model.embed_tokens.weight"),
+        wf.get_tensor_u16("language_model.model.embed_tokens.scales"),
+        wf.get_tensor_u16("language_model.model.embed_tokens.biases"),
+    ) else {
+        out.fill(0.0);
+        return;
+    };
+    let w_info = wf.get_tensor_info("language_model.model.embed_tokens.weight").unwrap();
+    let packed_cols = w_info.shape[1];
+    let s_info = wf.get_tensor_info("language_model.model.embed_tokens.scales").unwrap();
+    let num_groups = s_info.shape[1];
+    let group_size = hidden_dim / num_groups;
+    let packed_per_group = group_size / 8;
+    let w_row = &w[token_id * packed_cols..];
+    let s_row = &s[token_id * num_groups..];
+    let b_row = &b[token_id * num_groups..];
+    for g in 0..num_groups {
+        let scale = bf16_to_f32(s_row[g]);
+        let bias = bf16_to_f32(b_row[g]);
+        let base = g * group_size;
+        for p in 0..packed_per_group {
+            let packed = w_row[g * packed_per_group + p];
+            for n in 0..8 {
+                let nibble = (packed >> (n * 4)) & 0xF;
+                out[base + p * 8 + n] = (nibble as f32) * scale + bias;
+            }
+        }
+    }
+}
+
+// ─── BQ4 local: final_norm with MLX naming ──────────────────────────────────
+
+fn final_norm(wf: &WeightFile, hidden: &mut [f32], hidden_dim: usize) {
+    let Some(fnw_u16) = wf.get_tensor_u16("language_model.model.norm.weight") else { return };
+    let fnw_f32: Vec<f32> = fnw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+    let sum_sq: f32 = hidden[..hidden_dim].iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + RMS_NORM_EPS).sqrt();
+    for i in 0..hidden_dim {
+        hidden[i] *= inv_rms * fnw_f32[i];
+    }
+}
+
+// ─── Deferred expert results ────────────────────────────────────────────────
 
 struct DeferredExperts {
     cmd_buf: Option<CommandBuffer>,
     _keep_alive: Vec<Buffer>,
 }
 
-// ─── Per-layer gate scores and routing ────────────────────────────────────
+// ─── Per-layer gate scores and routing ──────────────────────────────────────
 
 struct GateScores {
     scores: Vec<f32>,
@@ -43,7 +95,7 @@ struct Routing {
     shared_gate_score: f32,
 }
 
-// ─── Timing helpers ──────────────────────────────────────────────────────
+// ─── Timing helpers ─────────────────────────────────────────────────────────
 
 fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
     if !crate::engine::record_telemetry() { return; }
@@ -56,10 +108,10 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 }
 
 
-// ─── Execution context ─────────────────────────────────────────────────────
+// ─── Execution context ──────────────────────────────────────────────────────
 
 struct ExecCtx<'b, C: ModelConfig> {
-    engine: &'b mut Fused4bitExp1<C>,
+    engine: &'b mut FusedExp2<C>,
     pending: Option<DeferredExperts>,
 }
 
@@ -75,7 +127,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         // Pre-compute input_norm for the first layer into buf_input
         {
             let buf_in = self.engine.ctx.buf_input.as_ref().unwrap();
-            let norm_name = format!("model.layers.{}.input_layernorm.weight", 0);
+            let norm_name = format!("language_model.model.layers.{}.input_layernorm.weight", 0);
             if let Some(nw_u16) = self.engine.model.weight_file.get_tensor_u16(&norm_name) {
                 let nw: Vec<f32> = nw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
                 let ssq: f32 = hidden[..hidden_dim].iter().map(|v| v * v).sum();
@@ -220,10 +272,10 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         let moe_inter = C::MOE_INTERMEDIATE;
         let shared_inter = C::SHARED_INTERMEDIATE;
         let k = self.engine.k;
-        
+
         let next_norm_info = if layer + 1 < C::NUM_LAYERS {
             self.engine.model.weight_file.get_tensor_ptr(
-                &format!("model.layers.{}.input_layernorm.weight", layer + 1))
+                &format!("language_model.model.layers.{}.input_layernorm.weight", layer + 1))
                 .map(|p| (p as *const c_void, self.engine.weight_buffer.base as usize))
         } else {
             None
@@ -232,8 +284,8 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         let cmd = self.engine.ctx.queue.new_command_buffer().to_owned();
         let mut keep_alive = Vec::with_capacity(4);
 
-    
-        
+
+
         let expert_buf = &self.engine.expert_buffer;
 
         // Keep expert out buffers alive
@@ -292,7 +344,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 }
 
 
-// ─── Private helpers ──────────────────────────────────────────────────────
+// ─── Private helpers ────────────────────────────────────────────────────────
 
 fn encode_pre_expert_linear(
     wf: &WeightFile,
@@ -322,7 +374,7 @@ fn encode_pre_expert_linear(
         "linear_idx {} out of bounds for buf_delta_state (len {})", linear_idx, c.buf_delta_state.len());
     debug_assert!(c.batch_out.len() >= 7,
         "batch_out too short (len {}), need >= 7", c.batch_out.len());
-    let prefix = format!("model.layers.{}.linear_attn", layer_idx);
+    let prefix = format!("language_model.model.layers.{}.linear_attn", layer_idx);
 
     let input_buf = c.buf_input.as_ref().unwrap();
     {
@@ -408,7 +460,7 @@ fn encode_pre_expert_linear(
         );
     }
 
-    let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
+    let post_norm_name = format!("language_model.model.layers.{}.post_attention_layernorm.weight", layer_idx);
     let pnw_ptr = wf.get_tensor_ptr(&post_norm_name).unwrap();
     let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
     let temp_res = c.buf_temp_residual.as_ref().unwrap();
@@ -426,7 +478,7 @@ fn encode_pre_expert_linear(
         );
     }
 
-    let mlp_prefix = format!("model.layers.{}.mlp", layer_idx);
+    let mlp_prefix = format!("language_model.model.layers.{}.mlp", layer_idx);
     let post_normed = c.buf_post_normed.as_ref().unwrap();
     gw.encode_matvec_into(wf, c, enc, &format!("{}.gate", mlp_prefix), post_normed, 0, c.buf_gate_scores.as_ref().unwrap(), 0, num_experts, hidden_dim);
     gw.encode_matvec_into(wf, c, enc, &format!("{}.shared_expert.gate_proj", mlp_prefix), post_normed, 0, c.buf_shared_gate.as_ref().unwrap(), 0, shared_inter, hidden_dim);
@@ -460,7 +512,7 @@ fn encode_pre_expert_full(
     let kv_dim = num_kv * head_dim;
     let seq_len = pos + 1;
 
-    let prefix = format!("model.layers.{}.self_attn", layer);
+    let prefix = format!("language_model.model.layers.{}.self_attn", layer);
 
     let buf_moe = c.buf_moe_hidden.as_ref().unwrap();
     let qkv_x = c.buf_qkv_x.as_ref().unwrap();
@@ -482,7 +534,7 @@ fn encode_pre_expert_full(
 
     // ── input_norm(buf_moe) → qkv_x ──
     let pnw_ptr = wf.get_tensor_ptr(
-        &format!("model.layers.{}.input_layernorm.weight", layer)).unwrap();
+        &format!("language_model.model.layers.{}.input_layernorm.weight", layer)).unwrap();
     let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
     {
         let pipe = c.rms_norm_fused_bf16.as_ref().unwrap();
@@ -561,21 +613,47 @@ fn encode_pre_expert_full(
         );
     }
 
-    // ── Fused SDPA (scores + online softmax + values) ──
+    // ── 2-pass Fused SDPA (block + reduce) ──
     {
-        let pipe = c.attn_sdpa_fused.as_ref().unwrap();
-        enc.set_compute_pipeline_state(pipe);
-        enc.set_buffer(0, Some(q_out_buf), 0);
-        enc.set_buffer(1, Some(kc_buf), 0);
-        enc.set_buffer(2, Some(vc_buf), 0);
-        enc.set_buffer(3, Some(out_buf), 0);
-        enc.set_bytes(4, 4, &(seq_len as u32) as *const u32 as *const c_void);
-        let scale: f32 = 1.0 / (head_dim as f32).sqrt();
-        enc.set_bytes(5, 4, &scale as *const f32 as *const c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(num_q as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
+        let num_blocks: u32 = (seq_len as u32 + 31) / 32;
+        let stride: usize = 2 + head_dim;
+
+        let partials_len = num_q * num_blocks as usize * stride;
+        let partials = c.device.new_buffer(
+            (partials_len * std::mem::size_of::<f32>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
         );
+
+        // ── Pass 1: block processing ──
+        {
+            let pipe = c.attn_sdpa_block.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(q_out_buf), 0);
+            enc.set_buffer(1, Some(kc_buf), 0);
+            enc.set_buffer(2, Some(vc_buf), 0);
+            enc.set_buffer(3, Some(&partials), 0);
+            enc.set_bytes(4, 4, &(seq_len as u32) as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &num_blocks as *const u32 as *const c_void);
+            let scale: f32 = 1.0 / (head_dim as f32).sqrt();
+            enc.set_bytes(6, 4, &scale as *const f32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(num_q as u64, num_blocks as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // ── Pass 2: reduce ──
+        {
+            let pipe = c.attn_sdpa_reduce.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&partials), 0);
+            enc.set_buffer(1, Some(out_buf), 0);
+            enc.set_bytes(2, 4, &num_blocks as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(num_q as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
     }
     // ── sigmoid_gate ──
     {
@@ -605,7 +683,7 @@ fn encode_pre_expert_full(
         );
     }
     // ── post_attention_layernorm ──
-    let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer);
+    let post_norm_name = format!("language_model.model.layers.{}.post_attention_layernorm.weight", layer);
     {
         let pnw_ptr = wf.get_tensor_ptr(&post_norm_name).unwrap();
         let post_norm_weight_off = (pnw_ptr as usize - gw.base as usize) as u64;
@@ -622,7 +700,7 @@ fn encode_pre_expert_full(
         );
     }
     // ── Gate + shared expert projections ──
-    let mlp_prefix = format!("model.layers.{}.mlp", layer);
+    let mlp_prefix = format!("language_model.model.layers.{}.mlp", layer);
     gw.encode_matvec_into(wf, c, enc, &format!("{}.gate", mlp_prefix), normed_buf, 0, gate_buf, 0, num_experts, hidden_dim);
     gw.encode_matvec_into(wf, c, enc, &format!("{}.shared_expert.gate_proj", mlp_prefix), normed_buf, 0, sg_buf, 0, shared_intermediate, hidden_dim);
     gw.encode_matvec_into(wf, c, enc, &format!("{}.shared_expert.up_proj", mlp_prefix), normed_buf, 0, su_buf, 0, shared_intermediate, hidden_dim);
@@ -650,13 +728,13 @@ fn encode_post_expert<C: ModelConfig>(
     moe_inter: usize,
     shared_inter: usize,
     num_experts_per_tok: usize,
-    
+
 ) {
     let hidden_u32 = hidden_dim as u32;
     let inter_u32 = moe_inter as u32;
     let gs_u32 = GROUP_SIZE as u32;
     let actual_k = num_experts_per_tok.min(MAX_K);
-    let prefix = format!("model.layers.{}.mlp", layer_idx);
+    let prefix = format!("language_model.model.layers.{}.mlp", layer_idx);
 
     let post_normed = ctx.buf_post_normed.as_ref().unwrap();
 
@@ -699,7 +777,7 @@ fn encode_post_expert<C: ModelConfig>(
     if !weight_buffer.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
         shared_down_buf, 0, hidden_dim, shared_inter)
     {
-        eprintln!("[fused_4bit] WARNING: shared expert down_proj tensor not found: {}", sd_name);
+        eprintln!("[fused] WARNING: shared expert down_proj tensor not found: {}", sd_name);
     }
 
     {
@@ -753,7 +831,7 @@ fn encode_post_expert<C: ModelConfig>(
     }
 }
 
-// ─── gpu_lm_head (local copy) ────────────────────────────────────────────
+// ─── gpu_lm_head ───────────────────────────────────────────────────────────
 
 fn gpu_lm_head(
     wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
@@ -766,7 +844,7 @@ fn gpu_lm_head(
     let out_buf = metal_buf_shared(&ctx.device, logits.len() * 4);
     let cm = ctx.queue.new_command_buffer();
     let enc = cm.new_compute_command_encoder();
-    weight_buffer.encode_matvec_into(wf, ctx, &enc, "lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
+    weight_buffer.encode_matvec_into(wf, ctx, &enc, "language_model.lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
     enc.end_encoding();
     cm.commit();
     cm.wait_until_completed();
@@ -776,9 +854,9 @@ fn gpu_lm_head(
     }
 }
 
-// ─── Fused4bitExp1 ──────────────────────────────────────────────────────
+// ─── FusedExp2 ──────────────────────────────────────────────────────────
 
-pub struct Fused4bitExp1<C: ModelConfig> {
+pub struct FusedExp2<C: ModelConfig> {
     pub model: Arc<Model>,
     pub ctx: MetalContext,
     pub weight_buffer: WeightBuffer,
@@ -788,11 +866,22 @@ pub struct Fused4bitExp1<C: ModelConfig> {
     _phantom: PhantomData<C>,
 }
 
-impl<C: ModelConfig> Fused4bitExp1<C> {
+impl<C: ModelConfig> FusedExp2<C> {
     pub fn new(model: Arc<Model>, k: usize) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "Fused4bitExp1")?;
-        Ok(Fused4bitExp1 {
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp2")?;
+
+        // // Debug: verify GPU matvec against CPU reference for key tensors
+        // eprintln!("[verify] === BF16 matvec verification ===");
+        // weight_buffer.verify_matvec(&model.weight_file, &ctx,
+        //     "language_model.model.layers.3.self_attn.q_proj",
+        //     C::NUM_ATTN_HEADS * 2 * C::HEAD_DIM, C::HIDDEN_DIM);
+        // eprintln!("[verify] === INT4 matvec verification ===");
+        // weight_buffer.verify_matvec(&model.weight_file, &ctx,
+        //     "language_model.model.layers.3.mlp.shared_expert.gate_proj",
+        //     C::SHARED_INTERMEDIATE, C::HIDDEN_DIM);
+
+        Ok(FusedExp2 {
             model, ctx, weight_buffer, expert_buffer,
             k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
             timing: BTreeMap::new(),
@@ -801,7 +890,7 @@ impl<C: ModelConfig> Fused4bitExp1<C> {
     }
 }
 
-impl<C: ModelConfig> Engine for Fused4bitExp1<C> {
+impl<C: ModelConfig> Engine for FusedExp2<C> {
     fn upload_cache(&self, cache: &Cache) {
         self.ctx.upload_cache(cache);
     }
@@ -810,18 +899,21 @@ impl<C: ModelConfig> Engine for Fused4bitExp1<C> {
         self.ctx.download_cache(cache);
     }
 
-    fn forward(
+    fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
+        let hidden_dim = C::HIDDEN_DIM;
+        for (i, &id) in token_ids.iter().enumerate() {
+            embed_lookup(&self.model.weight_file, id as usize, &mut embeddings[i * hidden_dim..(i + 1) * hidden_dim], hidden_dim);
+        }
+    }
+
+    fn forward_hidden(
         &mut self,
-        input_ids: &[i64],
+        embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        assert!(self.k <= C::NUM_EXPERTS_PER_TOK,
-            "k ({}) must not exceed model's num_experts_per_tok ({})",
-            self.k, C::NUM_EXPERTS_PER_TOK);
-
         let t0 = Instant::now();
-        let n_tokens = input_ids.len();
         let hidden_dim = C::HIDDEN_DIM;
+        let n_tokens = embeddings.len() / hidden_dim;
         let vocab_size = C::VOCAB_SIZE;
         let num_layers = C::NUM_LAYERS;
 
@@ -834,13 +926,8 @@ impl<C: ModelConfig> Engine for Fused4bitExp1<C> {
         {
             let mut exec = ExecCtx { engine: self, pending: None };
 
-            let mut embed = vec![0.0f32; n_tokens * hidden_dim];
-            for (i, &id) in input_ids.iter().enumerate() {
-                embed_lookup(&exec.engine.model.weight_file, id as usize, &mut embed[i * hidden_dim..(i + 1) * hidden_dim], C::HIDDEN_DIM);
-            }
-
-            for (ti, _) in input_ids.iter().enumerate() {
-                let embed_hidden = &embed[ti * hidden_dim..(ti + 1) * hidden_dim];
+            for ti in 0..n_tokens {
+                let embed_hidden = &embeddings[ti * hidden_dim..(ti + 1) * hidden_dim];
                 exec.init_hidden(embed_hidden);
 
                 for layer in 0..num_layers {
@@ -855,6 +942,7 @@ impl<C: ModelConfig> Engine for Fused4bitExp1<C> {
                 let mut hidden = exec.hidden_wait();
                 pos += 1;
                 exec.engine.ctx.pos.set(pos);
+
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vocab_size..(ti + 1) * vocab_size]);
             }
         } // exec dropped — ends borrow of self

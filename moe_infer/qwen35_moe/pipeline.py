@@ -9,11 +9,11 @@ from moe_infer.pipeline import Pipeline
 # ── Mode → vision processor mapping ──────────────────────────────────────────
 
 _VISION_CONFIG: dict[str, dict[str, str]] = {
-    "Qwen35MoEBq4Exp1": {
+    "Qwen35MoEFusedExp1": {
         "processor_class": "Qwen3VLProcessor",
         "image_processor_type": "Qwen2VLImageProcessorFast",
     },
-    "Qwen35MoEBq4Exp2": {
+    "Qwen35MoEFusedExp2": {
         "processor_class": "Qwen3VLProcessor",
         "image_processor_type": "Qwen2VLImageProcessorFast",
     },
@@ -29,7 +29,7 @@ class Qwen35MoEPipeline(Pipeline):
 
     Usage::
 
-        # After bq4_convert:
+        # After convert:
         pipe = Qwen35MoEPipeline("data/models--Qwen--Qwen3.6-35B-A3B")
         pipe.chat("Hello!")
 

@@ -72,6 +72,36 @@ pub fn encode_matvec_offset(
     }
 }
 
+/// Encode FP8_E4M3 dequant matvec with buffer offsets.
+pub fn encode_matvec_fp8_e4m3_offset(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_u8: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+) {
+    let pipeline = ctx.matvec_fp8_e4m3.as_ref().expect("matvec_fp8_e4m3 kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_u8), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(x), x_offset);
+    encoder.set_buffer(3, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 4, out_dim);
+        set_u32(encoder, 5, in_dim);
+        set_u32(encoder, 6, group_size);
+    }
+    let num_tgs = (out_dim as u64 + ROWS_PER_TG as u64 - 1) / ROWS_PER_TG as u64;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
 /// Encode a BF16 matvec with buffer offsets (for BQ4: attention, routers, lm_head).
 pub fn encode_matvec_bf16_offset(
     ctx: &MetalContext,
@@ -163,6 +193,36 @@ pub fn encode_swiglu(
     encoder.dispatch_thread_groups(
         MTLSize::new(num_tgs as u64, 1, 1),
         MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Encode FP4_E2M1 dequant matvec with buffer offsets.
+pub fn encode_matvec_fp4_e2m1_offset(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_packed: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+) {
+    let pipeline = ctx.matvec_fp4_e2m1.as_ref().expect("matvec_fp4_e2m1 kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_packed), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(x), x_offset);
+    encoder.set_buffer(3, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 4, out_dim);
+        set_u32(encoder, 5, in_dim);
+        set_u32(encoder, 6, group_size);
+    }
+    let num_tgs = (out_dim as u64 + ROWS_PER_TG as u64 - 1) / ROWS_PER_TG as u64;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
     );
 }
 

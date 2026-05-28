@@ -1,4 +1,4 @@
-/// Qwen3.6-35B-A3B-BQ4 FusedBq4Exp1 engine.
+/// Qwen3.6-35B-A3B-BQ4 FusedExp1 engine.
 ///
 /// Same structure as Fused4bitExp2 but uses MLX naming convention
 /// (language_model. prefix) for tensor lookups in the manifest.
@@ -111,7 +111,7 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 // ─── Execution context ──────────────────────────────────────────────────────
 
 struct ExecCtx<'b, C: ModelConfig> {
-    engine: &'b mut FusedBq4Exp1<C>,
+    engine: &'b mut FusedExp1<C>,
     pending: Option<DeferredExperts>,
 }
 
@@ -751,7 +751,7 @@ fn encode_post_expert<C: ModelConfig>(
     if !weight_buffer.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
         shared_down_buf, 0, hidden_dim, shared_inter)
     {
-        eprintln!("[fused_bq4] WARNING: shared expert down_proj tensor not found: {}", sd_name);
+        eprintln!("[fused] WARNING: shared expert down_proj tensor not found: {}", sd_name);
     }
 
     {
@@ -828,9 +828,9 @@ fn gpu_lm_head(
     }
 }
 
-// ─── FusedBq4Exp1 ──────────────────────────────────────────────────────────
+// ─── FusedExp1 ──────────────────────────────────────────────────────────
 
-pub struct FusedBq4Exp1<C: ModelConfig> {
+pub struct FusedExp1<C: ModelConfig> {
     pub model: Arc<Model>,
     pub ctx: MetalContext,
     pub weight_buffer: WeightBuffer,
@@ -840,10 +840,10 @@ pub struct FusedBq4Exp1<C: ModelConfig> {
     _phantom: PhantomData<C>,
 }
 
-impl<C: ModelConfig> FusedBq4Exp1<C> {
+impl<C: ModelConfig> FusedExp1<C> {
     pub fn new(model: Arc<Model>, k: usize) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedBq4Exp1")?;
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp1")?;
 
         // // Debug: verify GPU matvec against CPU reference for key tensors
         // eprintln!("[verify] === BF16 matvec verification ===");
@@ -855,7 +855,7 @@ impl<C: ModelConfig> FusedBq4Exp1<C> {
         //     "language_model.model.layers.3.mlp.shared_expert.gate_proj",
         //     C::SHARED_INTERMEDIATE, C::HIDDEN_DIM);
 
-        Ok(FusedBq4Exp1 {
+        Ok(FusedExp1 {
             model, ctx, weight_buffer, expert_buffer,
             k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
             timing: BTreeMap::new(),
@@ -864,7 +864,7 @@ impl<C: ModelConfig> FusedBq4Exp1<C> {
     }
 }
 
-impl<C: ModelConfig> Engine for FusedBq4Exp1<C> {
+impl<C: ModelConfig> Engine for FusedExp1<C> {
     fn upload_cache(&self, cache: &Cache) {
         self.ctx.upload_cache(cache);
     }

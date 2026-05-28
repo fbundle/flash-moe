@@ -7,9 +7,8 @@ use crate::cache::Cache;
 use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
 use crate::engine::metal_kernels;
-use crate::math::bf16_to_f32;
 use crate::model::weights::WeightFile;
-use crate::quant::{Quant, string_to_quant};
+use crate::dtype::{DType, string_to_dtype};
 
 // ─── Expert I/O pre-allocation ───────────────────────────────────────────────
 
@@ -83,6 +82,8 @@ pub struct MetalContext {
     pub matvec_v3: ComputePipelineState,
     pub matvec_bf16: ComputePipelineState,
     pub matvec_int8: ComputePipelineState,
+    pub matvec_fp4_e2m1: Option<ComputePipelineState>,
+    pub matvec_fp8_e4m3: Option<ComputePipelineState>,
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
     pub rms_norm_sum: ComputePipelineState,
@@ -364,6 +365,8 @@ impl MetalContext {
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
+            let matvec_fp4_e2m1 = make_pipeline("dequant_matvec_fp4_e2m1").ok();
+            let matvec_fp8_e4m3 = make_pipeline("matvec_fp8_e4m3").ok();
             let swiglu = make_pipeline("swiglu_fused")?;
             let rms_norm_sum = make_pipeline("rms_norm_sum_sq")?;
 
@@ -404,6 +407,8 @@ impl MetalContext {
                 matvec_v3: matvec_v3.clone(),
                 matvec_bf16,
                 matvec_int8,
+                matvec_fp4_e2m1,
+                matvec_fp8_e4m3,
                 swiglu,
                 swiglu_vec4,
                 rms_norm_sum,
@@ -610,10 +615,10 @@ impl WeightBuffer {
         let dtype = wf.get_tensor_info(&weight_name)
             .map(|info| info.dtype.as_str())
             .unwrap_or("u32");
-        let q = string_to_quant(dtype);
+        let q = string_to_dtype(dtype);
 
         match q {
-            Some(Quant::Bf16) => {
+            Some(DType::Bf16) => {
                 metal_kernels::encode_matvec_bf16_offset(
                     ctx, encoder,
                     &self.buf, w_off,
@@ -622,7 +627,7 @@ impl WeightBuffer {
                 );
                 return true;
             }
-            Some(Quant::Int8) => {
+            Some(DType::Int8) => {
                 let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
                     Some(p) => p,
                     None => {
@@ -639,184 +644,73 @@ impl WeightBuffer {
                 );
                 return true;
             }
-            _ => {} // INT4 or unknown → fall through
-        }
-
-        // INT4 dequant matvec
-        let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
-            Some(p) => p,
-            None => {
-                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
-                return false;
-            }
-        };
-        let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
-            Some(p) => p,
-            None => {
-                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.biases", prefix);
-                return false;
-            }
-        };
-
-        let s_off = (s_ptr as usize - self.base as usize) as u64;
-        let b_off = (b_ptr as usize - self.base as usize) as u64;
-
-        metal_kernels::encode_matvec_offset(
-            ctx, encoder,
-            &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
-            x_buf, x_offset, out_buf, out_offset,
-            out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, 3,
-        );
-        true
-    }
-
-    /// Dispatch a single GPU dequant matvec (convenience — creates command buffer).
-    pub fn matvec(
-        &self,
-        wf: &WeightFile,
-        ctx: &MetalContext,
-        prefix: &str,
-        x: &[f32],
-        out: &mut [f32],
-        out_dim: usize,
-        in_dim: usize,
-    ) -> bool {
-        let x_buf = metal_buf_shared(&ctx.device, in_dim * 4);
-        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(x.as_ptr(), dst, in_dim); }
-        let out_buf = metal_buf_shared(&ctx.device, out_dim * 4);
-
-        let cmd_buf = ctx.queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        let ok = self.encode_matvec_into(wf, ctx, encoder, prefix, &x_buf, 0, &out_buf, 0, out_dim, in_dim);
-        encoder.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
-
-        if ok {
-            unsafe { let src = out_buf.contents() as *const f32; std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out_dim); }
-        }
-        ok
-    }
-
-    /// Debug: verify GPU matvec against CPU reference for a tensor.
-    /// Prints first N elements of both GPU and CPU results for comparison.
-    pub fn verify_matvec(
-        &self,
-        wf: &WeightFile,
-        ctx: &MetalContext,
-        prefix: &str,
-        out_dim: usize,
-        in_dim: usize,
-    ) {
-        let weight_name = format!("{}.weight", prefix);
-        let info = match wf.get_tensor_info(&weight_name) {
-            Some(i) => i,
-            None => {
-                eprintln!("[verify] tensor not found: {}", weight_name);
-                return;
-            }
-        };
-        let dtype = info.dtype.as_str();
-
-        // Test input: all ones → GPU output = row sums of weight matrix
-        let x: Vec<f32> = vec![1.0f32; in_dim];
-        let mut gpu_out = vec![0.0f32; out_dim];
-
-        if !self.matvec(wf, ctx, prefix, &x, &mut gpu_out, out_dim, in_dim) {
-            eprintln!("[verify] GPU matvec failed for {}", weight_name);
-            return;
-        }
-
-        // CPU reference
-        let mut cpu_out = vec![0.0f32; out_dim];
-
-        let q = string_to_quant(dtype);
-
-        if q == Some(Quant::Bf16) {
-            let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
-            let w_u16 = unsafe {
-                std::slice::from_raw_parts(w_ptr as *const u16, out_dim * in_dim)
-            };
-            for r in 0..out_dim {
-                let mut acc = 0.0f64;
-                for c in 0..in_dim {
-                    acc += bf16_to_f32(w_u16[r * in_dim + c]) as f64;
-                }
-                cpu_out[r] = acc as f32;
-            }
-        } else {
-            // INT4: dequantize and compute row sums
-            let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
-            let s_ptr = wf.get_tensor_ptr(&format!("{}.scales", prefix)).unwrap();
-            let b_ptr = wf.get_tensor_ptr(&format!("{}.biases", prefix)).unwrap();
-
-            let s_info = wf.get_tensor_info(&format!("{}.scales", prefix)).unwrap();
-            let num_groups = s_info.shape[1];
-            let group_size = in_dim / num_groups;
-            let packed_per_group = group_size / 8;
-
-            let w_u32 = unsafe {
-                std::slice::from_raw_parts(w_ptr as *const u32, out_dim * in_dim / 8)
-            };
-            let s_u16 = unsafe {
-                std::slice::from_raw_parts(s_ptr as *const u16, out_dim * num_groups)
-            };
-            let b_u16 = unsafe {
-                std::slice::from_raw_parts(b_ptr as *const u16, out_dim * num_groups)
-            };
-
-            for r in 0..out_dim {
-                let w_row = &w_u32[r * in_dim / 8..];
-                let s_row = &s_u16[r * num_groups..];
-                let b_row = &b_u16[r * num_groups..];
-
-                let mut acc = 0.0f64;
-                for g in 0..num_groups {
-                    let scale = bf16_to_f32(s_row[g]);
-                    let bias = bf16_to_f32(b_row[g]);
-                    for p in 0..packed_per_group {
-                        let packed = w_row[g * packed_per_group + p];
-                        for n in 0..8 {
-                            let nibble = (packed >> (n * 4)) & 0xF;
-                            acc += ((nibble as f32) * scale + bias) as f64;
-                        }
+            Some(DType::Fp8E4m3) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
                     }
-                }
-                cpu_out[r] = acc as f32;
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_matvec_fp8_e4m3_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, crate::dtype::FP8_GROUP_SIZE as u32,
+                );
+                return true;
+            }
+            Some(DType::Fp4E2m1) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
+                    }
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_matvec_fp4_e2m1_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE,
+                );
+                return true;
+            }
+            Some(DType::Int4) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
+                    }
+                };
+                let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.biases", prefix);
+                        return false;
+                    }
+                };
+
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                let b_off = (b_ptr as usize - self.base as usize) as u64;
+
+                metal_kernels::encode_matvec_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, 3,
+                );
+                return true;
+            }
+            q => {
+                let d = q.map(|q| q.as_str()).unwrap_or("unknown");
+                eprintln!("[encode_matvec_into] ERROR: unsupported dtype '{}' for tensor {}", d, weight_name);
+                return false;
             }
         }
-
-        // Compare
-        let n_show = 10usize.min(out_dim);
-        let mut max_diff = 0.0f32;
-        let mut sum_diff = 0.0f64;
-        let mut max_rel_diff = 0.0f32;
-
-        eprintln!("[verify] {} dtype={} out_dim={} in_dim={}",
-            weight_name, dtype, out_dim, in_dim);
-        for i in 0..n_show {
-            let diff = (gpu_out[i] - cpu_out[i]).abs();
-            let rel = if cpu_out[i].abs() > 1e-8 {
-                diff / cpu_out[i].abs()
-            } else {
-                0.0
-            };
-            eprintln!("[verify]   row {:4}: gpu={:12.8} cpu={:12.8} diff={:10.6} rel={:10.6}",
-                i, gpu_out[i], cpu_out[i], diff, rel);
-            max_diff = max_diff.max(diff);
-            sum_diff += diff as f64;
-            max_rel_diff = max_rel_diff.max(rel);
-        }
-
-        // Also check for NaN/Inf in GPU output
-        let mut nan_count = 0;
-        let mut inf_count = 0;
-        for i in 0..out_dim {
-            if gpu_out[i].is_nan() { nan_count += 1; }
-            if gpu_out[i].is_infinite() { inf_count += 1; }
-        }
-
-        eprintln!("[verify]   max_diff={:.8} avg_diff(first_{})={:.8} max_rel={:.8} nan={} inf={}",
-            max_diff, n_show, sum_diff / n_show as f64, max_rel_diff, nan_count, inf_count);
     }
+
 }
