@@ -55,17 +55,8 @@ impl HfRepo {
                 Ok(entries)
             }
             Some(repo_id) => {
-                let url = format!("https://huggingface.co/api/models/{}/tree/main", repo_id);
-                let body_str = ureq::get(&url)
-                    .call()
-                    .map_err(|e| format!("HF API error: {e}"))?
-                    .into_body()
-                    .read_to_string()
-                    .map_err(|e| format!("read API response: {e}"))?;
-                let all: Vec<serde_json::Value> =
-                    serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
-                // Collect all paths from the API
-                let all_paths: Vec<&str> = all
+                let tree = fetch_tree(repo_id)?;
+                let all_paths: Vec<&str> = tree
                     .iter()
                     .filter_map(|v| v["path"].as_str())
                     .collect();
@@ -150,6 +141,81 @@ impl HfRepo {
     pub fn remove(&self, filename: &str) {
         fs::remove_file(self.staging.join(filename)).ok();
     }
+
+    /// Get file size in bytes.
+    /// - Local: reads filesystem metadata.
+    /// - HF: fetches the file tree from the Hub API.
+    pub fn file_size(&self, filename: &str) -> Result<u64, String> {
+        match &self.repo_id {
+            None => {
+                let meta = fs::metadata(self.staging.join(filename))
+                    .map_err(|e| e.to_string())?;
+                Ok(meta.len())
+            }
+            Some(repo_id) => {
+                let tree = fetch_tree(repo_id)?;
+                let size = tree.iter()
+                    .find(|v| v["path"].as_str() == Some(filename))
+                    .and_then(|v| v["size"].as_u64())
+                    .ok_or_else(|| format!("file not found in tree: {filename}"))?;
+                Ok(size)
+            }
+        }
+    }
+
+    /// Get sizes for all files in the repo (filename → bytes).
+    /// - Local: walks the filesystem.
+    /// - HF: fetches the file tree from the Hub API.
+    pub fn file_sizes(&self) -> Result<Vec<(String, u64)>, String> {
+        match &self.repo_id {
+            None => {
+                let mut sizes = Vec::new();
+                walk_sizes(&self.staging, &self.staging, &mut sizes)
+                    .map_err(|e| e.to_string())?;
+                sizes.sort();
+                Ok(sizes)
+            }
+            Some(repo_id) => {
+                let tree = fetch_tree(repo_id)?;
+                let mut sizes: Vec<(String, u64)> = tree.iter()
+                    .filter(|v| v["type"] == "file")
+                    .filter_map(|v| {
+                        let path = v["path"].as_str()?;
+                        let size = v["size"].as_u64()?;
+                        Some((path.to_string(), size))
+                    })
+                    .collect();
+                sizes.sort();
+                Ok(sizes)
+            }
+        }
+    }
+}
+
+fn fetch_tree(repo_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!("https://huggingface.co/api/models/{}/tree/main", repo_id);
+    let body_str = ureq::get(&url)
+        .call()
+        .map_err(|e| format!("HF API error: {e}"))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("read API response: {e}"))?;
+    serde_json::from_str(&body_str).map_err(|e| e.to_string())
+}
+
+fn walk_sizes(base: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            walk_sizes(base, &path, out)?;
+        } else if entry.file_type()?.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                out.push((rel.to_string_lossy().to_string(), entry.metadata()?.len()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn tqdm_style() -> ProgressStyle {

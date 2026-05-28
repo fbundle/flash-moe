@@ -298,6 +298,18 @@ impl PyHfRepo {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
+    /// Get a file's expected size from HF (or local fs metadata).
+    fn file_size(&self, filename: &str) -> PyResult<u64> {
+        self.repo.file_size(filename)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Get (filename, size_bytes) for all files in the repo.
+    fn file_sizes(&self) -> PyResult<Vec<(String, u64)>> {
+        self.repo.file_sizes()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
     /// Delete a cached file.
     fn remove(&self, filename: &str) {
         self.repo.remove(filename)
