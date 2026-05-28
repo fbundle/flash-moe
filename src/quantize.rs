@@ -223,18 +223,17 @@ pub fn run(
                 offset += pad;
             }
 
-            // Base name for the entry (strip .weight suffix if present)
-            let base = if mlx_name.ends_with(".weight") {
-                mlx_name[..mlx_name.len() - 7].to_string()
-            } else {
-                mlx_name.clone()
-            };
-
             // Encode and write
             let encoded = q.encode(&f32_padded, out_dim, padded_in);
             for et in &encoded {
+                // Avoid double .weight when encode also adds .weight suffix
+                let base = if et.suffix == ".weight" && mlx_name.ends_with(".weight") {
+                    &mlx_name[..mlx_name.len() - 7]
+                } else {
+                    &mlx_name[..]
+                };
                 let tname = if et.suffix.is_empty() {
-                    base.clone()
+                    base.to_string()
                 } else {
                     format!("{}{}", base, et.suffix)
                 };
