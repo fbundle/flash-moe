@@ -3,6 +3,7 @@
 /// Port of metal_init() / MetalContext from main.m:172-322.
 use metal::*;
 use objc::rc::autoreleasepool;
+use std::collections::HashMap;
 use crate::cache::Cache;
 use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
@@ -13,13 +14,109 @@ use crate::dtype::{DType, string_to_dtype};
 // ─── Expert I/O pre-allocation ───────────────────────────────────────────────
 
 pub const MAX_K: usize = 8;
+const DEFAULT_CACHE_SIZE: usize = 32;
+
+/// LRU cache for expert Metal buffers. Maps `(layer, expert_id)` → buffer.
+/// Cache hits skip pread entirely; misses evict the least-recently-used entry.
+pub struct ExpertCache {
+    entries: Vec<CacheEntry>,
+    map: HashMap<(usize, usize), usize>,
+    access_counter: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+struct CacheEntry {
+    buffer: Buffer,
+    layer_idx: i32,
+    expert_idx: i32,
+    last_used: u64,
+}
+
+impl ExpertCache {
+    pub fn new(device: &Device, max_entries: usize, expert_size: usize) -> Self {
+        let mut entries = Vec::with_capacity(max_entries);
+        for _ in 0..max_entries {
+            entries.push(CacheEntry {
+                buffer: metal_buf_shared(device, expert_size),
+                layer_idx: -1,
+                expert_idx: -1,
+                last_used: 0,
+            });
+        }
+        ExpertCache {
+            entries,
+            map: HashMap::with_capacity(max_entries),
+            access_counter: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Look up a cached Metal buffer. Returns the buffer on hit, None on miss.
+    pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<Buffer> {
+        if let Some(&idx) = self.map.get(&(layer, expert)) {
+            self.entries[idx].last_used = self.access_counter;
+            self.access_counter += 1;
+            self.hits += 1;
+            Some(self.entries[idx].buffer.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Store a buffer for `(layer, expert)` in the cache, evicting LRU if full.
+    /// The buffer's contents must already contain the expert weights.
+    pub fn insert(&mut self, layer: usize, expert: usize, buf: &Buffer) {
+        self.access_counter += 1;
+
+        // Already cached? Just update LRU
+        if let Some(&idx) = self.map.get(&(layer, expert)) {
+            self.entries[idx].last_used = self.access_counter;
+            return;
+        }
+
+        let target = if self.map.len() < self.entries.len() {
+            self.map.len()
+        } else {
+            let mut lru = 0;
+            let mut min_used = u64::MAX;
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.last_used < min_used {
+                    min_used = e.last_used;
+                    lru = i;
+                }
+            }
+            let old_layer = self.entries[lru].layer_idx;
+            let old_expert = self.entries[lru].expert_idx;
+            if old_layer >= 0 && old_expert >= 0 {
+                self.map.remove(&(old_layer as usize, old_expert as usize));
+            }
+            lru
+        };
+
+        self.entries[target].layer_idx = layer as i32;
+        self.entries[target].expert_idx = expert as i32;
+        self.entries[target].last_used = self.access_counter;
+        self.map.insert((layer, expert), target);
+        // Copy into the cache slot
+        unsafe {
+            let src_ptr = buf.contents() as *const u8;
+            let dst_ptr = self.entries[target].buffer.contents() as *mut u8;
+            let len = buf.length() as usize;
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len);
+        }
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+    }
+}
 
 /// Pre-allocated GPU buffers for expert dispatch — allocated once, reused across
 /// all layers and tokens.  Matches C's `buf_multi_expert_*` and scratch buffers.
-///
-/// Expert data is always read fresh from disk via pread (no custom cache — we
-/// trust the OS page cache, which flash-moe found to be ~38% faster than a
-/// custom Metal LRU).
 pub struct ExpertBuffer {
     /// Expert data buffers [MAX_K] — pread'd expert weights land here
     pub expert_data: Vec<Buffer>,
@@ -38,6 +135,8 @@ pub struct ExpertBuffer {
     pub combine_out: Buffer,
     /// Combine params [10 f32]: expert_weights[8] + shared_gate_score + padding
     pub combine_params: Buffer,
+    /// Optional GPU-side LRU cache for expert weights
+    pub cache: Option<ExpertCache>,
 }
 
 impl ExpertBuffer {
@@ -54,6 +153,7 @@ impl ExpertBuffer {
             expert_data.push(metal_buf_shared(device, expert_size));
             expert_out.push(metal_buf_shared(device, hidden_dim * 4));
         }
+        let cache = Some(ExpertCache::new(device, DEFAULT_CACHE_SIZE, expert_size));
         ExpertBuffer {
             expert_data,
             expert_out,
@@ -65,6 +165,7 @@ impl ExpertBuffer {
             shared_down: metal_buf_shared(device, hidden_dim * 4),
             combine_out: metal_buf_shared(device, hidden_dim * 4),
             combine_params: metal_buf_shared(device, 40),
+            cache,
         }
     }
 }
@@ -277,10 +378,11 @@ impl MetalContext {
             shared_inter,
         );
         eprintln!(
-            "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch (OS page cache for expert data)",
+            "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch, LRU cache={} entries",
             MAX_K,
             expert_size / (1024 * 1024),
             MAX_K,
+            DEFAULT_CACHE_SIZE,
         );
         io
     }

@@ -93,6 +93,8 @@ struct GateScores {
 struct Routing {
     expert_weights: Vec<f32>,
     shared_gate_score: f32,
+    /// Resolved expert data buffers (from cache or pread) for op2 dispatch
+    expert_data: Vec<Buffer>,
 }
 
 // ─── Timing helpers ─────────────────────────────────────────────────────────
@@ -233,34 +235,73 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         normalize_weights(&mut expert_weights);
 
         let actual_k = k.min(MAX_K);
+        let mut resolved_data: Vec<Option<Buffer>> = vec![None; actual_k];
 
-        // Always read all K experts from disk — trust the OS page cache
-        // for repeated reads (flash-moe: ~38% faster than custom Metal LRU).
         {
             let t_io = Instant::now();
             let expert_file = &self.engine.model.expert_files[layer];
             let expert_size = expert_file.expert_size();
-            let expert_buf = &self.engine.expert_buffer;
-            let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
-            for ki in 0..actual_k {
-                reads[ki] = (expert_indices[ki], expert_buf.expert_data[ki].contents() as usize);
-            }
-            rayon::scope(|s| {
+
+            // Phase 1: check LRU cache for each selected expert
+            let mut misses: Vec<(usize, usize)> = Vec::with_capacity(actual_k); // (ki, expert_idx)
+            {
+                let expert_buf = &mut self.engine.expert_buffer;
                 for ki in 0..actual_k {
-                    let (eidx, ptr_u) = reads[ki];
-                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
-                    s.spawn(move |_| {
-                        expert_file.read_expert(eidx, dst).unwrap();
-                    });
+                    let eidx = expert_indices[ki];
+                    if let Some(ref mut cache) = expert_buf.cache {
+                        if let Some(buf) = cache.lookup(layer, eidx) {
+                            resolved_data[ki] = Some(buf);
+                            continue;
+                        }
+                    }
+                    misses.push((ki, eidx));
                 }
-            });
+            }
+
+            // Phase 2: parallel pread for cache misses
+            if !misses.is_empty() {
+                let expert_buf = &self.engine.expert_buffer;
+                rayon::scope(|s| {
+                    for &(ki, eidx) in &misses {
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                expert_buf.expert_data[ki].contents() as *mut u8,
+                                expert_size,
+                            )
+                        };
+                        s.spawn(move |_| {
+                            expert_file.read_expert(eidx, dst).unwrap();
+                        });
+                    }
+                });
+            }
+
+            // Phase 3: insert newly loaded experts into cache
+            {
+                let expert_buf = &mut self.engine.expert_buffer;
+                if let Some(ref mut cache) = expert_buf.cache {
+                    for &(ki, eidx) in &misses {
+                        cache.insert(layer, eidx, &expert_buf.expert_data[ki]);
+                    }
+                }
+                // Resolve remaining buffers (from cache or fresh)
+                for ki in 0..actual_k {
+                    if resolved_data[ki].is_none() {
+                        resolved_data[ki] = Some(expert_buf.expert_data[ki].clone());
+                    }
+                }
+            }
+
             let dt = t_io.elapsed().as_secs_f64() * 1000.0;
             timing_add(&mut self.engine.timing, "engine.expert_io_ms", dt);
         }
 
+        let expert_data: Vec<Buffer> = resolved_data.into_iter().map(|b| b.unwrap()).collect();
+
         Routing {
             expert_weights,
             shared_gate_score: gate_scores.shared_gate_score,
+            expert_data,
         }
     }
 
@@ -288,10 +329,11 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
         let expert_buf = &self.engine.expert_buffer;
 
-        // Keep expert out buffers alive
+        // Keep expert out + cached data buffers alive
         let actual_k = k.min(MAX_K);
         for ki in 0..actual_k {
             keep_alive.push(expert_buf.expert_out[ki].clone());
+            keep_alive.push(routing.expert_data[ki].clone());
         }
         keep_alive.push(expert_buf.shared_act.clone());
         keep_alive.push(expert_buf.shared_down.clone());
@@ -300,7 +342,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             encode_post_expert::<C>(
                 &self.engine.model.weight_file, &self.engine.weight_buffer, &self.engine.ctx, &enc, layer,
                 &routing.expert_weights, routing.shared_gate_score,
-                &expert_buf.expert_data, &expert_buf.scratch_gate, &expert_buf.scratch_up, &expert_buf.scratch_act,
+                &routing.expert_data, &expert_buf.scratch_gate, &expert_buf.scratch_up, &expert_buf.scratch_act,
                 &expert_buf.expert_out, &expert_buf.shared_act, &expert_buf.shared_down, &expert_buf.combine_params,
                 next_norm_info,
                 hidden_dim, moe_inter, shared_inter, k,
