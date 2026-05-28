@@ -110,9 +110,10 @@ class HfRepo:
         """Delete a cached file from the staging directory."""
         self._inner.remove(filename)
 
-    def ls(self) -> list[str]:
-        """List files in the repo."""
-        return self._inner.ls()
+    def ls(self, dir: str | None = None) -> list[str]:
+        """List immediate children of *dir* (defaults to root).  Behaves like
+        UNIX ``ls``: returns names of files and directories at that level."""
+        return self._inner.ls(dir)
 
     @property
     def path(self) -> str:
