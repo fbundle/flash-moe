@@ -163,15 +163,16 @@ researchers wiring up alternative draft loops.
 
 ## Verification
 
-To verify that the BQ4 engine computes the same logits as the original
-model, the pipeline is:
+Correctness is measured two ways:
 
-1.  **Strip** the HF model to 4 layers / 4 experts (fast test).
-2.  **Quantize** the stripped model to BQ4.
-3.  **Dequantize** BQ4 back to HF safetensors.
-4.  **Compare** logits: dequantized HF (transformers) vs BQ4 engine (Rust).
+- **Engine correctness** — does our Rust/Metal pipeline match transformers
+  running on the *dequantized* model (same quantized weights, different
+  compute path)?  This catches engine bugs.
+- **Quantization quality** — does our pipeline match transformers running
+  on the *original* BF16 model?  This measures how much the BQ4 quantization
+  itself costs us.
 
-All four steps run locally — no network needed after the initial download.
+Both run on a stripped (4 layer / 4 expert) variant for speed.
 
 ```bash
 # 1. Strip: 40 layers → 4 layers, 256 experts → 4 experts (~2.4 GB)
@@ -185,27 +186,31 @@ convert('hub/models--Qwen--Qwen3.6-35B-A3B-Strip',
         'data/Qwen3.6-35B-A3B-Strip', version='3.6')
 "
 
-# 3. Dequantize back to HF safetensors (~2.4 GB)
+# 3. Dequantize back to HF safetensors (~2.4 GB) — needed for engine-correctness check
 python -m moe_infer.dequantize data/Qwen3.6-35B-A3B-Strip/model_bq4 \
   --ref hub/models--Qwen--Qwen3.6-35B-A3B-Strip \
   --out hub/models--Qwen--Qwen3.6-35B-A3B-Strip-Dequant
 
-# 4. Compare logits
+# 4a. Engine correctness (vs dequantized HF)
 python verify_nway.py
+
+# 4b. Quantization quality (vs original BF16 HF)
+python helpers/verify_vs_original.py
 ```
 
 Expected metrics on the 29-token test sequence (vocab_size=248,320):
 
-| Comparison | Cosine | Max Diff | Mean Diff | Notes |
+| Comparison | Cosine | Max Diff | Top-1 | Notes |
 |---|---|---|---|---|
-| Original HF vs BQ4 engine | ~0.902 | ~4.6 | ~0.79 | INT4 quantization loss |
-| **Dequantized HF vs BQ4 engine** | **~0.925** | **~4.5** | **~0.72** | Same weights, GPU vs CPU path |
-| FusedExp1 vs FusedExp2 | 1.000 | 0.000 | 0.000 | Bit-exact between Rust pipelines |
+| **Dequantized HF vs BQ4 engine** (`verify_nway.py`) | **~0.99997** | ~0.12 | match | Engine vs same weights — bug check |
+| **Original HF vs BQ4 engine** (`verify_vs_original.py`) | **~0.976** | ~2.8 | mismatch | Round-trip BQ4 quantization loss |
+| FusedExp1 vs FusedExp2 | 1.000 | 0.000 | match | Bit-exact between Rust pipelines |
 
-The dequantized model reproduces the engine more closely than the original
-because both use the same quantized weights.  The remaining gap (~0.075) is
-numerical precision differences between Metal GPU (on-the-fly INT4 matvec)
-and PyTorch CPU (pre-dequantized BF16 matmul).
+The dequant comparison should stay near 1.0 — any regression there is an
+engine bug.  The original comparison shows the true quantization cost on
+the stripped model: top-1 prediction can shift, KL is non-negligible.  On
+the full 40-layer model the per-layer error has more opportunity to average
+out, but the stripped numbers are a useful pessimistic ceiling.
 
 ## Tips
 
