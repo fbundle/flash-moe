@@ -67,6 +67,8 @@ pub fn mtp_step(
     num_attn_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    rotary_dim: usize,
+    rope_theta: f32,
     num_experts: usize,
     num_experts_per_tok: usize,
     moe_inter: usize,
@@ -135,10 +137,8 @@ pub fn mtp_step(
     let k_normed = per_head_norm(&k, num_kv_heads, head_dim, &k_norm_w);
 
     // 4d. RoPE
-    let rope_dim = 64;
-    let rope_theta: f32 = 10_000_000.0;
-    let q_roped = apply_rope(&q_normed, num_attn_heads, head_dim, rope_dim, pos, rope_theta);
-    let k_roped = apply_rope(&k_normed, num_kv_heads, head_dim, rope_dim, pos, rope_theta);
+    let q_roped = apply_rope(&q_normed, num_attn_heads, head_dim, rotary_dim, pos, rope_theta);
+    let k_roped = apply_rope(&k_normed, num_kv_heads, head_dim, rotary_dim, pos, rope_theta);
 
     // 4e. KV cache append
     let kv_offset = pos * kv_dim;
@@ -241,10 +241,12 @@ fn embed_token_cpu(wf: &WeightFile, token_id: usize, hidden_dim: usize) -> Vec<f
     let group_size = hidden_dim / num_groups;
     let packed_per_group = group_size / 8;
     let w_row = &w[token_id * packed_cols..];
+    let s_row = &s[token_id * num_groups..];
+    let b_row = &b[token_id * num_groups..];
     let mut out = vec![0.0f32; hidden_dim];
     for g in 0..num_groups {
-        let scale = bf16_to_f32(s[g]);
-        let bias = bf16_to_f32(b[g]);
+        let scale = bf16_to_f32(s_row[g]);
+        let bias = bf16_to_f32(b_row[g]);
         for p in 0..packed_per_group {
             let packed = w_row[g * packed_per_group + p];
             for n in 0..8 {

@@ -960,6 +960,10 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         self.ctx.download_cache(cache);
     }
 
+    fn engine_pos(&self) -> usize {
+        self.ctx.pos.get()
+    }
+
     fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
         let hidden_dim = C::HIDDEN_DIM;
         for (i, &id) in token_ids.iter().enumerate() {
@@ -1073,6 +1077,8 @@ impl<C: ModelConfig> FusedExp2<C> {
             C::NUM_ATTN_HEADS,
             C::NUM_KV_HEADS,
             C::HEAD_DIM,
+            C::ROTARY_DIM,
+            C::ROPE_THETA as f32,
             C::NUM_EXPERTS,
             C::NUM_EXPERTS_PER_TOK,
             C::MOE_INTERMEDIATE,
