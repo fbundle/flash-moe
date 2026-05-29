@@ -14,13 +14,14 @@ use crate::dtype::{DType, string_to_dtype};
 // ─── Expert I/O pre-allocation ───────────────────────────────────────────────
 
 pub const MAX_K: usize = 8;
-const DEFAULT_CACHE_SIZE: usize = 32;
+const DEFAULT_CACHE_SIZE: usize = 8;  // per-layer: holds previous token's expert selection
 
-/// LRU cache for expert Metal buffers. Maps `(layer, expert_id)` → buffer.
+/// Per-layer LRU cache for expert Metal buffers.
+/// Each MoE layer gets its own cache, keyed by expert_id.
 /// Cache hits skip pread entirely; misses evict the least-recently-used entry.
 pub struct ExpertCache {
     entries: Vec<CacheEntry>,
-    map: HashMap<(usize, usize), usize>,
+    map: HashMap<usize, usize>,
     access_counter: u64,
     pub hits: u64,
     pub misses: u64,
@@ -28,7 +29,6 @@ pub struct ExpertCache {
 
 struct CacheEntry {
     buffer: Buffer,
-    layer_idx: i32,
     expert_idx: i32,
     last_used: u64,
 }
@@ -39,7 +39,6 @@ impl ExpertCache {
         for _ in 0..max_entries {
             entries.push(CacheEntry {
                 buffer: metal_buf_shared(device, expert_size),
-                layer_idx: -1,
                 expert_idx: -1,
                 last_used: 0,
             });
@@ -53,9 +52,9 @@ impl ExpertCache {
         }
     }
 
-    /// Look up a cached Metal buffer. Returns the buffer on hit, None on miss.
-    pub fn lookup(&mut self, layer: usize, expert: usize) -> Option<Buffer> {
-        if let Some(&idx) = self.map.get(&(layer, expert)) {
+    /// Look up a cached Metal buffer by expert_id. Returns the buffer on hit, None on miss.
+    pub fn lookup(&mut self, expert: usize) -> Option<Buffer> {
+        if let Some(&idx) = self.map.get(&expert) {
             self.entries[idx].last_used = self.access_counter;
             self.access_counter += 1;
             self.hits += 1;
@@ -66,13 +65,14 @@ impl ExpertCache {
         }
     }
 
-    /// Store a buffer for `(layer, expert)` in the cache, evicting LRU if full.
-    /// The buffer's contents must already contain the expert weights.
-    pub fn insert(&mut self, layer: usize, expert: usize, buf: &Buffer) {
+    /// Swap the given buffer into the cache for `expert`, evicting LRU if full.
+    /// Zero-copy: the cache takes ownership of the data buffer and returns the
+    /// evicted buffer (or an empty slot) via `buf`. Caller's buffer now holds the
+    /// old cache buffer, ready for reuse as a pread destination.
+    pub fn insert_swap(&mut self, expert: usize, buf: &mut Buffer) {
         self.access_counter += 1;
 
-        // Already cached? Just update LRU
-        if let Some(&idx) = self.map.get(&(layer, expert)) {
+        if let Some(&idx) = self.map.get(&expert) {
             self.entries[idx].last_used = self.access_counter;
             return;
         }
@@ -88,26 +88,21 @@ impl ExpertCache {
                     lru = i;
                 }
             }
-            let old_layer = self.entries[lru].layer_idx;
             let old_expert = self.entries[lru].expert_idx;
-            if old_layer >= 0 && old_expert >= 0 {
-                self.map.remove(&(old_layer as usize, old_expert as usize));
+            if old_expert >= 0 {
+                self.map.remove(&(old_expert as usize));
             }
             lru
         };
 
-        self.entries[target].layer_idx = layer as i32;
+        // Zero-copy swap: cache gets the data, caller gets the old cache buffer
+        std::mem::swap(&mut self.entries[target].buffer, buf);
         self.entries[target].expert_idx = expert as i32;
         self.entries[target].last_used = self.access_counter;
-        self.map.insert((layer, expert), target);
-        // Copy into the cache slot
-        unsafe {
-            let src_ptr = buf.contents() as *const u8;
-            let dst_ptr = self.entries[target].buffer.contents() as *mut u8;
-            let len = buf.length() as usize;
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, len);
-        }
+        self.map.insert(expert, target);
     }
+
+    pub fn len(&self) -> usize { self.map.len() }
 
     pub fn reset_stats(&mut self) {
         self.hits = 0;
@@ -135,8 +130,8 @@ pub struct ExpertBuffer {
     pub combine_out: Buffer,
     /// Combine params [10 f32]: expert_weights[8] + shared_gate_score + padding
     pub combine_params: Buffer,
-    /// Optional GPU-side LRU cache for expert weights
-    pub cache: Option<ExpertCache>,
+    /// Per-layer GPU-side LRU caches for expert weights (one per MoE layer)
+    pub cache: Option<Vec<ExpertCache>>,
 }
 
 impl ExpertBuffer {
@@ -153,7 +148,6 @@ impl ExpertBuffer {
             expert_data.push(metal_buf_shared(device, expert_size));
             expert_out.push(metal_buf_shared(device, hidden_dim * 4));
         }
-        let cache = Some(ExpertCache::new(device, DEFAULT_CACHE_SIZE, expert_size));
         ExpertBuffer {
             expert_data,
             expert_out,
@@ -165,8 +159,36 @@ impl ExpertBuffer {
             shared_down: metal_buf_shared(device, hidden_dim * 4),
             combine_out: metal_buf_shared(device, hidden_dim * 4),
             combine_params: metal_buf_shared(device, 40),
-            cache,
+            cache: None,  // populated by init_expert_buffers after num_layers is known
         }
+    }
+
+    /// Initialize per-layer caches after num_layers is known.
+    pub fn init_caches(&mut self, device: &Device, num_layers: usize, expert_size: usize) {
+        let per_layer = DEFAULT_CACHE_SIZE;
+        let mut caches = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            caches.push(ExpertCache::new(device, per_layer, expert_size));
+        }
+        eprintln!("[expert-io] LRU cache: {} entries/layer × {} layers = {} MB",
+            per_layer, num_layers,
+            per_layer * num_layers * expert_size / (1024 * 1024));
+        self.cache = Some(caches);
+    }
+}
+
+/// Report LRU cache statistics and reset counters.
+pub fn report_cache_stats(label: &str, expert_buffer: &ExpertBuffer) {
+    if let Some(ref caches) = expert_buffer.cache {
+        let mut total_hits: u64 = 0;
+        let mut total_misses: u64 = 0;
+        for c in caches {
+            total_hits += c.hits;
+            total_misses += c.misses;
+        }
+        let total = total_hits + total_misses;
+        let rate = if total > 0 { 100.0 * total_hits as f64 / total as f64 } else { 0.0 };
+        eprintln!("[cache-{label}] hits={} misses={} hit_rate={:.1}%", total_hits, total_misses, rate);
     }
 }
 
@@ -369,20 +391,24 @@ impl MetalContext {
         hidden_dim: usize,
         moe_inter: usize,
         shared_inter: usize,
+        num_layers: usize,
+        cache_enabled: bool,
     ) -> ExpertBuffer {
-        let io = ExpertBuffer::new(
+        let mut io = ExpertBuffer::new(
             &self.device,
             expert_size,
             hidden_dim,
             moe_inter,
             shared_inter,
         );
+        if cache_enabled {
+            io.init_caches(&self.device, num_layers, expert_size);
+        }
         eprintln!(
-            "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch, LRU cache={} entries",
+            "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch",
             MAX_K,
             expert_size / (1024 * 1024),
             MAX_K,
-            DEFAULT_CACHE_SIZE,
         );
         io
     }
@@ -395,6 +421,7 @@ impl MetalContext {
         weight_file: &WeightFile,
         k: usize,
         label: &str,
+        cache_enabled: bool,
     ) -> Result<(Self, WeightBuffer, ExpertBuffer), MoEError> {
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         if k > C::NUM_EXPERTS_PER_TOK {
@@ -414,6 +441,7 @@ impl MetalContext {
         );
         let expert_buffer = ctx.init_expert_buffers(
             C::EXPERT_SIZE_4BIT, C::HIDDEN_DIM, C::MOE_INTERMEDIATE, C::SHARED_INTERMEDIATE,
+            C::NUM_LAYERS, cache_enabled,
         );
         let weight_buffer = WeightBuffer::new(&ctx.device, weight_file);
 

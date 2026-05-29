@@ -95,9 +95,9 @@ pub struct Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFusedExp2", k=0))]
-    fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
-        let engine = DynEngine::new(pipeline_mode, model.inner.clone(), k)
+    #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFusedExp2", k=0, *, cache_enabled=false))]
+    fn new(model: &Model, pipeline_mode: &str, k: usize, cache_enabled: bool) -> PyResult<Self> {
+        let engine = DynEngine::new(pipeline_mode, model.inner.clone(), k, cache_enabled)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Engine {
             engine,

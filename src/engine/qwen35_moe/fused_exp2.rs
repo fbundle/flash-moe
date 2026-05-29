@@ -243,19 +243,24 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             let expert_file = &self.engine.model.expert_files[layer];
             let expert_size = expert_file.expert_size();
 
-            // Phase 1: check LRU cache for each selected expert
+            // Phase 1: check per-layer LRU cache for each selected expert
             let mut misses: Vec<(usize, usize)> = Vec::with_capacity(actual_k); // (ki, expert_idx)
             {
                 let expert_buf = &mut self.engine.expert_buffer;
-                for ki in 0..actual_k {
-                    let eidx = expert_indices[ki];
-                    if let Some(ref mut cache) = expert_buf.cache {
-                        if let Some(buf) = cache.lookup(layer, eidx) {
+                if let Some(ref mut caches) = expert_buf.cache {
+                    let layer_cache = &mut caches[layer];
+                    for ki in 0..actual_k {
+                        let eidx = expert_indices[ki];
+                        if let Some(buf) = layer_cache.lookup(eidx) {
                             resolved_data[ki] = Some(buf);
                             continue;
                         }
+                        misses.push((ki, eidx));
                     }
-                    misses.push((ki, eidx));
+                } else {
+                    for ki in 0..actual_k {
+                        misses.push((ki, expert_indices[ki]));
+                    }
                 }
             }
 
@@ -277,15 +282,19 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                 });
             }
 
-            // Phase 3: insert newly loaded experts into cache
+            // Phase 3: insert newly loaded experts into per-layer cache (zero-copy swap)
             {
                 let expert_buf = &mut self.engine.expert_buffer;
-                if let Some(ref mut cache) = expert_buf.cache {
+                if let Some(ref mut caches) = expert_buf.cache {
+                    let layer_cache = &mut caches[layer];
                     for &(ki, eidx) in &misses {
-                        cache.insert(layer, eidx, &expert_buf.expert_data[ki]);
+                        // Swap: cache gets the loaded data, expert_data[ki] gets old cache buffer
+                        layer_cache.insert_swap(eidx, &mut expert_buf.expert_data[ki]);
+                        // Now look up the just-inserted buffer for resolved_data
+                        resolved_data[ki] = layer_cache.lookup(eidx);
                     }
                 }
-                // Resolve remaining buffers (from cache or fresh)
+                // Resolve remaining buffers (from pread for non-cached path, or from cache hits)
                 for ki in 0..actual_k {
                     if resolved_data[ki].is_none() {
                         resolved_data[ki] = Some(expert_buf.expert_data[ki].clone());
@@ -912,9 +921,9 @@ pub struct FusedExp2<C: ModelConfig> {
 }
 
 impl<C: ModelConfig> FusedExp2<C> {
-    pub fn new(model: Arc<Model>, k: usize) -> Result<Self, MoEError> {
+    pub fn new(model: Arc<Model>, k: usize, cache_enabled: bool) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp2")?;
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp2", cache_enabled)?;
 
         // // Debug: verify GPU matvec against CPU reference for key tensors
         // eprintln!("[verify] === BF16 matvec verification ===");
@@ -1030,7 +1039,15 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
     }
 
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
-        self.timing.clone()
+        let mut tm = self.timing.clone();
+        if let Some(ref caches) = self.expert_buffer.cache {
+            let (hits, misses): (u64, u64) = caches.iter()
+                .map(|c| (c.hits, c.misses))
+                .fold((0, 0), |(ah, am), (h, m)| (ah + h, am + m));
+            tm.insert("cache.hits".into(), TelemetryValue::Scalar(hits as f64));
+            tm.insert("cache.misses".into(), TelemetryValue::Scalar(misses as f64));
+        }
+        tm
     }
 }
 
