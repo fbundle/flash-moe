@@ -141,12 +141,16 @@ class Pipeline:
         Pipeline mode passed to :class:`~moe_infer.Engine`.
     k : int
         Active experts per token.  0 = model default.
-    expert_cache : bool
-        Enable the GPU-resident LRU cache for routed-expert weights
-        (8 entries per layer, ~540 MB on Qwen3.6-35B).  Default off —
-        Apple Silicon's OS page cache for the mmap'd weight file is
-        usually enough.  Worth flipping on for machines where expert
-        pread latency dominates (older SSDs, M1/M1 Pro).
+    expert_cache : int
+        Size of the GPU-resident shared LRU cache for routed-expert
+        weights, in number of entries (each ~1.7 MB on Qwen3.6-35B).
+        ``0`` disables it; ``32`` is the sweet spot from empirical
+        measurement on M1 Pro (recovers ~25% throughput vs disabled).
+        The cache is shared across all layers and keyed by
+        ``(layer, expert_idx)`` — hot experts that recur at multiple
+        layers stay warm.  Default ``0`` — Apple Silicon's OS page
+        cache for the mmap'd weight file is usually enough on
+        M2/M3/M4; older machines (M1, M1 Pro) benefit from the LRU.
     """
 
     # ── Set in subclasses ───────────────────────────────────────────────
@@ -222,7 +226,7 @@ class Pipeline:
         mode: str = "Qwen35MoEFusedExp2",
         k: int = 0,
         quantize_mode: str = "bq4",
-        expert_cache: bool = False,
+        expert_cache: int = 0,
     ) -> None:
         import os
 

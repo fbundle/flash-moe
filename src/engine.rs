@@ -101,7 +101,7 @@ impl DynEngine {
         engine_type: &str,
         model: Arc<Model>,
         k: usize,
-        expert_cache: bool,
+        expert_cache: usize,
     ) -> Result<Self, MoEError> {
         let arch = model.config.resolve("architectures")
             .and_then(|v| v.as_array())

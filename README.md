@@ -103,26 +103,35 @@ cache to absorb repeats.  That's usually enough on M2/M3/M4 + a fast
 SSD.  On older hardware (M1, M1 Pro) or slower disks, expert I/O can
 dominate and a GPU-resident LRU helps.
 
-Turn it on with `expert_cache=True`:
+Pass `expert_cache=N` to allocate an N-entry shared LRU:
 
 ```python
-pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B", expert_cache=True)
+pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B", expert_cache=32)
 ```
 
-This allocates one LRU per MoE layer (8 entries each, ~540 MB total on
-Qwen3.6-35B).  Cache hits skip the `pread` entirely and reuse the GPU
-buffer from a previous token.
+The cache is a single LRU shared across all MoE layers, keyed by
+`(layer, expert_idx)`.  Routers structurally re-use hot experts at
+multiple layers, so a small shared pool catches that overlap with
+minimal memory.  `0` disables it.
 
-Off by default — measure before flipping it on:
+Each entry is ~1.7 MB on Qwen3.6-35B, so:
 
-| Hardware | Off | On |
+| `expert_cache=` | Footprint | Notes |
 |---|---|---|
-| M4 + fast SSD | ~6.6 tok/s | ~5.8 tok/s (slower — page cache wins) |
-| M1 Pro + internal SSD | ~7 tok/s | ~9.5 tok/s (reported by user) |
+| `0` (default) | 0 MB | OS page cache only — best on M2/M3/M4 + fast SSD |
+| `32` | ~54 MB | Sweet spot on M1 / M1 Pro |
+| `128` | ~218 MB | More headroom for long contexts; diminishing returns |
+
+Empirical measurements on the "write a 200 word essay" prompt:
+
+| Hardware | `expert_cache=0` | `expert_cache=32` |
+|---|---|---|
+| M4 + fast SSD | 6.5 tok/s | 6.8 tok/s |
+| M1 Pro + internal SSD | ~7 tok/s | ~9.5 tok/s |
 
 The break-even depends on how often your prompts route to the same
-experts at each layer; the LRU pays off when temporal locality at the
-layer level is high.
+experts across layers; the LRU pays off when cross-layer expert reuse
+is high.
 
 ### Multi-Token Prediction (MTP)
 
@@ -207,5 +216,5 @@ and PyTorch CPU (pre-dequantized BF16 matmul).
 | Conversation history | `pipe.messages` — see what was said |
 | Engine timing | `pipe.telemetry` — how long each step took |
 | Switch quantization | `quantize_mode="int4"` or `quantize_mode="bq4"` (default) |
-| Expert LRU cache | `Qwen35MoEPipeline(..., expert_cache=True)` — try it on M1/M1 Pro |
+| Expert LRU cache | `Qwen35MoEPipeline(..., expert_cache=32)` — try it on M1/M1 Pro |
 | MTP support | Qwen3.6 models load MTP automatically; `pipe._has_mtp` reports status |

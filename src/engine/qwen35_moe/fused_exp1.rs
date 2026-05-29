@@ -242,15 +242,14 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             let expert_file = &self.engine.model.expert_files[layer];
             let expert_size = expert_file.expert_size();
 
-            // Phase 1: check per-layer LRU cache for each selected expert
+            // Phase 1: check the shared LRU cache for each selected expert
             let mut misses: Vec<(usize, usize)> = Vec::with_capacity(actual_k); // (ki, expert_idx)
             {
                 let expert_buf = &mut self.engine.expert_buffer;
-                if let Some(ref mut caches) = expert_buf.cache {
-                    let layer_cache = &mut caches[layer];
+                if let Some(ref mut cache) = expert_buf.cache {
                     for ki in 0..actual_k {
                         let eidx = expert_indices[ki];
-                        if let Some(buf) = layer_cache.lookup(eidx) {
+                        if let Some(buf) = cache.lookup(layer, eidx) {
                             resolved_data[ki] = Some(buf);
                             continue;
                         }
@@ -281,14 +280,13 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                 });
             }
 
-            // Phase 3: insert newly loaded experts into per-layer cache (zero-copy swap)
+            // Phase 3: insert newly loaded experts into the shared cache (zero-copy swap)
             {
                 let expert_buf = &mut self.engine.expert_buffer;
-                if let Some(ref mut caches) = expert_buf.cache {
-                    let layer_cache = &mut caches[layer];
+                if let Some(ref mut cache) = expert_buf.cache {
                     for &(ki, eidx) in &misses {
-                        layer_cache.insert_swap(eidx, &mut expert_buf.expert_data[ki]);
-                        resolved_data[ki] = layer_cache.lookup(eidx);
+                        cache.insert_swap(layer, eidx, &mut expert_buf.expert_data[ki]);
+                        resolved_data[ki] = cache.lookup(layer, eidx);
                     }
                 }
                 // Resolve remaining buffers (from pread for non-cached path, or from cache hits)
@@ -890,7 +888,7 @@ pub struct FusedExp1<C: ModelConfig> {
 }
 
 impl<C: ModelConfig> FusedExp1<C> {
-    pub fn new(model: Arc<Model>, k: usize, expert_cache: bool) -> Result<Self, MoEError> {
+    pub fn new(model: Arc<Model>, k: usize, expert_cache: usize) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
         let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp1", expert_cache)?;
 
@@ -981,12 +979,9 @@ impl<C: ModelConfig> Engine for FusedExp1<C> {
 
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
         let mut tm = self.timing.clone();
-        if let Some(ref caches) = self.expert_buffer.cache {
-            let (hits, misses): (u64, u64) = caches.iter()
-                .map(|c| (c.hits, c.misses))
-                .fold((0, 0), |(ah, am), (h, m)| (ah + h, am + m));
-            tm.insert("cache.hits".into(), TelemetryValue::Scalar(hits as f64));
-            tm.insert("cache.misses".into(), TelemetryValue::Scalar(misses as f64));
+        if let Some(ref cache) = self.expert_buffer.cache {
+            tm.insert("cache.hits".into(), TelemetryValue::Scalar(cache.hits as f64));
+            tm.insert("cache.misses".into(), TelemetryValue::Scalar(cache.misses as f64));
         }
         tm
     }
