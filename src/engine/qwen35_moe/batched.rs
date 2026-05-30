@@ -39,4 +39,48 @@
 
 #![allow(dead_code)]
 
-// Implementation will land here as tasks #2-#7 complete.
+// ─── Status (batched-prefill branch) ──────────────────────────────────────
+//
+// DONE — Kernel infrastructure:
+//   matvec_bf16_n, matvec_int8_n, dequant_matvec_4bit_n  — batched matvec
+//                                                          variants for the
+//                                                          [N, in_dim] → [N, out_dim] shape
+//   attn_sdpa_causal_n                                   — causal batched
+//                                                          attention with online softmax
+//   kv_cache_append_n                                    — write K/V for N
+//                                                          tokens at positions [past_pos..past_pos+N)
+//
+//   All 5 kernels compile cleanly and pipelines load. They are presently
+//   unused by the runtime — the integration is the next phase.
+//
+// TODO — Integration (the bulk of the remaining work):
+//
+//   1. forward_hidden_batched entry point on FusedExp2 (mirrors
+//      forward_hidden's signature) — initially delegates to the token-serial
+//      forward_hidden so we have an A/B-testable Python entry point.
+//
+//   2. Replace internal loop body, layer at a time, with batched compute:
+//      - Full-attn op1_full_batched: rms_norm + 3 batched matvecs (q/k/v)
+//        + per-token loop for Q/K head_norm_rope (pos changes per token)
+//        + kv_cache_append_n + attn_sdpa_causal_n + sigmoid_gate (loop or batched)
+//        + o_proj batched matvec + residual_add + post_attn_norm (loop or batched)
+//        + 4 batched matvecs for gate / shared_expert.*.
+//      - Linear-attn op1_linear_batched: 4 batched matvecs (in_proj_*)
+//        + per-token serial loop for conv1d_step, rms_norm_qk,
+//          compute_decay_beta, gated_delta_net_step, gated_rms_norm
+//          (these are recurrent / cheap enough that batching isn't worth it
+//          for MVP) + out_proj batched matvec + residual + post_attn_norm
+//        + 4 batched matvecs.
+//      - MoE (per-token): keep existing route_experts + op2 per token. Loop
+//        over N tokens within the layer. This stays serial — batching MoE
+//        is Phase 2.
+//      - Final norm + lm_head: batched.
+//
+//   3. Numerical equivalence test: forward_hidden(N) ≡ forward_hidden_batched(N)
+//      for N ∈ {1, 2, 4, 32}, validated against transformers via verify_nway.
+//
+//   4. Bench prefill: helpers/bench_prefill.py comparing both paths at
+//      prompt lengths {64, 256, 1K, 4K}.
+//
+// Expected: ~1.4× prefill speedup (analysis: non-MoE GPU work collapses;
+// MoE stays per-token and dominates; net win bounded by non-MoE fraction).
