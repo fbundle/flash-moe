@@ -19,7 +19,10 @@ from moe_infer import Model
 
 
 def bench(model, method: str, n: int, n_runs: int) -> float:
-    e = moe_infer._core._rs.Engine(model._inner, "Qwen35MoEFusedExp2", 0)
+    # forward → token-serial path via FusedExp2 (production engine).
+    # forward_batched → layer-batched path via FusedExp3 (opt-in batched engine).
+    pipeline_mode = "Qwen35MoEFusedExp3" if method == "forward_batched" else "Qwen35MoEFusedExp2"
+    e = moe_infer._core._rs.Engine(model._inner, pipeline_mode, 0)
     # Warmup — first call always slower (shader compile + GPU warm-up).
     warmup = np.array(np.random.RandomState(1).randint(4, 50000, size=4), dtype=np.int64)
     getattr(e, method)(warmup, moe_infer._core._rs.Cache(model._inner))

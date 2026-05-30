@@ -9,10 +9,17 @@ use pyo3::types::PyList;
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
-use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
+use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine, EngineSnapshot};
 use crate::bq4::{BQ4Scheme, QwenVersion};
 use crate::hf_util::HfRepo;
 use crate::int4::Int4Scheme;
+
+// ─── Opaque snapshot wrapper (for speculative-decoding rollback) ────────────
+
+#[pyclass(unsendable)]
+pub struct PyEngineSnapshot {
+    inner: EngineSnapshot,
+}
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -287,6 +294,18 @@ impl Engine {
     /// Roll back MTP KV cache to a specific position (after partial accept).
     fn mtp_rollback(&mut self, pos: usize) {
         self.engine.mtp_rollback(pos);
+    }
+
+    /// Take a full snapshot of mutable engine state (pos, MTP pos, DeltaNet
+    /// recurrent state). Returned as an opaque PyEngineSnapshot — pass to
+    /// `restore_snapshot()` to undo subsequent forwards. Used by speculative
+    /// decoding to roll back rejected drafts.
+    fn snapshot_state(&self) -> PyEngineSnapshot {
+        PyEngineSnapshot { inner: self.engine.snapshot() }
+    }
+
+    fn restore_snapshot(&mut self, snap: &PyEngineSnapshot) {
+        self.engine.restore(&snap.inner);
     }
 
     fn __repr__(&self) -> String {

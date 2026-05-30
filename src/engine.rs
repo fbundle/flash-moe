@@ -81,6 +81,31 @@ pub trait Engine {
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
         BTreeMap::new()
     }
+
+    /// Snapshot the engine's mutable runtime state (pos, MTP pos, linear-attn
+    /// recurrent state). Used to enable speculative decoding rollback.
+    /// Default impl returns an empty snapshot — engines that need rollback
+    /// override this.
+    fn snapshot(&self) -> EngineSnapshot { EngineSnapshot::empty() }
+
+    /// Restore previously-captured state. Pairs with `snapshot()`.
+    fn restore(&mut self, _snap: &EngineSnapshot) {}
+}
+
+/// Opaque snapshot of an engine's mutable runtime state.
+/// Currently captures: main-cache pos, last_h_pre_norm, MTP pos, and the
+/// recurrent state of every linear-attn layer (conv_state + delta_state).
+#[derive(Default, Clone)]
+pub struct EngineSnapshot {
+    pub pos: usize,
+    pub mtp_pos: usize,
+    pub last_h_pre_norm: Vec<f32>,
+    pub conv_state: Vec<Vec<u8>>,
+    pub delta_state: Vec<Vec<u8>>,
+}
+
+impl EngineSnapshot {
+    pub fn empty() -> Self { Self::default() }
 }
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
@@ -91,7 +116,9 @@ mod cpu;
 #[path = "engine/qwen35_moe/fused_exp1.rs"]
 mod fused_exp1;
 #[path = "engine/qwen35_moe/fused_exp2.rs"]
-mod fused_exp2;
+pub mod fused_exp2;
+#[path = "engine/qwen35_moe/fused_exp3.rs"]
+mod fused_exp3;
 #[path = "engine/qwen35_moe/metal_context.rs"]
 pub mod metal_context;
 #[path = "engine/qwen35_moe/metal_kernels.rs"]
@@ -104,6 +131,7 @@ pub mod batched;
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
 use crate::engine::fused_exp2::FusedExp2;
+use crate::engine::fused_exp3::FusedExp3;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -131,6 +159,10 @@ impl DynEngine {
                 Box::new(FusedExp2::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp2", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
                 Box::new(FusedExp2::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp3", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp3::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp3", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp3::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),
@@ -176,6 +208,14 @@ impl DynEngine {
 
     pub fn mtp_rollback(&mut self, pos: usize) {
         self.inner.mtp_rollback(pos)
+    }
+
+    pub fn snapshot(&self) -> EngineSnapshot {
+        self.inner.snapshot()
+    }
+
+    pub fn restore(&mut self, snap: &EngineSnapshot) {
+        self.inner.restore(snap)
     }
 
     pub fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {

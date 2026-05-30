@@ -325,46 +325,6 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         }
     }
 
-    /// CPU-only routing for one token: softmax + topk + normalize.
-    /// Returns (expert_indices, expert_weights). No I/O.
-    fn route_cpu_only(&self, mut gate_scores: GateScores) -> (Vec<usize>, Vec<f32>) {
-        let k = self.engine.num_active_experts;
-        softmax(&mut gate_scores.scores);
-        let mut expert_indices = vec![0usize; k];
-        let mut expert_weights = vec![0.0f32; k];
-        topk(&gate_scores.scores, k, &mut expert_indices, &mut expert_weights);
-        normalize_weights(&mut expert_weights);
-        (expert_indices, expert_weights)
-    }
-
-    /// Parallel pread the given UNIQUE expert IDs from this layer's expert
-    /// file into pool.slot(expert_id). Each unique expert is loaded ONCE per
-    /// layer, regardless of how many tokens picked it — the major
-    /// pread-bandwidth saving over the per-token pool design.
-    fn pread_unique_experts(
-        &self,
-        layer: usize,
-        unique_ids: &[usize],
-        pool: &crate::engine::batched::ExpertPool,
-    ) {
-        let expert_file = &self.engine.model.expert_files[layer];
-        let expert_size = expert_file.expert_size();
-        rayon::scope(|s| {
-            for &eid in unique_ids {
-                let dst_slot = pool.slot(eid);
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        dst_slot.contents() as *mut u8,
-                        expert_size,
-                    )
-                };
-                s.spawn(move |_| {
-                    expert_file.read_expert(eid, dst).unwrap();
-                });
-            }
-        });
-    }
-
     // ── op2: post-expert (encodes into pending buffer, does NOT commit) ────
 
     fn op2(&mut self, layer: usize, routing: &Routing) {
@@ -448,6 +408,9 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
 // ─── Private helpers ────────────────────────────────────────────────────────
 
+// encode_pre_expert_linear is `pub(crate)` (rather than fully private) so the
+// batched-prefill engine in `fused_exp3.rs` can reuse its per-token DeltaNet
+// dispatch sequence. Behavior is unchanged from the original.
 pub(crate) fn encode_pre_expert_linear(
     wf: &WeightFile,
     weight_buffer: &WeightBuffer,
@@ -930,36 +893,6 @@ fn encode_post_expert<C: ModelConfig>(
 
 // ─── gpu_lm_head ───────────────────────────────────────────────────────────
 
-/// Batched lm_head for N tokens. One Metal command buffer + one batched
-/// matvec instead of N separate (allocate, copy, dispatch, wait, copy) loops.
-fn gpu_lm_head_n(
-    wf: &WeightFile, hiddens: &[f32], logits: &mut [f32],
-    weight_buffer: &WeightBuffer, ctx: &MetalContext,
-    n: usize, hidden_dim: usize, vocab_size: usize,
-) {
-    debug_assert_eq!(hiddens.len(), n * hidden_dim);
-    debug_assert_eq!(logits.len(), n * vocab_size);
-    let x_buf = metal_buf_shared(&ctx.device, n * hidden_dim * 4);
-    unsafe {
-        std::ptr::copy_nonoverlapping(hiddens.as_ptr(), x_buf.contents() as *mut f32, n * hidden_dim);
-    }
-    let out_buf = metal_buf_shared(&ctx.device, n * vocab_size * 4);
-    let cm = ctx.queue.new_command_buffer();
-    let enc = cm.new_compute_command_encoder();
-    let ok = weight_buffer.encode_matvec_n_into(
-        wf, ctx, &enc, "language_model.lm_head",
-        &x_buf, 0, &out_buf, 0, vocab_size, hidden_dim, n as u32,
-    );
-    assert!(ok, "encode_matvec_n_into failed for language_model.lm_head");
-    enc.end_encoding();
-    cm.commit();
-    cm.wait_until_completed();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            out_buf.contents() as *const f32, logits.as_mut_ptr(), n * vocab_size);
-    }
-}
-
 fn gpu_lm_head(
     wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
     weight_buffer: &WeightBuffer, ctx: &MetalContext,
@@ -1096,197 +1029,6 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vocab_size..(ti + 1) * vocab_size]);
             }
         } // exec dropped — ends borrow of self
-
-        timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
-        Ok(logits)
-    }
-
-    /// Batched-prefill variant. Layer-serial loop with:
-    ///  - batched op1 for full-attention layers (10 of 40 on Qwen3.6)
-    ///  - per-token op1 for linear-attention layers (DeltaNet recurrence)
-    ///  - **batched** MoE op2: all N op2 dispatches into one cmd buffer per
-    ///    layer (one commit instead of N). Per-token expert weights live in
-    ///    `ExpertPool` (N * MAX_K Metal buffers, ~450 MB at N=32 on Qwen3.6).
-    ///  - batched final_norm + lm_head
-    fn forward_hidden_batched(
-        &mut self,
-        embeddings: &[f32],
-        check_signal: SignalCheckFn<'_>,
-        mtp: bool,
-    ) -> Result<Vec<f32>, MoEError> {
-        use crate::engine::batched::{BatchedFullBuffers, ExpertPool, op1_full_batched, op1_linear_batched, encode_post_expert_at};
-
-        let t0 = Instant::now();
-        let hidden_dim = C::HIDDEN_DIM;
-        let n = embeddings.len() / hidden_dim;
-        let vocab_size = C::VOCAB_SIZE;
-        let num_layers = C::NUM_LAYERS;
-        let num_experts = C::NUM_EXPERTS;
-        let shared_inter = C::SHARED_INTERMEDIATE;
-
-        let mut logits = vec![0.0f32; n * vocab_size];
-        if n == 0 { return Ok(logits); }
-        // For very small N (e.g. 1 = chat generation), fall back to the
-        // token-serial path — the batched overhead exceeds the win.
-        if n == 1 {
-            return Engine::forward_hidden(self, embeddings, check_signal, mtp);
-        }
-
-        let past_pos = self.ctx.pos.get();
-        assert!(past_pos + n <= MAX_SEQ, "past_pos + n ({} + {}) exceeds MAX_SEQ ({})",
-                past_pos, n, MAX_SEQ);
-
-        // Allocate batched buffers + per-layer unique-expert pool once and reuse across layers.
-        // Pool sized for ALL experts in a layer (worst case all unique), one slot per expert ID.
-        let bufs = BatchedFullBuffers::new::<C>(&self.ctx.device, n);
-        let expert_size = self.model.expert_files[0].expert_size();
-        let pool = ExpertPool::new(&self.ctx.device, num_experts, expert_size);
-
-        // Copy initial embeddings into bufs.hidden_n.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                embeddings.as_ptr(),
-                bufs.hidden_n.contents() as *mut f32,
-                n * hidden_dim,
-            );
-        }
-
-        for layer in 0..num_layers {
-            if check_signal() {
-                return Err(MoEError::Metal("interrupted".into()));
-            }
-            let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
-
-            // ── Op1: produce per-token (post_normed, temp_residual, shared_*, gate_scores) ──
-            if is_full {
-                let fa_idx = layer / FULL_ATTN_INTERVAL;
-                let cm = op1_full_batched::<C>(
-                    &self.model.weight_file, &self.weight_buffer, &self.ctx,
-                    layer, fa_idx, past_pos, n, &bufs,
-                );
-                cm.commit();
-                cm.wait_until_completed();
-            } else {
-                // Linear-attn op1: all N tokens encoded into ONE cmd buffer.
-                // DeltaNet recurrence (conv_state, delta_state) is sequential
-                // by definition — Metal serializes the per-token dispatches
-                // via implicit barriers on the shared state buffers.
-                let linear_idx = layer - (layer + 1) / FULL_ATTN_INTERVAL;
-                let cm = op1_linear_batched::<C>(
-                    &self.model.weight_file, &self.weight_buffer, &self.ctx,
-                    layer, linear_idx, n, &bufs,
-                );
-                cm.commit();
-                cm.wait_until_completed();
-            }
-
-            // ── Batched MoE op2: one cmd buffer per layer covers all N tokens ──
-            // Phase 1: CPU routing (softmax/topk/normalize) for each token.
-            let mut all_indices: Vec<Vec<usize>> = Vec::with_capacity(n);
-            let mut all_weights: Vec<Vec<f32>>   = Vec::with_capacity(n);
-            let mut sg_scores: Vec<f32>          = Vec::with_capacity(n);
-            for ti in 0..n {
-                let mut gs_vec = vec![0.0f32; num_experts];
-                let sg_score: f32;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (bufs.gate_scores_n.contents() as *const f32).add(ti * num_experts),
-                        gs_vec.as_mut_ptr(), num_experts);
-                    sg_score = *((bufs.shared_gate_score_n.contents() as *const f32).add(ti));
-                }
-                let exec = ExecCtx { engine: self, pending: None };
-                let (idx, w) = exec.route_cpu_only(
-                    GateScores { scores: gs_vec, shared_gate_score: sg_score });
-                all_indices.push(idx);
-                all_weights.push(w);
-                sg_scores.push(sg_score);
-            }
-            // Phase 2: pread unique experts ONCE each (saves bandwidth vs per-token pool).
-            let unique_ids: Vec<usize> = {
-                let mut seen = vec![false; num_experts];
-                let mut ids = Vec::new();
-                for indices in &all_indices {
-                    for &eid in indices {
-                        if !seen[eid] {
-                            seen[eid] = true;
-                            ids.push(eid);
-                        }
-                    }
-                }
-                ids
-            };
-            let _n_unique = unique_ids.len();
-            {
-                let exec = ExecCtx { engine: self, pending: None };
-                exec.pread_unique_experts(layer, &unique_ids, &pool);
-            }
-            // Phase 3: build Routing structs with refs into the unique pool.
-            let actual_k = self.num_active_experts.min(MAX_K);
-            let routings: Vec<Routing> = (0..n).map(|ti| {
-                let expert_data: Vec<Buffer> = (0..actual_k)
-                    .map(|ki| pool.slot(all_indices[ti][ki]).clone())
-                    .collect();
-                Routing {
-                    expert_weights: all_weights[ti].clone(),
-                    shared_gate_score: sg_scores[ti],
-                    expert_data,
-                }
-            }).collect();
-            // 2. Encode all N op2 dispatches into ONE command buffer; one commit.
-            {
-                let cm = self.ctx.queue.new_command_buffer().to_owned();
-                let enc = cm.new_compute_command_encoder();
-                for ti in 0..n {
-                    encode_post_expert_at::<C>(
-                        &self.model.weight_file, &self.weight_buffer, &self.ctx, &enc,
-                        layer, ti,
-                        &routings[ti].expert_weights, routings[ti].shared_gate_score,
-                        &routings[ti].expert_data, &self.expert_buffer,
-                        self.num_active_experts,
-                        &bufs,
-                    );
-                }
-                enc.end_encoding();
-                cm.commit();
-                cm.wait_until_completed();
-            }
-            // 3. For MTP: save the last token's hidden state (pre-norm).
-            if mtp && layer + 1 == num_layers {
-                let mut last = vec![0.0f32; hidden_dim];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (bufs.hidden_n.contents() as *const f32).add((n - 1) * hidden_dim),
-                        last.as_mut_ptr(),
-                        hidden_dim,
-                    );
-                }
-                self.last_h_pre_norm = last;
-            }
-        }
-
-        // Update pos once we've advanced through the whole batch.
-        self.ctx.pos.set(past_pos + n);
-
-        // Collect hiddens from the final layer's output, do batched final_norm + lm_head.
-        let mut hiddens_flat = vec![0.0f32; n * hidden_dim];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bufs.hidden_n.contents() as *const f32,
-                hiddens_flat.as_mut_ptr(),
-                n * hidden_dim,
-            );
-        }
-        for ti in 0..n {
-            final_norm(
-                &self.model.weight_file,
-                &mut hiddens_flat[ti * hidden_dim..(ti + 1) * hidden_dim],
-                hidden_dim,
-            );
-        }
-        gpu_lm_head_n(
-            &self.model.weight_file, &hiddens_flat, &mut logits,
-            &self.weight_buffer, &self.ctx, n, hidden_dim, vocab_size,
-        );
 
         timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
         Ok(logits)

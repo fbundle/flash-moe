@@ -26,6 +26,7 @@ fn _moe_infer_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<(
     use pyo3::wrap_pyfunction;
     m.add_class::<python_bindings::Model>()?;
     m.add_class::<python_bindings::Engine>()?;
+    m.add_class::<python_bindings::PyEngineSnapshot>()?;
     m.add_class::<python_bindings::Cache>()?;
     m.add_function(wrap_pyfunction!(python_bindings::record_engine_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::qwen35_moe_quantize, m)?)?;
