@@ -551,30 +551,34 @@ pub fn op1_linear_batched<C: ModelConfig>(
 }
 
 
-// ─── Per-call expert pool ────────────────────────────────────────────────
+// ─── Unique-expert pool (per-layer reuse) ────────────────────────────────
 //
-// For batched op2 commits, each token's experts must live in distinct GPU
-// memory through the whole layer's encoding (otherwise the next token's
-// pread overwrites the previous token's data mid-encoding). This pool of
-// N * MAX_K Metal buffers serves as per-token pread destinations.
+// Each MoE layer has at most `num_experts` (Qwen3.6: 256) distinct experts.
+// At prefill, multiple tokens often pick the SAME expert — instead of
+// preading the same expert weight blob N×K times, we pread each unique
+// expert ONCE per layer.
 //
-// Memory cost: N * MAX_K * expert_size. For Qwen3.6 with N=32: ~450 MB.
+// Pool memory: num_experts × expert_size = 256 × ~1.77 MB ≈ 450 MB on
+// Qwen3.6 full model. Same memory cost as the previous per-token pool,
+// but pread bandwidth drops dramatically.
+//
+// In op2, multiple `routing[ti].expert_data[ki]` clones can point to the
+// SAME pool slot — Metal handles that as concurrent reads of the same
+// buffer (no serialization needed).
 pub struct ExpertPool {
-    pub n: usize,
-    pub buffers: Vec<Buffer>,  // length n * MAX_K
+    pub buffers: Vec<Buffer>,  // length = num_experts (one slot per unique expert per layer)
 }
 
 impl ExpertPool {
-    pub fn new(device: &Device, n: usize, expert_size: usize) -> Self {
-        let mut buffers = Vec::with_capacity(n * MAX_K);
-        for _ in 0..(n * MAX_K) {
+    pub fn new(device: &Device, num_experts: usize, expert_size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(num_experts);
+        for _ in 0..num_experts {
             buffers.push(metal_buf_shared(device, expert_size));
         }
-        Self { n, buffers }
+        Self { buffers }
     }
 
-    /// Get the `ki`-th expert slot for token `ti`.
-    pub fn slot(&self, ti: usize, ki: usize) -> &Buffer {
-        &self.buffers[ti * MAX_K + ki]
+    pub fn slot(&self, expert_id: usize) -> &Buffer {
+        &self.buffers[expert_id]
     }
 }

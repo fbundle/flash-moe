@@ -325,33 +325,33 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         }
     }
 
-    /// Batched-prefill route: same CPU work as route_experts but preads into
-    /// the per-token slots of an external pool instead of the shared
-    /// expert_buffer.expert_data scratch. Bypasses the LRU cache (prefill
-    /// has low expert reuse anyway). Used by forward_hidden_batched so all N
-    /// tokens' routing data lives in distinct GPU memory through the layer's
-    /// single batched op2 commit.
-    fn route_experts_for_batched(
-        &self,
-        layer: usize,
-        mut gate_scores: GateScores,
-        pool: &crate::engine::batched::ExpertPool,
-        ti: usize,
-    ) -> Routing {
+    /// CPU-only routing for one token: softmax + topk + normalize.
+    /// Returns (expert_indices, expert_weights). No I/O.
+    fn route_cpu_only(&self, mut gate_scores: GateScores) -> (Vec<usize>, Vec<f32>) {
         let k = self.engine.num_active_experts;
         softmax(&mut gate_scores.scores);
         let mut expert_indices = vec![0usize; k];
         let mut expert_weights = vec![0.0f32; k];
         topk(&gate_scores.scores, k, &mut expert_indices, &mut expert_weights);
         normalize_weights(&mut expert_weights);
-        let actual_k = k.min(MAX_K);
+        (expert_indices, expert_weights)
+    }
 
+    /// Parallel pread the given UNIQUE expert IDs from this layer's expert
+    /// file into pool.slot(expert_id). Each unique expert is loaded ONCE per
+    /// layer, regardless of how many tokens picked it — the major
+    /// pread-bandwidth saving over the per-token pool design.
+    fn pread_unique_experts(
+        &self,
+        layer: usize,
+        unique_ids: &[usize],
+        pool: &crate::engine::batched::ExpertPool,
+    ) {
         let expert_file = &self.engine.model.expert_files[layer];
         let expert_size = expert_file.expert_size();
         rayon::scope(|s| {
-            for ki in 0..actual_k {
-                let eidx = expert_indices[ki];
-                let dst_slot = pool.slot(ti, ki);
+            for &eid in unique_ids {
+                let dst_slot = pool.slot(eid);
                 let dst = unsafe {
                     std::slice::from_raw_parts_mut(
                         dst_slot.contents() as *mut u8,
@@ -359,16 +359,10 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                     )
                 };
                 s.spawn(move |_| {
-                    expert_file.read_expert(eidx, dst).unwrap();
+                    expert_file.read_expert(eid, dst).unwrap();
                 });
             }
         });
-        let expert_data: Vec<Buffer> = (0..actual_k).map(|ki| pool.slot(ti, ki).clone()).collect();
-        Routing {
-            expert_weights,
-            shared_gate_score: gate_scores.shared_gate_score,
-            expert_data,
-        }
     }
 
     // ── op2: post-expert (encodes into pending buffer, does NOT commit) ────
@@ -1142,10 +1136,11 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         assert!(past_pos + n <= MAX_SEQ, "past_pos + n ({} + {}) exceeds MAX_SEQ ({})",
                 past_pos, n, MAX_SEQ);
 
-        // Allocate batched buffers + per-token expert pool once and reuse across layers.
+        // Allocate batched buffers + per-layer unique-expert pool once and reuse across layers.
+        // Pool sized for ALL experts in a layer (worst case all unique), one slot per expert ID.
         let bufs = BatchedFullBuffers::new::<C>(&self.ctx.device, n);
         let expert_size = self.model.expert_files[0].expert_size();
-        let pool = ExpertPool::new(&self.ctx.device, n, expert_size);
+        let pool = ExpertPool::new(&self.ctx.device, num_experts, expert_size);
 
         // Copy initial embeddings into bufs.hidden_n.
         unsafe {
@@ -1186,9 +1181,10 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
             }
 
             // ── Batched MoE op2: one cmd buffer per layer covers all N tokens ──
-            // 1. CPU routing for each token; preads into the per-token ExpertPool
-            //    (NOT the shared expert_buffer.expert_data scratch — that would race).
-            let mut routings: Vec<Routing> = Vec::with_capacity(n);
+            // Phase 1: CPU routing (softmax/topk/normalize) for each token.
+            let mut all_indices: Vec<Vec<usize>> = Vec::with_capacity(n);
+            let mut all_weights: Vec<Vec<f32>>   = Vec::with_capacity(n);
+            let mut sg_scores: Vec<f32>          = Vec::with_capacity(n);
             for ti in 0..n {
                 let mut gs_vec = vec![0.0f32; num_experts];
                 let sg_score: f32;
@@ -1199,12 +1195,43 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                     sg_score = *((bufs.shared_gate_score_n.contents() as *const f32).add(ti));
                 }
                 let exec = ExecCtx { engine: self, pending: None };
-                routings.push(exec.route_experts_for_batched(
-                    layer,
-                    GateScores { scores: gs_vec, shared_gate_score: sg_score },
-                    &pool, ti,
-                ));
+                let (idx, w) = exec.route_cpu_only(
+                    GateScores { scores: gs_vec, shared_gate_score: sg_score });
+                all_indices.push(idx);
+                all_weights.push(w);
+                sg_scores.push(sg_score);
             }
+            // Phase 2: pread unique experts ONCE each (saves bandwidth vs per-token pool).
+            let unique_ids: Vec<usize> = {
+                let mut seen = vec![false; num_experts];
+                let mut ids = Vec::new();
+                for indices in &all_indices {
+                    for &eid in indices {
+                        if !seen[eid] {
+                            seen[eid] = true;
+                            ids.push(eid);
+                        }
+                    }
+                }
+                ids
+            };
+            let _n_unique = unique_ids.len();
+            {
+                let exec = ExecCtx { engine: self, pending: None };
+                exec.pread_unique_experts(layer, &unique_ids, &pool);
+            }
+            // Phase 3: build Routing structs with refs into the unique pool.
+            let actual_k = self.num_active_experts.min(MAX_K);
+            let routings: Vec<Routing> = (0..n).map(|ti| {
+                let expert_data: Vec<Buffer> = (0..actual_k)
+                    .map(|ki| pool.slot(all_indices[ti][ki]).clone())
+                    .collect();
+                Routing {
+                    expert_weights: all_weights[ti].clone(),
+                    shared_gate_score: sg_scores[ti],
+                    expert_data,
+                }
+            }).collect();
             // 2. Encode all N op2 dispatches into ONE command buffer; one commit.
             {
                 let cm = self.ctx.queue.new_command_buffer().to_owned();
