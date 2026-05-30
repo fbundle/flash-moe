@@ -325,6 +325,52 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         }
     }
 
+    /// Batched-prefill route: same CPU work as route_experts but preads into
+    /// the per-token slots of an external pool instead of the shared
+    /// expert_buffer.expert_data scratch. Bypasses the LRU cache (prefill
+    /// has low expert reuse anyway). Used by forward_hidden_batched so all N
+    /// tokens' routing data lives in distinct GPU memory through the layer's
+    /// single batched op2 commit.
+    fn route_experts_for_batched(
+        &self,
+        layer: usize,
+        mut gate_scores: GateScores,
+        pool: &crate::engine::batched::ExpertPool,
+        ti: usize,
+    ) -> Routing {
+        let k = self.engine.num_active_experts;
+        softmax(&mut gate_scores.scores);
+        let mut expert_indices = vec![0usize; k];
+        let mut expert_weights = vec![0.0f32; k];
+        topk(&gate_scores.scores, k, &mut expert_indices, &mut expert_weights);
+        normalize_weights(&mut expert_weights);
+        let actual_k = k.min(MAX_K);
+
+        let expert_file = &self.engine.model.expert_files[layer];
+        let expert_size = expert_file.expert_size();
+        rayon::scope(|s| {
+            for ki in 0..actual_k {
+                let eidx = expert_indices[ki];
+                let dst_slot = pool.slot(ti, ki);
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        dst_slot.contents() as *mut u8,
+                        expert_size,
+                    )
+                };
+                s.spawn(move |_| {
+                    expert_file.read_expert(eidx, dst).unwrap();
+                });
+            }
+        });
+        let expert_data: Vec<Buffer> = (0..actual_k).map(|ki| pool.slot(ti, ki).clone()).collect();
+        Routing {
+            expert_weights,
+            shared_gate_score: gate_scores.shared_gate_score,
+            expert_data,
+        }
+    }
+
     // ── op2: post-expert (encodes into pending buffer, does NOT commit) ────
 
     fn op2(&mut self, layer: usize, routing: &Routing) {
@@ -1064,7 +1110,9 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
     /// Batched-prefill variant. Layer-serial loop with:
     ///  - batched op1 for full-attention layers (10 of 40 on Qwen3.6)
     ///  - per-token op1 for linear-attention layers (DeltaNet recurrence)
-    ///  - per-token MoE within each layer (route + op2 per token)
+    ///  - **batched** MoE op2: all N op2 dispatches into one cmd buffer per
+    ///    layer (one commit instead of N). Per-token expert weights live in
+    ///    `ExpertPool` (N * MAX_K Metal buffers, ~450 MB at N=32 on Qwen3.6).
     ///  - batched final_norm + lm_head
     fn forward_hidden_batched(
         &mut self,
@@ -1072,7 +1120,7 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         check_signal: SignalCheckFn<'_>,
         mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
-        use crate::engine::batched::{BatchedFullBuffers, op1_full_batched};
+        use crate::engine::batched::{BatchedFullBuffers, ExpertPool, op1_full_batched, encode_post_expert_at};
 
         let t0 = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;
@@ -1094,8 +1142,11 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         assert!(past_pos + n <= MAX_SEQ, "past_pos + n ({} + {}) exceeds MAX_SEQ ({})",
                 past_pos, n, MAX_SEQ);
 
-        // Allocate batched buffers once and reuse across layers.
+        // Allocate batched buffers + per-token expert pool once and reuse across layers.
         let bufs = BatchedFullBuffers::new::<C>(&self.ctx.device, n);
+        let expert_size = self.model.expert_files[0].expert_size();
+        let pool = ExpertPool::new(&self.ctx.device, n, expert_size);
+
         // Copy initial embeddings into bufs.hidden_n.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1120,70 +1171,28 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                 );
                 cm.commit();
                 cm.wait_until_completed();
-                // Per-token MoE (route + op2) using batched buffers.
-                let ctx_buf_post_normed   = self.ctx.buf_post_normed.as_ref().unwrap().clone();
-                let ctx_buf_temp_residual = self.ctx.buf_temp_residual.as_ref().unwrap().clone();
-                let ctx_buf_shared_gate   = self.ctx.buf_shared_gate.as_ref().unwrap().clone();
-                let ctx_buf_shared_up     = self.ctx.buf_shared_up.as_ref().unwrap().clone();
-                let ctx_buf_moe_hidden    = self.ctx.buf_moe_hidden.as_ref().unwrap().clone();
-                for ti in 0..n {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.post_normed_n.contents() as *const f32).add(ti * hidden_dim),
-                            ctx_buf_post_normed.contents() as *mut f32, hidden_dim);
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.temp_residual_n.contents() as *const f32).add(ti * hidden_dim),
-                            ctx_buf_temp_residual.contents() as *mut f32, hidden_dim);
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.shared_gate_n.contents() as *const f32).add(ti * shared_inter),
-                            ctx_buf_shared_gate.contents() as *mut f32, shared_inter);
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.shared_up_n.contents() as *const f32).add(ti * shared_inter),
-                            ctx_buf_shared_up.contents() as *mut f32, shared_inter);
-                    }
-                    let mut gate_scores = vec![0.0f32; num_experts];
-                    let shared_gate_score: f32;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.gate_scores_n.contents() as *const f32).add(ti * num_experts),
-                            gate_scores.as_mut_ptr(), num_experts);
-                        shared_gate_score = *((bufs.shared_gate_score_n.contents() as *const f32).add(ti));
-                    }
-                    let mut exec = ExecCtx { engine: self, pending: None };
-                    let gs = GateScores { scores: gate_scores, shared_gate_score };
-                    let routing = exec.route_experts(layer, gs);
-                    exec.op2(layer, &routing);
-                    let hidden = exec.hidden_wait();
-                    if mtp && layer + 1 == num_layers && ti + 1 == n {
-                        exec.engine.last_h_pre_norm = hidden.clone();
-                    }
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_moe_hidden.contents() as *const f32,
-                            (bufs.hidden_n.contents() as *mut f32).add(ti * hidden_dim),
-                            hidden_dim);
-                    }
-                }
             } else {
-                // Linear-attn layer: per-token, fully reusing the existing
-                // op1_linear + route + op2 + hidden_wait pipeline. Slightly
-                // more work but DeltaNet recurrence has to be sequential
-                // anyway; batched DeltaNet is Phase 2.
-                let ctx_buf_moe_hidden = self.ctx.buf_moe_hidden.as_ref().unwrap().clone();
-                let in_norm_name = format!(
-                    "language_model.model.layers.{}.input_layernorm.weight", layer);
-                let in_norm_ptr = self.model.weight_file
-                    .get_tensor_ptr(&in_norm_name).unwrap();
+                // Linear-attn op1: per-token (DeltaNet recurrence is sequential).
+                // Just runs op1_linear → copies single-token outputs (post_normed,
+                // temp_residual, shared_*, gate_scores) into batched buffers.
+                // The batched MoE op2 block below then handles all N tokens uniformly.
+                let ctx_buf_moe          = self.ctx.buf_moe_hidden.as_ref().unwrap().clone();
+                let ctx_buf_post_normed  = self.ctx.buf_post_normed.as_ref().unwrap().clone();
+                let ctx_buf_temp_res     = self.ctx.buf_temp_residual.as_ref().unwrap().clone();
+                let ctx_buf_shared_gate  = self.ctx.buf_shared_gate.as_ref().unwrap().clone();
+                let ctx_buf_shared_up    = self.ctx.buf_shared_up.as_ref().unwrap().clone();
+                let ctx_buf_shared_gscore= self.ctx.buf_shared_gate_score.as_ref().unwrap().clone();
+                let ctx_buf_gate_scores  = self.ctx.buf_gate_scores.as_ref().unwrap().clone();
+                let in_norm_name = format!("language_model.model.layers.{}.input_layernorm.weight", layer);
+                let in_norm_ptr = self.model.weight_file.get_tensor_ptr(&in_norm_name).unwrap();
                 let in_norm_off = (in_norm_ptr as usize - self.weight_buffer.base as usize) as u64;
+
                 for ti in 0..n {
-                    // 1. Load this token's hidden into buf_moe_hidden.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             (bufs.hidden_n.contents() as *const f32).add(ti * hidden_dim),
-                            ctx_buf_moe_hidden.contents() as *mut f32,
-                            hidden_dim);
+                            ctx_buf_moe.contents() as *mut f32, hidden_dim);
                     }
-                    // 2. Single cmd buffer: input_norm + op1_linear pipelined.
                     let mut exec = ExecCtx { engine: self, pending: None };
                     let cmd = exec.engine.ctx.queue.new_command_buffer().to_owned();
                     {
@@ -1191,44 +1200,98 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                         let pipe = exec.engine.ctx.rms_norm_fused_bf16.as_ref().unwrap();
                         let buf_in = exec.engine.ctx.buf_input.as_ref().unwrap();
                         enc.set_compute_pipeline_state(pipe);
-                        enc.set_buffer(0, Some(&ctx_buf_moe_hidden), 0);
+                        enc.set_buffer(0, Some(&ctx_buf_moe), 0);
                         enc.set_buffer(1, Some(&exec.engine.weight_buffer.buf), in_norm_off);
                         enc.set_buffer(2, Some(buf_in), 0);
                         unsafe {
                             enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
                             enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
                         }
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(1, 1, 1),
-                            MTLSize::new(256, 1, 1),
-                        );
+                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
                         enc.end_encoding();
                     }
                     exec.op1_linear(layer, &cmd);
                     cmd.commit();
                     cmd.wait_until_completed();
-                    // Read gate_scores from buf_gate_scores.
-                    let mut gate_scores = vec![0.0f32; num_experts];
-                    let shared_gate_score: f32;
+                    // Copy single-token op1 outputs into batched slices.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            exec.engine.ctx.buf_gate_scores.as_ref().unwrap().contents() as *const f32,
-                            gate_scores.as_mut_ptr(), num_experts);
-                        shared_gate_score = *(exec.engine.ctx.buf_shared_gate_score.as_ref().unwrap().contents() as *const f32);
-                    }
-                    let routing = exec.route_experts(layer, GateScores { scores: gate_scores, shared_gate_score });
-                    exec.op2(layer, &routing);
-                    let hidden = exec.hidden_wait();
-                    if mtp && layer + 1 == num_layers && ti + 1 == n {
-                        exec.engine.last_h_pre_norm = hidden.clone();
-                    }
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_moe_hidden.contents() as *const f32,
-                            (bufs.hidden_n.contents() as *mut f32).add(ti * hidden_dim),
+                            ctx_buf_post_normed.contents() as *const f32,
+                            (bufs.post_normed_n.contents() as *mut f32).add(ti * hidden_dim),
                             hidden_dim);
+                        std::ptr::copy_nonoverlapping(
+                            ctx_buf_temp_res.contents() as *const f32,
+                            (bufs.temp_residual_n.contents() as *mut f32).add(ti * hidden_dim),
+                            hidden_dim);
+                        std::ptr::copy_nonoverlapping(
+                            ctx_buf_shared_gate.contents() as *const f32,
+                            (bufs.shared_gate_n.contents() as *mut f32).add(ti * shared_inter),
+                            shared_inter);
+                        std::ptr::copy_nonoverlapping(
+                            ctx_buf_shared_up.contents() as *const f32,
+                            (bufs.shared_up_n.contents() as *mut f32).add(ti * shared_inter),
+                            shared_inter);
+                        std::ptr::copy_nonoverlapping(
+                            ctx_buf_shared_gscore.contents() as *const f32,
+                            (bufs.shared_gate_score_n.contents() as *mut f32).add(ti),
+                            1);
+                        std::ptr::copy_nonoverlapping(
+                            ctx_buf_gate_scores.contents() as *const f32,
+                            (bufs.gate_scores_n.contents() as *mut f32).add(ti * num_experts),
+                            num_experts);
                     }
                 }
+            }
+
+            // ── Batched MoE op2: one cmd buffer per layer covers all N tokens ──
+            // 1. CPU routing for each token; preads into the per-token ExpertPool
+            //    (NOT the shared expert_buffer.expert_data scratch — that would race).
+            let mut routings: Vec<Routing> = Vec::with_capacity(n);
+            for ti in 0..n {
+                let mut gs_vec = vec![0.0f32; num_experts];
+                let sg_score: f32;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (bufs.gate_scores_n.contents() as *const f32).add(ti * num_experts),
+                        gs_vec.as_mut_ptr(), num_experts);
+                    sg_score = *((bufs.shared_gate_score_n.contents() as *const f32).add(ti));
+                }
+                let exec = ExecCtx { engine: self, pending: None };
+                routings.push(exec.route_experts_for_batched(
+                    layer,
+                    GateScores { scores: gs_vec, shared_gate_score: sg_score },
+                    &pool, ti,
+                ));
+            }
+            // 2. Encode all N op2 dispatches into ONE command buffer; one commit.
+            {
+                let cm = self.ctx.queue.new_command_buffer().to_owned();
+                let enc = cm.new_compute_command_encoder();
+                for ti in 0..n {
+                    encode_post_expert_at::<C>(
+                        &self.model.weight_file, &self.weight_buffer, &self.ctx, &enc,
+                        layer, ti,
+                        &routings[ti].expert_weights, routings[ti].shared_gate_score,
+                        &routings[ti].expert_data, &self.expert_buffer,
+                        self.num_active_experts,
+                        &bufs,
+                    );
+                }
+                enc.end_encoding();
+                cm.commit();
+                cm.wait_until_completed();
+            }
+            // 3. For MTP: save the last token's hidden state (pre-norm).
+            if mtp && layer + 1 == num_layers {
+                let mut last = vec![0.0f32; hidden_dim];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (bufs.hidden_n.contents() as *const f32).add((n - 1) * hidden_dim),
+                        last.as_mut_ptr(),
+                        hidden_dim,
+                    );
+                }
+                self.last_h_pre_norm = last;
             }
         }
 

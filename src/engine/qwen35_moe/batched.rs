@@ -32,8 +32,8 @@
 use std::ffi::c_void;
 use metal::*;
 
-use crate::constants::RMS_NORM_EPS;
-use crate::engine::metal_context::{MetalContext, WeightBuffer, metal_buf_shared};
+use crate::constants::{RMS_NORM_EPS, GROUP_SIZE};
+use crate::engine::metal_context::{MetalContext, WeightBuffer, ExpertBuffer, MAX_K, metal_buf_shared};
 use crate::engine::qwen35_constants::ModelConfig;
 use crate::model::weights::WeightFile;
 use crate::engine::metal_kernels;
@@ -52,6 +52,13 @@ pub struct BatchedFullBuffers {
     pub shared_gate_n: Buffer,       // [N, shared_inter]
     pub shared_up_n: Buffer,         // [N, shared_inter]
     pub shared_gate_score_n: Buffer, // [N, 1]
+    // Per-token combine_params for moe_combine_residual.
+    // Layout: each token gets 10 f32 (expert_weights[0..8] + shared_gate_score + pad).
+    pub combine_params_n: Buffer,    // [N, 10] f32
+    // Per-token expert intermediate outputs for batched op2.
+    // expert_out_n[ti * MAX_K + ki] holds the down-proj output of expert ki for token ti.
+    pub expert_out_n: Vec<Buffer>,   // length N * MAX_K, each [hidden] f32
+    pub shared_down_n: Buffer,       // [N, hidden] — shared expert down output per token
     // Scratch (lifetimes: within op1_full_batched only)
     pub qkv_x_n: Buffer,
     pub qbuf_n: Buffer,
@@ -78,6 +85,11 @@ impl BatchedFullBuffers {
 
         let alloc = |elements: usize| metal_buf_shared(device, elements * 4);
 
+        let mut expert_out_n = Vec::with_capacity(n * MAX_K);
+        for _ in 0..(n * MAX_K) {
+            expert_out_n.push(metal_buf_shared(device, hidden * 4));
+        }
+
         Self {
             n,
             hidden_n:            alloc(n * hidden),
@@ -86,6 +98,9 @@ impl BatchedFullBuffers {
             shared_gate_n:       alloc(n * shared_inter),
             shared_up_n:         alloc(n * shared_inter),
             shared_gate_score_n: alloc(n * 1),
+            combine_params_n:    alloc(n * 10),
+            expert_out_n,
+            shared_down_n:       alloc(n * hidden),
             qkv_x_n:    alloc(n * hidden),
             qbuf_n:     alloc(n * q_proj_dim),
             kbuf_n:     alloc(n * kv_dim),
@@ -292,4 +307,168 @@ pub fn op1_full_batched<C: ModelConfig>(
 
     enc.end_encoding();
     cm
+}
+
+
+// ─── Per-token op2 encoded with explicit batched buffer offsets ───────────
+//
+// Encodes one token's op2 dispatches into `enc`. All inputs and outputs
+// are slices of BatchedFullBuffers indexed by `ti`. Per-token combine_params
+// are written to `bufs.combine_params_n[ti * 10..]` and read via offset.
+//
+// Reads:
+//   - bufs.post_normed_n[ti]                   (input to expert + shared-expert matvecs)
+//   - bufs.temp_residual_n[ti]                 (residual baseline for moe_combine_residual)
+//   - bufs.shared_gate_n[ti], shared_up_n[ti]  (shared expert swiglu inputs)
+// Writes:
+//   - bufs.expert_out_n[ti*MAX_K..(ti+1)*MAX_K] (per-expert outputs, per-token)
+//   - bufs.shared_down_n[ti]                    (shared expert down output)
+//   - bufs.hidden_n[ti]                         (final layer output — input to next layer)
+//
+// expert_data[ki] points to the pread'd expert weights for this token; the
+// caller is responsible for ensuring these refs remain stable through GPU
+// execution (i.e., per-token expert pool, not the shared scratch).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_post_expert_at<C: ModelConfig>(
+    wf: &WeightFile,
+    weight_buffer: &WeightBuffer,
+    ctx: &MetalContext,
+    enc: &ComputeCommandEncoderRef,
+    layer_idx: usize,
+    ti: usize,
+    expert_weights: &[f32],
+    shared_gate_score: f32,
+    expert_data: &[Buffer],
+    expert_buffer: &ExpertBuffer,
+    num_experts_per_tok: usize,
+    bufs: &BatchedFullBuffers,
+) {
+    let hidden_dim = C::HIDDEN_DIM;
+    let moe_inter = C::MOE_INTERMEDIATE;
+    let shared_inter = C::SHARED_INTERMEDIATE;
+    let hidden_u32 = hidden_dim as u32;
+    let inter_u32 = moe_inter as u32;
+    let gs_u32 = GROUP_SIZE as u32;
+    let actual_k = num_experts_per_tok.min(MAX_K);
+    let prefix = format!("language_model.model.layers.{}.mlp", layer_idx);
+
+    let post_normed_off = (ti * hidden_dim * 4) as u64;
+    let temp_residual_off = (ti * hidden_dim * 4) as u64;
+    let shared_gate_off = (ti * shared_inter * 4) as u64;
+    let shared_up_off = (ti * shared_inter * 4) as u64;
+    let hidden_out_off = (ti * hidden_dim * 4) as u64;
+    let combine_off = (ti * 10 * 4) as u64;
+
+    for ki in 0..actual_k {
+        let eb = &expert_data[ki];
+        if eb.length() == 0 { continue; }
+
+        metal_kernels::encode_matvec_offset(ctx, enc,
+            eb, C::GATE_W_OFF as u64,
+            eb, C::GATE_S_OFF as u64,
+            eb, C::GATE_B_OFF as u64,
+            &bufs.post_normed_n, post_normed_off,
+            &expert_buffer.scratch_gate, 0,
+            inter_u32, hidden_u32, gs_u32, 3);
+
+        metal_kernels::encode_matvec_offset(ctx, enc,
+            eb, C::UP_W_OFF as u64,
+            eb, C::UP_S_OFF as u64,
+            eb, C::UP_B_OFF as u64,
+            &bufs.post_normed_n, post_normed_off,
+            &expert_buffer.scratch_up, 0,
+            inter_u32, hidden_u32, gs_u32, 3);
+
+        metal_kernels::encode_swiglu(ctx, enc,
+            &expert_buffer.scratch_gate, 0,
+            &expert_buffer.scratch_up, 0,
+            &expert_buffer.scratch_act, 0, inter_u32);
+
+        let eout = &bufs.expert_out_n[ti * MAX_K + ki];
+        metal_kernels::encode_matvec_offset(ctx, enc,
+            eb, C::DOWN_W_OFF as u64,
+            eb, C::DOWN_S_OFF as u64,
+            eb, C::DOWN_B_OFF as u64,
+            &expert_buffer.scratch_act, 0,
+            eout, 0,
+            hidden_u32, inter_u32, gs_u32, 3);
+    }
+
+    // Shared expert: swiglu(shared_gate, shared_up) → shared_act, then down → shared_down_n[ti]
+    metal_kernels::encode_swiglu(ctx, enc,
+        &bufs.shared_gate_n, shared_gate_off,
+        &bufs.shared_up_n, shared_up_off,
+        &expert_buffer.shared_act, 0, shared_inter as u32);
+
+    let sd_name = format!("{}.shared_expert.down_proj", prefix);
+    let ok = weight_buffer.encode_matvec_into(wf, ctx, enc, &sd_name,
+        &expert_buffer.shared_act, 0,
+        &bufs.shared_down_n, hidden_out_off,
+        hidden_dim, shared_inter);
+    debug_assert!(ok, "shared_expert.down_proj missing");
+
+    // Write per-token combine_params (CPU memcpy into bufs.combine_params_n[ti*10..]).
+    let mut cparams = [0.0f32; 10];
+    for (i, &w) in expert_weights.iter().enumerate() { cparams[i] = w; }
+    cparams[8] = shared_gate_score;
+    unsafe {
+        let dst = (bufs.combine_params_n.contents() as *mut f32).add(ti * 10);
+        std::ptr::copy_nonoverlapping(cparams.as_ptr(), dst, 10);
+    }
+
+    // moe_combine_residual: sums per-expert outputs + shared_down + temp_residual → hidden_n[ti]
+    {
+        let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
+        enc.set_compute_pipeline_state(mcr_pipe);
+        enc.set_buffer(0, Some(&bufs.temp_residual_n), temp_residual_off);
+        enc.set_buffer(1, Some(&bufs.shared_down_n), hidden_out_off);
+        enc.set_buffer(2, Some(&bufs.hidden_n), hidden_out_off);
+        for ei in 0..MAX_K {
+            if ei < actual_k {
+                enc.set_buffer(3 + ei as u64, Some(&bufs.expert_out_n[ti * MAX_K + ei]), 0);
+            } else {
+                // Padding: bind any valid buffer; the kernel ignores past actual_k.
+                enc.set_buffer(3 + ei as u64, Some(&bufs.hidden_n), hidden_out_off);
+            }
+        }
+        enc.set_buffer(11, Some(&bufs.combine_params_n), combine_off);
+        unsafe {
+            enc.set_bytes(12, 4, &hidden_u32 as *const u32 as *const c_void);
+            let ku = actual_k as u32;
+            enc.set_bytes(13, 4, &ku as *const u32 as *const c_void);
+        }
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+}
+
+
+// ─── Per-call expert pool ────────────────────────────────────────────────
+//
+// For batched op2 commits, each token's experts must live in distinct GPU
+// memory through the whole layer's encoding (otherwise the next token's
+// pread overwrites the previous token's data mid-encoding). This pool of
+// N * MAX_K Metal buffers serves as per-token pread destinations.
+//
+// Memory cost: N * MAX_K * expert_size. For Qwen3.6 with N=32: ~450 MB.
+pub struct ExpertPool {
+    pub n: usize,
+    pub buffers: Vec<Buffer>,  // length n * MAX_K
+}
+
+impl ExpertPool {
+    pub fn new(device: &Device, n: usize, expert_size: usize) -> Self {
+        let mut buffers = Vec::with_capacity(n * MAX_K);
+        for _ in 0..(n * MAX_K) {
+            buffers.push(metal_buf_shared(device, expert_size));
+        }
+        Self { n, buffers }
+    }
+
+    /// Get the `ki`-th expert slot for token `ti`.
+    pub fn slot(&self, ti: usize, ki: usize) -> &Buffer {
+        &self.buffers[ti * MAX_K + ki]
+    }
 }
