@@ -50,6 +50,18 @@ pub trait Engine {
         mtp: bool,
     ) -> Result<Vec<f32>, MoEError>;
 
+    /// Batched-prefill variant: process N tokens with layer-batched compute
+    /// instead of token-serial. Default impl delegates to `forward_hidden` —
+    /// engines override when they have a batched code path.
+    fn forward_hidden_batched(
+        &mut self,
+        embeddings: &[f32],
+        check_signal: SignalCheckFn<'_>,
+        mtp: bool,
+    ) -> Result<Vec<f32>, MoEError> {
+        self.forward_hidden(embeddings, check_signal, mtp)
+    }
+
     /// H pre-norm from the last forward pass (before final norm + lm_head).
     /// Only populated by engines that support MTP.
     fn last_h_pre_norm(&self) -> &[f32] { &[] }
@@ -142,6 +154,10 @@ impl DynEngine {
 
     pub fn forward_hidden(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>, mtp: bool) -> Result<Vec<f32>, MoEError> {
         self.inner.forward_hidden(embeddings, check_signal, mtp)
+    }
+
+    pub fn forward_hidden_batched(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>, mtp: bool) -> Result<Vec<f32>, MoEError> {
+        self.inner.forward_hidden_batched(embeddings, check_signal, mtp)
     }
 
     pub fn last_h_pre_norm(&self) -> &[f32] {

@@ -192,6 +192,48 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
+    /// Batched-prefill variant of forward. Same return shape, different
+    /// internal loop strategy: layer-batched instead of token-serial.
+    /// On engines that don't have a batched path yet (default trait impl),
+    /// this just delegates to forward() — A/B-safe.
+    #[pyo3(signature = (tokens, cache, *, mtp=false))]
+    fn forward_batched(&mut self, py: Python<'_>, tokens: &Bound<PyArray1<i64>>,
+        cache: &mut Cache,
+        mtp: bool,
+    ) -> PyResult<PyObject> {
+        let toks = tokens.readonly();
+        let toks = toks.as_slice()?;
+        let n = toks.len();
+        let hd = self.model.config.get_usize("hidden_size").unwrap();
+        let vs = self.model.config.get_usize("vocab_size").unwrap();
+
+        if n == 0 {
+            let arr = PyArray2::<f32>::from_owned_array(py,
+                numpy::ndarray::Array2::from_shape_vec((0, vs), Vec::new())
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("shape error: {}", e)))?);
+            return Ok(arr.into_pyobject(py)?.into_any().into());
+        }
+
+        let mut embed = vec![0.0f32; n * hd];
+        self.engine.embed_lookup(toks, &mut embed);
+
+        if cache.inner.cpu_dirty {
+            self.engine.upload_cache(&cache.inner);
+            cache.inner.cpu_dirty = false;
+        }
+        let logits = self.engine.forward_hidden_batched(&embed, &mut || py.check_signals().is_err(), mtp)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        cache.inner.gpu_dirty = true;
+        self.telemetry = self.engine.telemetry();
+
+        let arr = PyArray2::<f32>::from_owned_array(py,
+            numpy::ndarray::Array2::from_shape_vec((n, vs), logits)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("shape error: {}", e)))?);
+        Ok(arr.into_pyobject(py)?.into_any().into())
+    }
+
     /// Expose upload/download for callers that manage cache persistence.
     /// Hot-path forward_hidden no longer round-trips the cache, so callers
     /// that want to persist GPU state to disk must download_cache first.

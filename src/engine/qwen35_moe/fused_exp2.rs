@@ -890,6 +890,36 @@ fn encode_post_expert<C: ModelConfig>(
 
 // ─── gpu_lm_head ───────────────────────────────────────────────────────────
 
+/// Batched lm_head for N tokens. One Metal command buffer + one batched
+/// matvec instead of N separate (allocate, copy, dispatch, wait, copy) loops.
+fn gpu_lm_head_n(
+    wf: &WeightFile, hiddens: &[f32], logits: &mut [f32],
+    weight_buffer: &WeightBuffer, ctx: &MetalContext,
+    n: usize, hidden_dim: usize, vocab_size: usize,
+) {
+    debug_assert_eq!(hiddens.len(), n * hidden_dim);
+    debug_assert_eq!(logits.len(), n * vocab_size);
+    let x_buf = metal_buf_shared(&ctx.device, n * hidden_dim * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(hiddens.as_ptr(), x_buf.contents() as *mut f32, n * hidden_dim);
+    }
+    let out_buf = metal_buf_shared(&ctx.device, n * vocab_size * 4);
+    let cm = ctx.queue.new_command_buffer();
+    let enc = cm.new_compute_command_encoder();
+    let ok = weight_buffer.encode_matvec_n_into(
+        wf, ctx, &enc, "language_model.lm_head",
+        &x_buf, 0, &out_buf, 0, vocab_size, hidden_dim, n as u32,
+    );
+    assert!(ok, "encode_matvec_n_into failed for language_model.lm_head");
+    enc.end_encoding();
+    cm.commit();
+    cm.wait_until_completed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            out_buf.contents() as *const f32, logits.as_mut_ptr(), n * vocab_size);
+    }
+}
+
 fn gpu_lm_head(
     wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
     weight_buffer: &WeightBuffer, ctx: &MetalContext,
@@ -1026,6 +1056,69 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vocab_size..(ti + 1) * vocab_size]);
             }
         } // exec dropped — ends borrow of self
+
+        timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
+        Ok(logits)
+    }
+
+    /// Batched-prefill variant. Currently optimizes only final_norm + lm_head
+    /// across all N tokens (one batched matvec instead of N single matvecs).
+    /// Layer compute still uses the token-serial loop — that's the next phase.
+    /// Logits are bit-identical to `forward_hidden` because the underlying
+    /// math is the same; only dispatch grouping changes.
+    fn forward_hidden_batched(
+        &mut self,
+        embeddings: &[f32],
+        check_signal: SignalCheckFn<'_>,
+        mtp: bool,
+    ) -> Result<Vec<f32>, MoEError> {
+        let t0 = Instant::now();
+        let hidden_dim = C::HIDDEN_DIM;
+        let n_tokens = embeddings.len() / hidden_dim;
+        let vocab_size = C::VOCAB_SIZE;
+        let num_layers = C::NUM_LAYERS;
+
+        let mut logits = vec![0.0f32; n_tokens * vocab_size];
+        if n_tokens == 0 {
+            return Ok(logits);
+        }
+
+        let mut pos = self.ctx.pos.get();
+        // Collect post-layer hidden states for batched final_norm + lm_head.
+        let mut hiddens_flat = vec![0.0f32; n_tokens * hidden_dim];
+        {
+            let mut exec = ExecCtx { engine: self, pending: None };
+            for ti in 0..n_tokens {
+                let embed_hidden = &embeddings[ti * hidden_dim..(ti + 1) * hidden_dim];
+                exec.init_hidden(embed_hidden);
+                for layer in 0..num_layers {
+                    if check_signal() {
+                        return Err(MoEError::Metal("interrupted".into()));
+                    }
+                    let gate_scores = exec.op1_wait(layer, pos);
+                    let routing = exec.route_experts(layer, gate_scores);
+                    exec.op2(layer, &routing);
+                }
+                let hidden = exec.hidden_wait();
+                if mtp { exec.engine.last_h_pre_norm = hidden.clone(); }
+                pos += 1;
+                exec.engine.ctx.pos.set(pos);
+                hiddens_flat[ti * hidden_dim..(ti + 1) * hidden_dim].copy_from_slice(&hidden);
+            }
+        }
+
+        // Batched final_norm + lm_head: one CPU norm loop + one batched matvec.
+        for ti in 0..n_tokens {
+            final_norm(
+                &self.model.weight_file,
+                &mut hiddens_flat[ti * hidden_dim..(ti + 1) * hidden_dim],
+                hidden_dim,
+            );
+        }
+        gpu_lm_head_n(
+            &self.model.weight_file, &hiddens_flat, &mut logits,
+            &self.weight_buffer, &self.ctx, n_tokens, hidden_dim, vocab_size,
+        );
 
         timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
         Ok(logits)

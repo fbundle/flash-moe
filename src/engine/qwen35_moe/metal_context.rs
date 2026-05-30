@@ -860,4 +860,89 @@ impl WeightBuffer {
         }
     }
 
+    /// Batched-N variant: x is [N, in_dim], out is [N, out_dim] (row-major).
+    /// Currently supports BF16, INT8, INT4 (the dtypes used by Qwen3.6 BQ4).
+    /// Returns false if tensor not found or dtype not supported.
+    pub fn encode_matvec_n_into(
+        &self,
+        wf: &WeightFile,
+        ctx: &MetalContext,
+        encoder: &ComputeCommandEncoderRef,
+        prefix: &str,
+        x_buf: &BufferRef,
+        x_offset: u64,
+        out_buf: &BufferRef,
+        out_offset: u64,
+        out_dim: usize,
+        in_dim: usize,
+        n: u32,
+    ) -> bool {
+        let weight_name = format!("{}.weight", prefix);
+        let w_ptr = match wf.get_tensor_ptr(&weight_name) {
+            Some(p) => p,
+            None => {
+                eprintln!("[encode_matvec_n_into] WARNING: tensor not found: {}.weight", prefix);
+                return false;
+            }
+        };
+        let w_off = (w_ptr as usize - self.base as usize) as u64;
+
+        let dtype = wf.get_tensor_info(&weight_name)
+            .map(|info| info.dtype.as_str())
+            .unwrap_or("u32");
+        let q = string_to_dtype(dtype);
+
+        match q {
+            Some(DType::Bf16) => {
+                metal_kernels::encode_matvec_bf16_n(
+                    ctx, encoder,
+                    &self.buf, w_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, n,
+                );
+                true
+            }
+            Some(DType::Int8) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_n_into] WARNING: scales missing for {}", prefix);
+                        return false;
+                    }
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_matvec_int8_n(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, n,
+                );
+                true
+            }
+            Some(DType::Int4) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                let b_off = (b_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_dequant_matvec_4bit_n(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, n,
+                );
+                true
+            }
+            q => {
+                let d = q.map(|q| q.as_str()).unwrap_or("unknown");
+                eprintln!("[encode_matvec_n_into] ERROR: unsupported dtype '{}' for tensor {}", d, weight_name);
+                false
+            }
+        }
+    }
 }
