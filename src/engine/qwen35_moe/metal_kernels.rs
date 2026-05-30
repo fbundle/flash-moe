@@ -431,6 +431,71 @@ pub fn encode_matvec_int8_n(
     );
 }
 
+/// Encode causal batched SDPA for prefill.
+///
+/// N new tokens with Q [N, num_q_heads, head_dim] vs K/V cache where the
+/// new tokens' K/V are at positions [past_pos .. past_pos+N). Causal mask
+/// is implicit: token i only attends positions 0..(past_pos + i).
+pub fn encode_attn_sdpa_causal_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q: &BufferRef, q_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    out: &BufferRef, o_offset: u64,
+    past_pos: u32,
+    num_q_heads: u32,
+    head_dim: u32,
+    n: u32,
+) {
+    let pipeline = ctx.attn_sdpa_causal_n.as_ref().expect("attn_sdpa_causal_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q), q_offset);
+    encoder.set_buffer(1, Some(k_cache), 0);
+    encoder.set_buffer(2, Some(v_cache), 0);
+    encoder.set_buffer(3, Some(out), o_offset);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    unsafe {
+        set_u32(encoder, 4, past_pos);
+        set_u32(encoder, 5, num_q_heads);
+        set_f32(encoder, 6, scale);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((num_q_heads as u64) * (n as u64), 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Append N tokens' K/V into the KV cache at positions [past_pos .. past_pos+N).
+pub fn encode_kv_cache_append_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    k_in: &BufferRef, k_offset: u64,
+    v_in: &BufferRef, v_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    past_pos: u32,
+    kv_dim: u32,
+    n: u32,
+) {
+    let pipeline = ctx.kv_cache_append_n.as_ref().expect("kv_cache_append_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(k_in), k_offset);
+    encoder.set_buffer(1, Some(v_in), v_offset);
+    encoder.set_buffer(2, Some(k_cache), 0);
+    encoder.set_buffer(3, Some(v_cache), 0);
+    let tgs_per_row = (kv_dim + 255) / 256;
+    unsafe {
+        set_u32(encoder, 4, past_pos);
+        set_u32(encoder, 5, kv_dim);
+        set_u32(encoder, 6, tgs_per_row);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((tgs_per_row as u64) * (n as u64), 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
 pub fn encode_dequant_matvec_4bit_n(
     ctx: &MetalContext,
     encoder: &ComputeCommandEncoderRef,

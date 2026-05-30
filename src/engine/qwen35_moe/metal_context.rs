@@ -229,6 +229,8 @@ pub struct MetalContext {
     pub matvec_bf16_n: Option<ComputePipelineState>,
     pub matvec_int8_n: Option<ComputePipelineState>,
     pub dequant_matvec_4bit_n: Option<ComputePipelineState>,
+    pub attn_sdpa_causal_n: Option<ComputePipelineState>,
+    pub kv_cache_append_n: Option<ComputePipelineState>,
 
     // ── Persistent GPU buffers for fused forward ──
     /// Per linear-layer conv state: [(kernel_size-1) * qkv_dim] f32
@@ -534,6 +536,8 @@ impl MetalContext {
             let matvec_bf16_n = make_pipeline("matvec_bf16_n").ok();
             let matvec_int8_n = make_pipeline("matvec_int8_n").ok();
             let dequant_matvec_4bit_n = make_pipeline("dequant_matvec_4bit_n").ok();
+            let attn_sdpa_causal_n = make_pipeline("attn_sdpa_causal_n").ok();
+            let kv_cache_append_n = make_pipeline("kv_cache_append_n").ok();
 
             // Validate required pipelines exist
             let matvec_fast = matvec_fast.ok_or_else(|| MoEError::Shader("dequant_matvec_4bit_fast not found".into()))?;
@@ -573,6 +577,8 @@ impl MetalContext {
                 matvec_bf16_n,
                 matvec_int8_n,
                 dequant_matvec_4bit_n,
+                attn_sdpa_causal_n,
+                kv_cache_append_n,
                 // Persistent GPU buffers — initialized later via init_linear_attn_buffers()
                 buf_conv_state: Vec::new(),
                 buf_delta_state: Vec::new(),
