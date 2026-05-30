@@ -232,6 +232,7 @@ pub struct MetalContext {
     pub attn_sdpa_causal_n: Option<ComputePipelineState>,
     pub kv_cache_append_n: Option<ComputePipelineState>,
     pub buffer_copy_f32: Option<ComputePipelineState>,
+    pub matvec_bf16_gemm_n: Option<ComputePipelineState>,
 
     // ── Persistent GPU buffers for fused forward ──
     /// Per linear-layer conv state: [(kernel_size-1) * qkv_dim] f32
@@ -540,6 +541,7 @@ impl MetalContext {
             let attn_sdpa_causal_n = make_pipeline("attn_sdpa_causal_n").ok();
             let kv_cache_append_n = make_pipeline("kv_cache_append_n").ok();
             let buffer_copy_f32 = make_pipeline("buffer_copy_f32").ok();
+            let matvec_bf16_gemm_n = make_pipeline("matvec_bf16_gemm_n").ok();
 
             // Validate required pipelines exist
             let matvec_fast = matvec_fast.ok_or_else(|| MoEError::Shader("dequant_matvec_4bit_fast not found".into()))?;
@@ -582,6 +584,7 @@ impl MetalContext {
                 attn_sdpa_causal_n,
                 kv_cache_append_n,
                 buffer_copy_f32,
+                matvec_bf16_gemm_n,
                 // Persistent GPU buffers — initialized later via init_linear_attn_buffers()
                 buf_conv_state: Vec::new(),
                 buf_delta_state: Vec::new(),

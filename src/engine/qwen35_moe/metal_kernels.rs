@@ -385,6 +385,29 @@ pub fn encode_matvec_bf16_n(
     in_dim: u32,
     n: u32,
 ) {
+    // Use GEMM-tiled variant when available and N >= 2.
+    // For N=1, fall back to per-token kernel — GEMM tile would waste 3/4 of the work.
+    if n >= 2 && ctx.matvec_bf16_gemm_n.is_some() {
+        let ncols_per_tg: u32 = 4;
+        let pipeline = ctx.matvec_bf16_gemm_n.as_ref().unwrap();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w_bf16), w_offset);
+        encoder.set_buffer(1, Some(x), x_offset);
+        encoder.set_buffer(2, Some(out), o_offset);
+        let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        let num_n_tiles   = (n + ncols_per_tg - 1) / ncols_per_tg;
+        unsafe {
+            set_u32(encoder, 3, out_dim);
+            set_u32(encoder, 4, in_dim);
+            set_u32(encoder, 5, n);
+            set_u32(encoder, 6, num_row_tiles);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new((num_row_tiles as u64) * (num_n_tiles as u64), 1, 1),
+            MTLSize::new(TG_SIZE as u64, 1, 1),
+        );
+        return;
+    }
     let pipeline = ctx.matvec_bf16_n.as_ref().expect("matvec_bf16_n kernel missing");
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(w_bf16), w_offset);

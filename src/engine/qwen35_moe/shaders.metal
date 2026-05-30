@@ -2435,6 +2435,80 @@ kernel void dequant_matvec_4bit_n(
 // Used by batched op1_linear to save/load per-token ctx buffer slices
 // without breaking encoder-order serialization.
 // ============================================================================
+// ============================================================================
+// matvec_bf16_gemm_n — tiled GEMM-style batched BF16 matvec.
+//
+// Unlike matvec_bf16_n which dispatches independent TGs per (row_tile, token)
+// (and re-reads weight rows N times), this kernel processes NCOLS_PER_TG
+// tokens within ONE threadgroup, sharing weight reads across those tokens.
+//
+// Tiles in K direction (TILE_K=256 columns of in_dim at a time) so the
+// per-token X tile fits comfortably in threadgroup memory.
+//
+// Weight bandwidth reduction vs matvec_bf16_n: ~NCOLS_PER_TG×.
+// ============================================================================
+#define NCOLS_PER_TG 4
+#define TILE_K 256
+
+kernel void matvec_bf16_gemm_n(
+    device const uint16_t* W_bf16 [[buffer(0)]],
+    device const float*    x      [[buffer(1)]],   // [N, in_dim]
+    device float*          out    [[buffer(2)]],   // [N, out_dim]
+    constant uint&         out_dim [[buffer(3)]],
+    constant uint&         in_dim  [[buffer(4)]],
+    constant uint&         n_total [[buffer(5)]],
+    constant uint&         num_row_tiles [[buffer(6)]],
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint lid       [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_tile = tgid_flat % num_row_tiles;
+    uint n_tile   = tgid_flat / num_row_tiles;
+    uint row = row_tile * ROWS_PER_TG + simd_group;
+
+    threadgroup float x_tile[NCOLS_PER_TG * TILE_K];  // 4*256 = 1024 floats = 4KB
+
+    float accs[NCOLS_PER_TG] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k0 = 0; k0 < in_dim; k0 += TILE_K) {
+        uint tile_k = min((uint)TILE_K, in_dim - k0);
+        // Cooperative load of x_tile: load NCOLS_PER_TG * tile_k floats with 256 threads.
+        for (uint i = lid; i < NCOLS_PER_TG * tile_k; i += 256) {
+            uint t = i / tile_k;
+            uint k = i % tile_k;
+            uint n_idx = n_tile * NCOLS_PER_TG + t;
+            x_tile[t * TILE_K + k] = (n_idx < n_total) ? x[n_idx * in_dim + k0 + k] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < out_dim) {
+            device const uint16_t* w_row = W_bf16 + row * in_dim + k0;
+            for (uint c = simd_lane; c < tile_k; c += 32) {
+                float w = bf16_to_f32(w_row[c]);
+                accs[0] += w * x_tile[0 * TILE_K + c];
+                accs[1] += w * x_tile[1 * TILE_K + c];
+                accs[2] += w * x_tile[2 * TILE_K + c];
+                accs[3] += w * x_tile[3 * TILE_K + c];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row >= out_dim) return;
+    float sum0 = simd_sum(accs[0]);
+    float sum1 = simd_sum(accs[1]);
+    float sum2 = simd_sum(accs[2]);
+    float sum3 = simd_sum(accs[3]);
+    if (simd_lane == 0) {
+        uint n_base = n_tile * NCOLS_PER_TG;
+        if (n_base + 0 < n_total) out[(n_base + 0) * out_dim + row] = sum0;
+        if (n_base + 1 < n_total) out[(n_base + 1) * out_dim + row] = sum1;
+        if (n_base + 2 < n_total) out[(n_base + 2) * out_dim + row] = sum2;
+        if (n_base + 3 < n_total) out[(n_base + 3) * out_dim + row] = sum3;
+    }
+}
+
 kernel void buffer_copy_f32(
     device const float* src [[buffer(0)]],
     device float*       dst [[buffer(1)]],
