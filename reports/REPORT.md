@@ -426,6 +426,52 @@ The 25% throughput gain over flash-moe comes from the two core contributions: (1
 
 Expert I/O (SSD pread) dominates at ~34% of wall time for short prompts and ~43% for 100-token prompts. Full-attention and linear SSM GPU compute are negligible (<10 ms total).
 
+### Batched Prefill (branch: `batched-prefill`)
+
+For prompts of more than one token, the token-serial engine above leaves the GPU underutilized. Each step issues matvecs against large weight matrices with a tiny input vector, and the GPU's wide units are barely loaded. The batched-prefill path processes N tokens together at the same point in the layer stack, sharing weight reads and collapsing per-token command-buffer commits into one per layer.
+
+Seven landed optimizations, each preserving bit-near-identical logits (`max_diff ~ 2e-5`, top-1 match):
+
+1. **Batched matvec kernels** — `matvec_bf16_n`, `matvec_int8_n`, `dequant_matvec_4bit_n`. Same simdgroup-based reduction as the single-input kernels, with one threadgroup per (row tile, token) (grid linearized; Metal disallows mixing scalar and vector grid attributes).
+2. **Causal batched SDPA** (`attn_sdpa_causal_n`) — one TG per (new-token i, query head h); online softmax over positions [0, past_pos + i]; causal mask implicit in the loop bound. Paired with `kv_cache_append_n` for the N-position cache write.
+3. **`op1_full_batched`** — full-attn pre-MoE work for N tokens in one cmd buffer. Q/K head-norm + RoPE loop within the encoder with offset addressing (per-token positions differ for RoPE).
+4. **`op1_linear_batched`** — linear-attn pre-MoE work for N tokens in one cmd buffer. DeltaNet recurrence is sequential, but Metal serializes the per-token dispatches via implicit barriers on conv_state and delta_state. A tiny `buffer_copy_f32` GPU kernel saves/loads per-token ctx slices (CPU memcpy can't interleave with encoding because shared-storage writes are only visible at commit).
+5. **Single-commit batched MoE op2** — all N op2 dispatches into ONE cmd buffer per layer. `encode_post_expert_at` reads per-token slices of `BatchedFullBuffers` via offset arithmetic. Per-token `combine_params` live in `bufs.combine_params_n[ti*10..]`.
+6. **Unique-expert pool** — the biggest single win. Without it, N×K expert pre-reads per layer; with it, each unique expert is loaded ONCE per layer regardless of how many tokens chose it. At N=128, K=8, E=256 with random routing: ~200–256 unique vs 1024 pre-reads. ~4× pread bandwidth reduction. Pool memory: E × expert_size ≈ 450 MB on Qwen3.6.
+7. **GEMM-tiled `matvec_bf16_gemm_n`** — NCOLS_PER_TG=4 tokens per threadgroup with K-axis tiling. Weight reads shared across the 4 tokens, ~4× weight bandwidth saving on the BF16 matvecs.
+
+#### Measured speedup (M4, mins of 5 runs)
+
+| N | seq tok/s | bat tok/s | speedup | seq ms | bat ms |
+|---|---:|---:|---:|---:|---:|
+| 8 | 6.51 | 11.66 | 1.79× | 1229 | 686 |
+| 16 | 6.29 | 12.01 | 1.91× | 2543 | 1333 |
+| 32 | 6.77 | 18.45 | **2.73×** | 4728 | 1735 |
+| 64 | 6.29 | 14.92 | 2.37× | 10170 | 4289 |
+| 128 | 6.89 | 17.82 | 2.59× | 18582 | 7182 |
+
+Speedup grows with N — the unique-expert pool savings compound. Throughput climbs from ~7 tok/s to 12–18 tok/s.
+
+#### Incremental contribution at N=128
+
+| Cumulative optimizations | Speedup |
+|---|---:|
+| batched lm_head only | 1.05× |
+| + `op1_full_batched` | 1.16× |
+| + single-commit op2 (per-token pool) | 1.62× |
+| + batched op1 for linear-attn | 1.72× |
+| + GEMM-tiled `matvec_bf16_n` | 1.88× |
+| + unique-expert pool | **2.59×** |
+
+The python entry point is `Engine.forward_batched(tokens, cache)`, parallel to `Engine.forward(tokens, cache)`. N=1 falls through to the token-serial path (batched overhead exceeds the win at single tokens). Numerics validated by `verify_nway.py` and `helpers/verify_vs_original.py`; the bench is `helpers/bench_prefill.py`.
+
+### Negative-result experiments
+
+Two well-known weight-compression techniques that failed on Qwen3.6 (the failures themselves are informative):
+
+- **Low-rank expert factorization** (`helpers/analyze_expert_lowrank.py`). Layer 0 alone is meaningfully low-rank (~28% storage saving at 99% variance). Layers 1–40 are rank-saturated: rank > 485 of 512 needed to keep 99% variance, and the low-rank decomposition is actually *larger* than the dense INT4 matrix (+21%). Verdict: experts have been trained to use full rank. Dead on 40 of 41 layers.
+- **Rotated quantization** (QuIP#-style, `helpers/analyze_rotated_quant.py`). Random orthogonal rotation gives ≤0.2% per-matrix cosine lift, *only* at INT2 where the absolute baseline is already broken. The per-group BF16-scale INT4 scheme (group size 64) already does the local outlier adaptation that rotation would unlock against coarser schemes.
+
 ## Numerical Verification
 
 ### CPU vs MLX-LM (Stripped 4-Layer Model)
